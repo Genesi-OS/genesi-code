@@ -6089,7 +6089,9 @@ impl TerminalView {
                         ConversationStatus::Success => Some(FinishReason::Complete),
                         ConversationStatus::Error => Some(FinishReason::Error),
                         ConversationStatus::Cancelled => Some(FinishReason::Cancelled),
-                        ConversationStatus::InProgress | ConversationStatus::Blocked { .. } => None,
+                        ConversationStatus::InProgress
+                        | ConversationStatus::Blocked { .. }
+                        | ConversationStatus::WaitingForEvents => None,
                     };
                     if let Some(finish_reason) = finish_reason {
                         self.handle_finished_conversation(*conversation_id, finish_reason, ctx);

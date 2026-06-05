@@ -1576,8 +1576,14 @@ impl BlocklistAIController {
             );
             return false;
         };
-        let is_success = matches!(conversation.status(), ConversationStatus::Success);
-        if !owns || has_active_stream || !is_success {
+        // WaitingForEvents is treated as Success here: pending events
+        // drain via the next outbound request and the server-side
+        // supersede emits the resume signal.
+        let is_ready_status = matches!(
+            conversation.status(),
+            ConversationStatus::Success | ConversationStatus::WaitingForEvents,
+        );
+        if !owns || has_active_stream || !is_ready_status {
             log::info!(
                 "Pending events are not ready: conversation_id={conversation_id:?} owns_conversation={owns} has_active_stream={has_active_stream} status={:?}",
                 conversation.status()
@@ -1789,6 +1795,11 @@ impl BlocklistAIController {
         else {
             return;
         };
+
+        // The resume request supersedes any in-flight wait_for_events.
+        self.action_model.update(ctx, |action_model, ctx| {
+            action_model.cancel_wait_for_events_for_conversation(conversation_id, ctx);
+        });
 
         if self
             .send_request_input(

@@ -20,6 +20,7 @@ pub(super) mod suggest_new_conversation;
 pub(super) mod suggest_prompt;
 pub(super) mod upload_artifact;
 pub(super) mod use_computer;
+pub(super) mod wait_for_events;
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -66,6 +67,7 @@ use suggest_new_conversation::SuggestNewConversationExecutor;
 pub use suggest_prompt::PromptSuggestionExecutor;
 use upload_artifact::UploadArtifactExecutor;
 use use_computer::UseComputerExecutor;
+use wait_for_events::WaitForEventsExecutor;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 #[cfg(feature = "local_fs")]
@@ -263,6 +265,7 @@ pub struct BlocklistAIActionExecutor {
     run_agents_executor: ModelHandle<RunAgentsExecutor>,
     send_message_executor: ModelHandle<SendMessageToAgentExecutor>,
     ask_user_question_executor: ModelHandle<AskUserQuestionExecutor>,
+    wait_for_events_executor: ModelHandle<WaitForEventsExecutor>,
     /// The actions currently executing asynchronously, keyed by action ID.
     /// We track them per action rather than as a single slot so multiple actions from the same
     /// parallel phase can complete independently.
@@ -331,6 +334,8 @@ impl BlocklistAIActionExecutor {
         let send_message_executor = ctx.add_model(|_| SendMessageToAgentExecutor::new());
         let ask_user_question_executor =
             ctx.add_model(|_| AskUserQuestionExecutor::new(terminal_view_id));
+        let wait_for_events_executor =
+            ctx.add_model(|ctx| WaitForEventsExecutor::new(terminal_view_id, ctx));
         Self {
             shell_command_executor,
             read_files_executor,
@@ -356,6 +361,7 @@ impl BlocklistAIActionExecutor {
             run_agents_executor,
             send_message_executor,
             ask_user_question_executor,
+            wait_for_events_executor,
         }
     }
 
@@ -363,6 +369,26 @@ impl BlocklistAIActionExecutor {
         self.async_executing_actions
             .get(action_id)
             .map(|running| &running.action)
+    }
+
+    /// Returns the action_id of any running WaitForEvents action for the
+    /// given conversation. There is at most one (wait_for_events is
+    /// documented as exclusive within a turn).
+    pub(super) fn find_running_wait_for_events(
+        &self,
+        conversation_id: AIConversationId,
+    ) -> Option<AIAgentActionId> {
+        self.async_executing_actions
+            .iter()
+            .find_map(|(action_id, running)| {
+                if running.conversation_id == conversation_id
+                    && matches!(running.action.action, AIAgentActionType::WaitForEvents { .. })
+                {
+                    Some(action_id.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn shell_command_executor(&self) -> &ModelHandle<ShellCommandExecutor> {
@@ -529,6 +555,9 @@ impl BlocklistAIActionExecutor {
                 .update(ctx, |executor, ctx| executor.preprocess_action(input, ctx)),
             AIAgentActionType::RunAgents(_) => self
                 .run_agents_executor
+                .update(ctx, |executor, ctx| executor.preprocess_action(input, ctx)),
+            AIAgentActionType::WaitForEvents { .. } => self
+                .wait_for_events_executor
                 .update(ctx, |executor, ctx| executor.preprocess_action(input, ctx)),
         }
     }
@@ -719,6 +748,10 @@ impl BlocklistAIActionExecutor {
                 .run_agents_executor
                 .update(ctx, |executor, ctx| executor.execute(input, ctx))
                 .into(),
+            AIAgentActionType::WaitForEvents { .. } => self
+                .wait_for_events_executor
+                .update(ctx, |executor, ctx| executor.execute(input, ctx))
+                .into(),
         };
 
         let action_id = action_clone.id.clone();
@@ -821,6 +854,15 @@ impl BlocklistAIActionExecutor {
             } else if matches!(running.action.action, AIAgentActionType::SearchCodebase(..)) {
                 self.search_codebase_executor.update(ctx, |executor, ctx| {
                     executor.cancel_execution(&running.action.id, ctx);
+                });
+            } else if let AIAgentActionType::WaitForEvents { tool_call_id, .. } =
+                &running.action.action
+            {
+                // Drop the executor's pending entry; the shared cancel
+                // path emits FinishedAction(Cancelled).
+                let tool_call_id = tool_call_id.clone();
+                self.wait_for_events_executor.update(ctx, |executor, _| {
+                    executor.cancel_execution(&tool_call_id);
                 });
             }
             ctx.emit(BlocklistAIActionExecutorEvent::FinishedAction {
@@ -926,6 +968,9 @@ impl BlocklistAIActionExecutor {
                 .update(ctx, |executor, ctx| executor.should_autoexecute(input, ctx)),
             AIAgentActionType::RunAgents(_) => self
                 .run_agents_executor
+                .update(ctx, |executor, ctx| executor.should_autoexecute(input, ctx)),
+            AIAgentActionType::WaitForEvents { .. } => self
+                .wait_for_events_executor
                 .update(ctx, |executor, ctx| executor.should_autoexecute(input, ctx)),
         }
     }

@@ -129,11 +129,14 @@ pub(super) const DONE_STATUS_KEY: u8 = 3;
 
 /// Sort priority within a pill section. Lower sorts leftmost. Cancelled
 /// and Success share one "done" bucket; recency decides their order.
+/// WaitingForEvents shares the InProgress bucket so yielded pills stay in
+/// the active half of the bar.
 fn pill_status_sort_key(status: Option<&ConversationStatus>) -> u8 {
     match status {
         Some(ConversationStatus::Blocked { .. }) => 0,
         Some(ConversationStatus::Error) => 1,
         Some(ConversationStatus::InProgress) => 2,
+        Some(ConversationStatus::WaitingForEvents) => 2,
         Some(ConversationStatus::Cancelled) | Some(ConversationStatus::Success) => DONE_STATUS_KEY,
         None => 2,
     }
