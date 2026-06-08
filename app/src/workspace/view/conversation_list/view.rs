@@ -1148,6 +1148,7 @@ impl TypedActionView for ConversationListView {
                     summarize_after_fork: false,
                     summarization_prompt: None,
                     initial_prompt: None,
+                    initial_attachments: vec![],
                     destination: *destination,
                 });
             }
