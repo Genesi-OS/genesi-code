@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ai::skills::{parse_bundled_skill, ParsedSkill, SkillReference};
+use ai::skills::{parse_bundled_skill, ParsedSkill, SkillPathOrigin, SkillReference};
 use futures::TryStreamExt;
 use warp_core::channel::ChannelState;
 use warp_core::ui::icons::Icon;
@@ -67,8 +67,38 @@ impl BundledSkills {
         self.local = bundled_skill;
     }
 
-    pub fn local(&self) -> &BundledSkill {
-        &self.local
+    pub fn active_descriptors(
+        &self,
+        path_origin: &SkillPathOrigin,
+        ctx: &AppContext,
+    ) -> Vec<SkillDescriptor> {
+        self.for_path_origin(path_origin)
+            .map(|bundled_skill| bundled_skill.active_descriptors(ctx))
+            .unwrap_or_default()
+    }
+
+    pub fn reference_for_path(&self, path: &LocalOrRemotePath) -> Option<SkillReference> {
+        match path {
+            LocalOrRemotePath::Local(_) => self.local.reference_for_path(path),
+            LocalOrRemotePath::Remote(path) => self
+                .remote(&path.host_id)
+                .and_then(|bundled_skill| {
+                    bundled_skill.reference_for_path(&LocalOrRemotePath::Remote(path.clone()))
+                }),
+        }
+    }
+
+    pub fn local_skill(&self, id: &str) -> Option<&ParsedSkill> {
+        self.local.skill(id)
+    }
+
+    pub fn active_skill(
+        &self,
+        id: &str,
+        path_origin: &SkillPathOrigin,
+        ctx: &AppContext,
+    ) -> Option<&ParsedSkill> {
+        self.for_path_origin(path_origin)?.active_skill(id, ctx)
     }
 
     /// Begins bootstrapping a catalog for a newly connected remote host.
@@ -136,6 +166,14 @@ impl BundledSkills {
         }
     }
 
+    fn for_path_origin(&self, path_origin: &SkillPathOrigin) -> Option<&BundledSkill> {
+        match path_origin {
+            SkillPathOrigin::Local | SkillPathOrigin::RestoredDisplayOnly => Some(&self.local),
+            SkillPathOrigin::Remote { host_id } => self.remote(host_id),
+            SkillPathOrigin::Unavailable => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn insert_local_for_testing(
         &mut self,
@@ -144,6 +182,27 @@ impl BundledSkills {
         activation: BundledSkillActivation,
     ) {
         self.local.insert_for_testing(id, skill, activation);
+    }
+
+    #[cfg(test)]
+    pub fn insert_remote_for_testing(
+        &mut self,
+        host_id: HostId,
+        id: impl Into<String>,
+        skill: ParsedSkill,
+        activation: BundledSkillActivation,
+    ) {
+        let state = self
+            .remote_by_host
+            .entry(host_id)
+            .or_insert_with(|| RemoteBundledSkillState::Ready(BundledSkill::default()));
+        let bundled_skill = match state {
+            RemoteBundledSkillState::Ready(bundled_skill) => bundled_skill,
+            RemoteBundledSkillState::Bootstrapping { .. } => {
+                panic!("remote test catalog is still bootstrapping")
+            }
+        };
+        bundled_skill.insert_for_testing(id, skill, activation);
     }
 }
 
