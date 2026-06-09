@@ -8,6 +8,8 @@
 #   {binary_name}               — e.g. oz | oz-dev | oz-preview
 #   {version_query}             — e.g. &version=v0.2026... (empty when no release tag)
 #   {version_suffix}            — e.g. -v0.2026...        (empty when no release tag)
+#   {bundle_version}            — version-scoped bundle directory name
+#   {binary_symlink_target}     — relative target for the compatibility symlink
 #   {no_http_client_exit_code}  — exit code when neither curl nor wget is available
 #   {staging_tarball_path}      — path to a pre-uploaded tarball (SCP fallback; empty normally)
 set -e
@@ -52,6 +54,12 @@ tmpdir=$(mktemp -d "$install_dir/.install.XXXXXX")
 # instead of clobbering with the cleanup's exit code.
 cleanup() {
   rm -rf "$tmpdir" 2>/dev/null || true
+  if [ -n "${install_bundle_tmp:-}" ]; then
+    rm -rf "$install_bundle_tmp" 2>/dev/null || true
+  fi
+  if [ -n "${symlink_tmp:-}" ]; then
+    rm -f "$symlink_tmp" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -79,7 +87,38 @@ fi
 
 tar -xzf "$tmpdir/oz.tar.gz" -C "$tmpdir"
 
-bin=$(find "$tmpdir" -type f -name 'oz*' ! -name '*.tar.gz' | head -n1)
+# The executable and its resources are siblings in the artifact. Exclude the
+# resources tree from the search: bundled skills may ship companion files
+# whose names also start with `oz`.
+bin=$(find "$tmpdir" -type f -name 'oz*' ! -name '*.tar.gz' ! -path '*/resources/*' | head -n1)
 if [ -z "$bin" ]; then echo "no binary found in tarball" >&2; exit 1; fi
+resources="$(dirname "$bin")/resources"
+if [ ! -d "$resources" ]; then echo "no resources directory found in tarball" >&2; exit 1; fi
+
+staged_bundle="$tmpdir/bundle"
+mkdir -p "$staged_bundle"
 chmod +x "$bin"
-mv "$bin" "$install_dir/{binary_name}{version_suffix}"
+mv "$bin" "$staged_bundle/{binary_name}"
+mv "$resources" "$staged_bundle/resources"
+
+bundles_dir="$install_dir/bundles"
+bundle_dir="$bundles_dir/{bundle_version}"
+mkdir -p "$bundles_dir"
+
+# Move the fully-staged executable + resources together. Replacing an existing
+# bundle is only needed to repair an incomplete install at this version; healthy
+# bundles are skipped by the pre-install binary check.
+install_bundle_tmp="$bundles_dir/.{bundle_version}.install.$$"
+rm -rf "$install_bundle_tmp"
+mv "$staged_bundle" "$install_bundle_tmp"
+rm -rf "$bundle_dir"
+mv "$install_bundle_tmp" "$bundle_dir"
+
+# Keep the historical expected binary path as the launch interface. The
+# relative link makes the install relocatable and canonicalizes to an
+# executable whose sibling is the resources directory.
+binary_path="$install_dir/{binary_name}{version_suffix}"
+symlink_tmp="$install_dir/.{binary_name}{version_suffix}.link.$$"
+rm -f "$symlink_tmp"
+ln -s "{binary_symlink_target}" "$symlink_tmp"
+mv -f "$symlink_tmp" "$binary_path"

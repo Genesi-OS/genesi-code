@@ -29,7 +29,7 @@ message HostScopedRequest {
   // 4 (open_buffer) and 7 (get_diff_state) moved to SessionScopedRequest:
   // they establish per-connection subscription state, so they must be
   // delivered on (and answered by) a specific connection, never failed over.
-  reserved 4, 7;
+  reserved 4, 7, 15, 16;
   oneof message {
     WriteFile write_file = 1;
     DeleteFile delete_file = 2;
@@ -79,6 +79,7 @@ message Notification {
 // Push messages use an empty request_id to distinguish them from
 // request/response pairs.
 message ServerMessage {
+  reserved 27, 28;
   string request_id = 1;
   oneof message {
     InitializeResponse initialize_response = 2;
@@ -158,6 +159,9 @@ message Abort {
 message InitializeResponse {
   string server_version = 1;
   string host_id = 2;
+  // Absolute path to the packaged resources installed beside the daemon.
+  // Empty when the daemon has no packaged resources available.
+  string bundled_resources_dir = 3;
 }
 
 // Sent by the client after the SSH session has been bootstrapped.
@@ -226,6 +230,7 @@ message ErrorResponse {
   ErrorCode code = 1;
   string message = 2;
 }
+
 
 // ── Shared repo metadata sub-messages ─────────────────────────────
 // Mirror the Rust types in repo_metadata/src/file_tree_update.rs.
