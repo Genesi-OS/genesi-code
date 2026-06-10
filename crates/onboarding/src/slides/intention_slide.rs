@@ -1,3 +1,4 @@
+use pathfinder_color::ColorU;
 use ui_components::{button, Component as _, Options as _};
 use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
