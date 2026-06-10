@@ -78,7 +78,7 @@ jobs:
           done
           # rust-toolchain.toml pins 1.92.0; install it explicitly so the first
           # cargo invocation doesn't pay for an implicit download mid-build.
-          rustup toolchain install 1.92.0 --profile minimal -c rustfmt clippy
+          rustup toolchain install 1.92.0 --profile minimal -c rustfmt -c clippy
 
       - name: Pull Git LFS assets
         shell: bash
