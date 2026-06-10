@@ -2,7 +2,8 @@
 //!
 //! For non-bundled builds, the generator is invoked at runtime. For bundled builds, the config
 //! is embedded at compile time via the build script.
-use warp_core::channel::ChannelConfig;
+use warp_core::channel::{ChannelConfig, OzConfig, WarpServerConfig};
+use warp_core::AppId;
 
 /// The name of the config generator binary, expected to be on PATH.
 const CONFIG_BIN_NAME: &str = "warp-channel-config";
@@ -59,35 +60,24 @@ pub fn load_config_from_generator(channel: &str) -> ChannelConfig {
         "linux"
     };
 
-    let output = command::blocking::Command::new(CONFIG_BIN_NAME)
-        .arg("--channel")
-        .arg(channel)
-        .arg("--target-family")
-        .arg(target_family)
-        .arg("--target-os")
-        .arg(target_os)
-        .output()
-        .unwrap_or_else(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                panic!(
-                    "\n\n'{CONFIG_BIN_NAME}' was not found on PATH.\n\n\
-                     To build internal channels, run:\n\
-                     \n\
-                     \x20 ./script/install_channel_config\n\n"
-                )
-            }
-            panic!("Failed to execute '{CONFIG_BIN_NAME}': {err}")
-        });
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Config generator failed for channel '{channel}':\n{stderr}");
+    // Genesi Code fork: upstream's `warp-channel-config` generator lives in a
+    // private Warp repo (`warpdotdev/warp-channel-config`) that wasn't open
+    // sourced, so non-bundled builds can't shell out to it. Return the same
+    // in-Rust default config that `ChannelState::init()` uses for the OSS
+    // channel: Warp's production servers, with telemetry, autoupdate, and crash
+    // reporting all disabled (Genesi doesn't phone home and ships its own update
+    // pipeline). The channel/target args are kept for signature compatibility.
+    let _ = (channel, target_family, target_os);
+    ChannelConfig {
+        app_id: AppId::new("dev", "warp", "WarpOss"),
+        logfile_name: "".into(),
+        server_config: WarpServerConfig::production(),
+        oz_config: OzConfig::production(),
+        telemetry_config: None,
+        autoupdate_config: None,
+        crash_reporting_config: None,
+        mcp_static_config: None,
     }
-
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        panic!("Failed to parse config generator output for channel '{channel}': {err}\nOutput:\n{stdout}")
-    })
 }
 
 /// Deserializes a [`ChannelConfig`] from a JSON string embedded at compile time.
