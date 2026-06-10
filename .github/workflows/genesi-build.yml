@@ -109,21 +109,26 @@ jobs:
           ptrs=$(grep -rlI "git-lfs.github.com/spec" app/assets 2>/dev/null | wc -l || echo 0)
           echo "remaining LFS pointer files under app/assets: $ptrs"
 
-      - name: Build Genesi Code (dev)
+      - name: Build Genesi Code (release)
         shell: bash
         env:
-          # Drop debuginfo to cut link-time RAM/disk dramatically (proven locally:
-          # ~5.8 GB peak). mold linker for speed. Bounded jobs for RAM safety.
-          CARGO_PROFILE_DEV_DEBUG: "0"
+          # MUST be a release build: rust_embed only embeds the bundled assets
+          # (fonts, svg, imagery) in release. A debug build reads them from the
+          # COMPILE-TIME folder path at runtime, which doesn't exist on the
+          # user's machine -> "no asset exists at path bundled/fonts/...". Release
+          # also yields a smaller, optimized binary for distribution. LTO off +
+          # more codegen units keeps peak RAM/time sane on the 16 GB runner.
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           CARGO_BUILD_JOBS: "4"
-        run: cargo build --bin warp
+        run: cargo build --release --bin warp
 
       - name: Stage + compress artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp target/debug/warp dist/genesi-code
+          cp target/release/warp dist/genesi-code
           chmod +x dist/genesi-code
           # zstd-compressed tarball for the Release asset (consistent name so the
           # latest-release download URL is stable for the package installer).
@@ -156,5 +161,6 @@ jobs:
             chmod +x genesi-code
             ./genesi-code            # or: WGPU_BACKEND=gl ./genesi-code on a GPU-less VM
             ```
-            Dev build (unoptimized, self-contained). Latest asset is always at the
+            Release build (optimized, self-contained — assets embedded). Latest
+            asset is always at the
             `releases/latest/download/genesi-code-linux-x86_64.tar.zst` URL.
