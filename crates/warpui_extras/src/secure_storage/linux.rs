@@ -73,7 +73,11 @@ impl SecureStorage {
             .get_or_init(|| match Collection::open_default_collection() {
                 Ok(collection) => Some(collection),
                 Err(err) => {
-                    log::error!("Failed to acquire default Secret Service collection: {err:#}");
+                    // Genesi: a headless box / VM / minimal session often has no
+                    // Secret Service (keyring) daemon. That is expected here — the
+                    // encrypted-file fallback handles storage — so this is a debug
+                    // note, not an error, to keep the log clean.
+                    log::debug!("No Secret Service collection (using encrypted-file fallback): {err:#}");
                     None
                 }
             })

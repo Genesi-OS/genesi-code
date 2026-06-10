@@ -1,5 +1,4 @@
 use pathfinder_color::ColorU;
-use pathfinder_geometry::vector::vec2f;
 use ui_components::{button, Component as _, Options as _};
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
@@ -10,9 +9,8 @@ use warpui_core::elements::shimmering_text::{
     ShimmerConfig, ShimmeringTextElement, ShimmeringTextStateHandle,
 };
 use warpui_core::elements::{
-    Align, ChildAnchor, ConstrainedBox, Container, CrossAxisAlignment, Flex, FormattedTextElement,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Stack,
+    Align, ConstrainedBox, Container, CrossAxisAlignment, Flex, FormattedTextElement,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Stack,
 };
 use warpui_core::keymap::Keystroke;
 use warpui_core::text_layout::TextAlignment;
@@ -80,7 +78,10 @@ impl View for IntroSlide {
             ..Default::default()
         };
 
-        let login_row = Flex::row()
+        // Genesi: this is a local-first editor for Genesi OS — there is no Warp
+        // account. We keep the row constructed (so the field/action stay wired)
+        // but do NOT display the "Already have an account? Log in" affordance.
+        let _login_row = Flex::row()
             .with_child(
                 ui_builder
                     .span("Already have an account? ")
@@ -110,15 +111,6 @@ impl View for IntroSlide {
 
         let mut stack = Stack::new();
         stack.add_child(centered);
-        stack.add_positioned_child(
-            login_row,
-            OffsetPositioning::offset_from_parent(
-                vec2f(0., -28.),
-                ParentOffsetBounds::ParentBySize,
-                ParentAnchor::BottomMiddle,
-                ChildAnchor::BottomMiddle,
-            ),
-        );
         stack.finish()
     }
 }
