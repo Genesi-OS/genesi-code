@@ -75,7 +75,7 @@ impl IntentionSlide {
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
 
-        let logo_fill = internal_colors::fg_overlay_4(theme);
+        let logo_fill = Fill::Solid(ColorU::new(15, 143, 106, 255));
         let logo = ConstrainedBox::new(Icon::WarpLogoLight.to_warpui_icon(logo_fill).finish())
             .with_width(64.)
             .with_height(64.)

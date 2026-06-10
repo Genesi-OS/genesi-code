@@ -4,6 +4,7 @@ use ui_components::{button, Component as _, Options as _};
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::Fill;
 use warp_core::ui::Icon;
 use warpui_core::elements::shimmering_text::{
     ShimmerConfig, ShimmeringTextElement, ShimmeringTextStateHandle,
@@ -142,7 +143,9 @@ impl IntroSlide {
     fn render_centered_content(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
 
-        let logo_fill = internal_colors::fg_overlay_4(theme);
+        // Genesi green (#0F8F6A) so the leaf logo reads as the brand mark,
+        // instead of Warp's barely-visible fg_overlay_4 tint.
+        let logo_fill = Fill::Solid(ColorU::new(15, 143, 106, 255));
         let logo = ConstrainedBox::new(Icon::WarpLogoLight.to_warpui_icon(logo_fill).finish())
             .with_width(64.)
             .with_height(64.)

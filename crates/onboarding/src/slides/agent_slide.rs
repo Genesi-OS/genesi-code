@@ -319,7 +319,7 @@ impl AgentSlide {
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let title = appearance
             .ui_builder()
-            .paragraph("Customize your Warp Agent")
+            .paragraph("Customize your Genesi Agent")
             .with_style(UiComponentStyles {
                 font_size: Some(36.),
                 font_weight: Some(Weight::Medium),
@@ -461,7 +461,7 @@ impl AgentSlide {
             .iter()
             .any(|m| m.requires_upgrade);
 
-        let mut col = Flex::column()
+        let col = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(header)
             .with_child(
@@ -470,13 +470,9 @@ impl AgentSlide {
                     .finish(),
             );
 
-        if has_disabled {
-            col = col.with_child(
-                Container::new(self.render_upgrade_banner(appearance))
-                    .with_margin_top(12.)
-                    .finish(),
-            );
-        }
+        // Genesi Code is local-first: there are no paid/premium tiers, so the
+        // Warp "Upgrade for premium models" upsell banner is never shown.
+        let _ = has_disabled;
 
         col.finish()
     }
