@@ -42,10 +42,15 @@ jobs:
         # assets (fonts, imagery) are LFS-tracked and get embedded at build time.
         run: pacman -Sy --needed --noconfirm git git-lfs openssh
 
-      - name: Checkout (genesi branch, no LFS smudge yet)
+      - name: Checkout (genesi branch, with LFS)
+        # git-lfs is installed in the step above, so the action can smudge LFS
+        # assets (fonts under app/assets/bundled/fonts/**) during checkout. The
+        # previous lfs:false + manual `git lfs pull` pulled ZERO objects on this
+        # fork, so fonts embedded as pointers and the binary panicked at runtime
+        # ("no asset exists at path bundled/fonts/hack/Hack-Italic.ttf").
         uses: actions/checkout@v4
         with:
-          lfs: false
+          lfs: true
 
       - name: Build headroom (overcommit + swap backstop)
         shell: bash
@@ -84,12 +89,25 @@ jobs:
           # cargo invocation doesn't pay for an implicit download mid-build.
           rustup toolchain install 1.92.0 --profile minimal -c rustfmt -c clippy
 
-      - name: Pull Git LFS assets
+      - name: Ensure LFS assets materialized (fail fast)
         shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git lfs install --local
-          git lfs pull
+          git lfs install --local || true
+          git lfs pull || true
+          f=app/assets/bundled/fonts/hack/Hack-Italic.ttf
+          if [ ! -f "$f" ]; then echo "::error::missing $f"; exit 1; fi
+          sz=$(stat -c%s "$f")
+          echo "Hack-Italic.ttf = $sz bytes"
+          # LFS pointer files are ~130 bytes; a real .ttf is tens of KB+.
+          if [ "$sz" -lt 4096 ]; then
+            echo "::error::LFS not materialized ($sz bytes = pointer). Fonts would embed as pointers and the binary would panic at runtime."
+            head -c 300 "$f"; echo
+            exit 1
+          fi
+          # Surface any pointer files still lurking under the embedded asset dir.
+          ptrs=$(grep -rlI "git-lfs.github.com/spec" app/assets 2>/dev/null | wc -l || echo 0)
+          echo "remaining LFS pointer files under app/assets: $ptrs"
 
       - name: Build Genesi Code (dev)
         shell: bash
