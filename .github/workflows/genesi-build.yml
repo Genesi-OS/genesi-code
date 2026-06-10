@@ -1,0 +1,113 @@
+name: Build Genesi Code
+
+# Builds the Genesi Code binary inside a CachyOS container (Arch-native, so it
+# runs on Genesi OS) and uploads it as a downloadable artifact for testing on a
+# Genesi OS VM. Mirrors the proven container/swap setup from the GenesiOS repo's
+# publish-packages.yml.
+#
+# NOTE: GitHub disables Actions on forks by default — enable them once under the
+# repo's Actions tab for this workflow to run.
+
+on:
+  push:
+    branches: [genesi]
+    paths:
+      - 'app/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/genesi-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      # cachyos-v3 ships CachyOS repos + a trusted keyring. Arch-native build ->
+      # the resulting binary runs on Genesi OS (CachyOS-based).
+      image: cachyos/cachyos-v3:latest
+      # --privileged so we can swapon a backstop swapfile: a 60+ crate Rust
+      # build (esp. the link step) can exhaust the runner's RAM. Same headroom
+      # trick publish-packages.yml uses for the heavy Vulkan build.
+      options: --privileged
+
+    steps:
+      - name: Install git in container
+        # Needed before actions/checkout; --needed avoids reinstalling git on a
+        # running pacman process (can deadlock). git-lfs is required because some
+        # assets (fonts, imagery) are LFS-tracked and get embedded at build time.
+        run: pacman -Sy --needed --noconfirm git git-lfs openssh
+
+      - name: Checkout (genesi branch, no LFS smudge yet)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Build headroom (overcommit + swap backstop)
+        shell: bash
+        run: |
+          set -x
+          sysctl -w vm.overcommit_memory=1 || echo "::warning::could not set overcommit"
+          if [ ! -e /ci-swapfile ]; then
+            fallocate -l 16G /ci-swapfile 2>/dev/null || dd if=/dev/zero of=/ci-swapfile bs=1M count=16384
+            chmod 600 /ci-swapfile
+            mkswap /ci-swapfile
+            swapon /ci-swapfile || echo "::warning::swapon failed — relying on overcommit"
+          fi
+          swapon --show || true
+          free -h || true
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Don't `-Syu` (upgrading pacman mid-CI can deadlock). DB refresh +
+          # needed deps only, with retries for CachyOS CDN flakes.
+          install_deps() {
+            pacman -Syy --noconfirm && \
+            pacman -S --needed --noconfirm --overwrite='*' \
+              base-devel git git-lfs mold cmake clang pkgconf python openssl \
+              fontconfig freetype2 libxkbcommon wayland libx11 libxcb \
+              vulkan-icd-loader vulkan-headers mesa rustup
+          }
+          for attempt in 1 2 3 4 5; do
+            if install_deps; then echo "deps installed (attempt $attempt)"; break; fi
+            if [ "$attempt" = 5 ]; then echo "::error::deps failed (CachyOS CDN)"; exit 1; fi
+            echo "::warning::deps attempt $attempt failed; retry in 30s"; sleep 30
+          done
+          # rust-toolchain.toml pins 1.92.0; install it explicitly so the first
+          # cargo invocation doesn't pay for an implicit download mid-build.
+          rustup toolchain install 1.92.0 --profile minimal -c rustfmt clippy
+
+      - name: Pull Git LFS assets
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git lfs install --local
+          git lfs pull
+
+      - name: Build Genesi Code (dev)
+        shell: bash
+        env:
+          # Drop debuginfo to cut link-time RAM/disk dramatically (proven locally:
+          # ~5.8 GB peak). mold linker for speed. Bounded jobs for RAM safety.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          CARGO_BUILD_JOBS: "4"
+        run: cargo build --bin warp
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/debug/warp dist/genesi-code
+          chmod +x dist/genesi-code
+          ls -lh dist/
+
+      - name: Upload Genesi Code binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: genesi-code-linux-x86_64
+          path: dist/genesi-code
+          if-no-files-found: error
