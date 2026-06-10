@@ -69,7 +69,7 @@ pub fn load_config_from_generator(channel: &str) -> ChannelConfig {
     // pipeline). The channel/target args are kept for signature compatibility.
     let _ = (channel, target_family, target_os);
     ChannelConfig {
-        app_id: AppId::new("dev", "warp", "WarpOss"),
+        app_id: AppId::new("dev", "genesi", "GenesiCode"),
         logfile_name: "".into(),
         server_config: WarpServerConfig::production(),
         oz_config: OzConfig::production(),
