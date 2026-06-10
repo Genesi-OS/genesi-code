@@ -23,6 +23,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Needed so the build can publish a GitHub Release with the binary.
+    permissions:
+      contents: write
     container:
       # cachyos-v3 ships CachyOS repos + a trusted keyring. Arch-native build ->
       # the resulting binary runs on Genesi OS (CachyOS-based).
@@ -98,17 +101,42 @@ jobs:
           CARGO_BUILD_JOBS: "4"
         run: cargo build --bin warp
 
-      - name: Stage artifact
+      - name: Stage + compress artifact
         shell: bash
         run: |
           mkdir -p dist
           cp target/debug/warp dist/genesi-code
           chmod +x dist/genesi-code
+          # zstd-compressed tarball for the Release asset (consistent name so the
+          # latest-release download URL is stable for the package installer).
+          tar -C dist -caf dist/genesi-code-linux-x86_64.tar.zst genesi-code
           ls -lh dist/
 
-      - name: Upload Genesi Code binary
+      - name: Upload build artifact (login-only fallback)
         uses: actions/upload-artifact@v4
         with:
           name: genesi-code-linux-x86_64
-          path: dist/genesi-code
+          path: dist/genesi-code-linux-x86_64.tar.zst
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        # One Release per successful build (tag = run number, monotonic). The
+        # asset name is constant, so the package installer can always pull
+        # https://github.com/zFreshy/genesi-code/releases/latest/download/genesi-code-linux-x86_64.tar.zst
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.${{ github.run_number }}
+          name: Genesi Code build ${{ github.run_number }}
+          make_latest: true
+          files: dist/genesi-code-linux-x86_64.tar.zst
+          body: |
+            Automated Genesi Code build from `${{ github.sha }}` (branch `genesi`).
+
+            Install / run:
+            ```bash
+            tar xaf genesi-code-linux-x86_64.tar.zst
+            chmod +x genesi-code
+            ./genesi-code            # or: WGPU_BACKEND=gl ./genesi-code on a GPU-less VM
+            ```
+            Dev build (unoptimized, self-contained). Latest asset is always at the
+            `releases/latest/download/genesi-code-linux-x86_64.tar.zst` URL.
