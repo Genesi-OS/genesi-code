@@ -68,6 +68,7 @@ jobs:
             pacman -Syy --noconfirm && \
             pacman -S --needed --noconfirm --overwrite='*' \
               base-devel git git-lfs mold cmake clang pkgconf python openssl \
+              protobuf \
               fontconfig freetype2 libxkbcommon wayland libx11 libxcb \
               vulkan-icd-loader vulkan-headers mesa rustup
           }
