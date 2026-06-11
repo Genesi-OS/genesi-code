@@ -487,6 +487,10 @@ impl LocalCodeEditorView {
             return;
         }
 
+        log::info!(
+            "completion popup: showing {} candidate(s) (anchor={anchor:?})",
+            filtered.len()
+        );
         self.lsp_completion_state = LspCompletionState::Active {
             items,
             filtered,

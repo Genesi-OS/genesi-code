@@ -925,7 +925,20 @@ impl LocalCodeEditorView {
             LspCompletionState::Active { anchor, .. } => *anchor,
             _ => return None,
         };
-        self.compute_card_positioning(anchor, COMPLETION_POPUP_MAX_HEIGHT, app)
+        // Anchor at the character *before* the prefix (the trigger `.`), which
+        // always has a glyph box. The offset right after the dot can sit at
+        // end-of-line, where `character_bounds_in_viewport` returns None and the
+        // popup would never get positioned (and thus never render).
+        let before = anchor.saturating_sub(&CharOffset::from(1));
+        let positioning = self
+            .compute_card_positioning(before, COMPLETION_POPUP_MAX_HEIGHT, app)
+            .or_else(|| self.compute_card_positioning(anchor, COMPLETION_POPUP_MAX_HEIGHT, app));
+        if positioning.is_none() {
+            log::warn!(
+                "completion popup: could not compute positioning (anchor={anchor:?})"
+            );
+        }
+        positioning
     }
 
     /// Get the positioning for the find references card based on the request offset.
