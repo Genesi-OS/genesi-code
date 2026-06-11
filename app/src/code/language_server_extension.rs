@@ -632,6 +632,22 @@ impl LocalCodeEditorView {
         };
 
         let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
+
+        // Defensive: if the char right before the anchor is already the trigger
+        // `.`, strip any leading dot the server may have baked into the insert
+        // text so we don't produce `a..at`.
+        let before_anchor = anchor.saturating_sub(&CharOffset::from(1));
+        let prev_is_dot = self.editor().as_ref(ctx).char_at(before_anchor, ctx) == Some('.');
+        let insert_text = if prev_is_dot {
+            insert_text.trim_start_matches('.').to_string()
+        } else {
+            insert_text
+        };
+
+        log::info!(
+            "completion accept: anchor={anchor:?} cursor={cursor:?} prev_is_dot={prev_is_dot} insert={insert_text:?}"
+        );
+
         self.editor.update(ctx, |editor, ctx| {
             let edits = vec![(insert_text, anchor..cursor)];
             if let Ok(edits) = Vec1::try_from_vec(edits) {
