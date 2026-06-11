@@ -404,6 +404,67 @@ impl LocalCodeEditorView {
         self.lsp_hover_state = LspHoverState::Loading(Some(abort_handle));
     }
 
+    /// Request LSP completion candidates at the given (buffer) offset.
+    ///
+    /// For now this exercises the new `textDocument/completion` path end-to-end
+    /// and logs the returned candidates to both the server log and the app log.
+    /// The interactive popup that renders these results is wired in a follow-up;
+    /// keeping the request path separate lets us confirm on-device that servers
+    /// actually return completions now that the capability is advertised.
+    pub(super) fn completion_for_offset(
+        &mut self,
+        offset: CharOffset,
+        trigger: lsp::CompletionTrigger,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(file_path) = self.file_path() else {
+            return;
+        };
+        let Some(lsp_server) = self.lsp_server.as_ref() else {
+            return;
+        };
+
+        let lsp_position = self
+            .editor()
+            .as_ref(ctx)
+            .offset_to_lsp_position(offset, ctx);
+
+        let future = match lsp_server.as_ref(ctx).completion(
+            file_path.to_path_buf(),
+            lsp_position,
+            trigger,
+        ) {
+            Ok(future) => future,
+            Err(e) => {
+                log::warn!("Failed to call lsp.completion: {e}");
+                return;
+            }
+        };
+
+        ctx.spawn(future, move |me, result, ctx| match result {
+            Ok(items) => {
+                let labels: Vec<String> =
+                    items.iter().take(8).map(|item| item.label.clone()).collect();
+                if let Some(server) = me.lsp_server.as_ref() {
+                    server.as_ref(ctx).log_to_server_log(
+                        LspServerLogLevel::Info,
+                        format!(
+                            "completion: received {} item(s); first: {labels:?}",
+                            items.len()
+                        ),
+                    );
+                }
+                log::info!(
+                    "LSP completion returned {} item(s); first: {labels:?}",
+                    items.len()
+                );
+            }
+            Err(e) => {
+                log::warn!("lsp.completion request failed: {e}");
+            }
+        });
+    }
+
     pub(super) fn create_highlighted_code_fragment(
         language: String,
         code: String,

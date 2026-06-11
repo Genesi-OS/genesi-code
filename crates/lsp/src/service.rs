@@ -8,7 +8,8 @@ use jsonrpc::{JsonRpcService, RequestId, ServerNotificationEvent};
 use lsp_types::notification::{self, Notification};
 use lsp_types::request::{self, Request};
 use lsp_types::{
-    CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    CancelParams, CompletionContext, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, FileChangeType, FileSystemWatcher,
     FormattingOptions, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
@@ -23,8 +24,8 @@ use warp_util::on_cancel::OnCancelFutureExt;
 
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
-    HoverResult, LspDefinitionLocation, ReferenceLocation, TextDocumentContentChangeEvent,
-    TextEdit, WatchedFileChangeEvent,
+    CompletionItem, CompletionTrigger, HoverResult, LspDefinitionLocation, ReferenceLocation,
+    TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
 
@@ -735,5 +736,65 @@ impl<'a> TextDocumentService<'a> {
             .into_iter()
             .filter_map(|loc| ReferenceLocation::try_from(loc).ok())
             .collect())
+    }
+
+    /// Request completion candidates at the given position.
+    ///
+    /// `trigger` is forwarded as the LSP `CompletionContext` so servers can
+    /// distinguish a `.`-triggered member completion from an explicitly invoked
+    /// one. Returns an empty list when the server has nothing (including the
+    /// spec's `null` response).
+    pub async fn completion(
+        &self,
+        path: &Path,
+        position: Position,
+        trigger: CompletionTrigger,
+    ) -> anyhow::Result<Vec<CompletionItem>> {
+        let uri = path_to_lsp_uri(path)?;
+
+        let context = match trigger {
+            CompletionTrigger::Invoked => CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            CompletionTrigger::TriggerCharacter(c) => CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(c.to_string()),
+            },
+        };
+
+        let completion_params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: Some(context),
+        };
+
+        let result = self
+            .service
+            .send_request::<request::Completion>(completion_params)
+            .await;
+
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/completion failed: {e}"),
+            );
+        }
+
+        // The LSP spec allows textDocument/completion to return null.
+        let Some(response) = result? else {
+            return Ok(Vec::new());
+        };
+
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        Ok(items.into_iter().map(Into::into).collect())
     }
 }

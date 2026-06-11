@@ -262,6 +262,65 @@ fn marked_string_to_string(marked: lsp_types::MarkedString) -> String {
     }
 }
 
+/// How a completion request was triggered, forwarded as the LSP
+/// `CompletionContext` so servers can tailor results (e.g. member completions
+/// after a `.`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTrigger {
+    /// Explicitly invoked (keybinding) or while typing an identifier character.
+    Invoked,
+    /// A registered trigger character (e.g. `.`) was just typed.
+    TriggerCharacter(char),
+}
+
+/// A single completion candidate returned from `textDocument/completion`,
+/// flattened from `lsp_types::CompletionItem` into the fields the editor needs.
+#[derive(Debug, Clone)]
+pub struct CompletionItem {
+    /// The text shown in the completion list.
+    pub label: String,
+    /// The text actually inserted when the item is accepted. For v1 this is
+    /// plain text (snippets are disabled in the advertised capabilities).
+    pub insert_text: String,
+    /// Extra info (type signature, source module, ...) shown alongside the label.
+    pub detail: Option<String>,
+    /// The semantic kind (function, variable, ...), used to pick an icon.
+    pub kind: Option<lsp_types::CompletionItemKind>,
+    /// Server-provided ordering key; falls back to `label` when absent.
+    pub sort_text: Option<String>,
+    /// Text the client should match the typed prefix against; falls back to `label`.
+    pub filter_text: Option<String>,
+}
+
+impl From<lsp_types::CompletionItem> for CompletionItem {
+    fn from(item: lsp_types::CompletionItem) -> Self {
+        // Prefer an explicit insert_text, then a text edit's new_text, then the
+        // label. We deliberately ignore the text-edit range here; the editor
+        // replaces the current identifier prefix on accept (simple + correct for
+        // the common identifier/member-access cases).
+        let insert_text = item
+            .insert_text
+            .clone()
+            .or_else(|| match &item.text_edit {
+                Some(lsp_types::CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
+                Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+                    Some(edit.new_text.clone())
+                }
+                None => None,
+            })
+            .unwrap_or_else(|| item.label.clone());
+
+        Self {
+            label: item.label,
+            insert_text,
+            detail: item.detail,
+            kind: item.kind,
+            sort_text: item.sort_text,
+            filter_text: item.filter_text,
+        }
+    }
+}
+
 /// A file change event that can be forwarded to the language server using
 /// `workspace/didChangeWatchedFiles`.
 #[derive(Debug, Clone, PartialEq, Eq)]

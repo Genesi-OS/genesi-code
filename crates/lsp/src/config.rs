@@ -6,8 +6,9 @@ use anyhow::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use command::r#async::Command;
 use lsp_types::{
-    ClientCapabilities, ClientInfo, DidChangeWatchedFilesClientCapabilities, GotoCapability,
-    HoverClientCapabilities, InitializeParams, MarkupKind, PublishDiagnosticsClientCapabilities,
+    ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
+    DidChangeWatchedFilesClientCapabilities, GotoCapability, HoverClientCapabilities,
+    InitializeParams, MarkupKind, PublishDiagnosticsClientCapabilities,
     TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri,
     WindowClientCapabilities, WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceFolder,
 };
@@ -310,6 +311,25 @@ fn default_client_capabilities() -> ClientCapabilities {
                 // Request Markdown content from the LSP for hover responses.
                 // This enables proper syntax highlighting in hover tooltips.
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+            }),
+            // Genesi: advertise textDocument/completion so language servers offer
+            // classic (non-AI) autocomplete. Upstream Warp never declared this, so
+            // servers withheld completions even though diagnostics/hover worked.
+            // snippet_support is intentionally false for v1: we insert plain text
+            // (the item's insert_text/label) and don't interpret `$1`/`${...}`
+            // placeholders, keeping the editor-side accept path simple.
+            completion: Some(CompletionClientCapabilities {
+                dynamic_registration: Some(false),
+                completion_item: Some(CompletionItemCapability {
+                    snippet_support: Some(false),
+                    documentation_format: Some(vec![
+                        MarkupKind::Markdown,
+                        MarkupKind::PlainText,
+                    ]),
+                    ..Default::default()
+                }),
+                context_support: Some(true),
+                ..Default::default()
             }),
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 version_support: Some(true),

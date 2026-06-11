@@ -334,6 +334,22 @@ impl LocalCodeEditorView {
                 if origin.from_user() {
                     me.was_edited = true;
                     ctx.emit(LocalCodeEditorEvent::UserEdited);
+
+                    // Genesi: trigger classic (non-AI) LSP autocomplete when the user
+                    // types a member-access dot. The interactive popup that renders
+                    // these candidates is wired in a follow-up; for now this confirms
+                    // the textDocument/completion request path works end-to-end.
+                    if me.is_lsp_server_available(ctx) {
+                        let cursor = me.editor().as_ref(ctx).cursor_head_offset(ctx);
+                        let before_cursor = cursor.saturating_sub(&CharOffset::from(1));
+                        if me.editor().as_ref(ctx).char_at(before_cursor, ctx) == Some('.') {
+                            me.completion_for_offset(
+                                cursor,
+                                lsp::CompletionTrigger::TriggerCharacter('.'),
+                                ctx,
+                            );
+                        }
+                    }
                 }
             }
             CodeEditorEvent::VimEscapeInNormalMode => {

@@ -25,8 +25,8 @@ use crate::config::{lsp_uri_to_path, LanguageId};
 use crate::server_repo_watcher::LspRepoWatcher;
 use crate::supported_servers::LSPServerType;
 use crate::types::{
-    DefinitionLocation, DocumentVersion, HoverResult, Location, ReferenceLocation,
-    TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
+    CompletionItem, CompletionTrigger, DefinitionLocation, DocumentVersion, HoverResult, Location,
+    ReferenceLocation, TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{spawn_lsp_service, LspServiceInitializationResult};
@@ -728,6 +728,21 @@ impl LspServerModel {
             service
                 .text_document()
                 .references(&path, position.into_lsp())
+                .await
+        })
+    }
+
+    pub fn completion(
+        &self,
+        path: PathBuf,
+        position: Location,
+        trigger: CompletionTrigger,
+    ) -> Result<impl Future<Output = Result<Vec<CompletionItem>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .completion(&path, position.into_lsp(), trigger)
                 .await
         })
     }
