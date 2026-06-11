@@ -143,14 +143,16 @@ fn get_wgpu_instance() -> Arc<wgpu::Instance> {
 
 /// Returns the set of wgpu backends that we can select from.
 ///
-/// Genesi: default to `PRIMARY` (Vulkan/Metal/DX12) instead of `all()`. The GL
-/// backend is excluded because the VirtualBox SVGA3D GL adapter fails surface
-/// creation ("Failed to create surface for any enabled backend"), making the
-/// window never appear inside a VM. Vulkan (real driver on hardware, lavapipe
-/// in a VM) works in every environment Genesi OS ships. GL can still be forced
-/// explicitly with `WGPU_BACKEND=gl`.
+/// Default to `all()` (upstream behavior) so wgpu keeps the GL fallback that
+/// real hardware without a Vulkan driver may need. NOTE on VMs: in VirtualBox
+/// the SVGA3D *GL* adapter creates a surface but renders the window invisibly,
+/// while lavapipe *Vulkan* fails surface creation outright — so the reliable
+/// path inside a VM is software GL (`LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl`).
+/// That is handled by the Genesi OS launcher wrapper (which detects a VM), NOT
+/// by narrowing the backend set here (an earlier `PRIMARY` default removed GL
+/// and made VMs fail hard at surface creation instead).
 fn wgpu_backend_options() -> wgpu::Backends {
-    wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY)
+    wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all())
 }
 
 #[cfg(not(target_family = "wasm"))]
