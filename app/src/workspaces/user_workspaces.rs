@@ -484,7 +484,12 @@ impl UserWorkspaces {
             .get()
             .is_anonymous_or_logged_out()
         {
-            return false;
+            // Genesi: local-first editor with no Warp account/billing. Upstream
+            // blocked anonymous users from BYO keys because it was a paid Warp
+            // entitlement. We allow it so a logged-out user can add a custom
+            // inference endpoint pointing at the on-device ollama/llama-server
+            // (the one genesi-ai-mode already runs) and get AI with no account.
+            return true;
         }
         self.current_workspace()
             .map(|workspace| workspace.is_byo_api_key_enabled())
