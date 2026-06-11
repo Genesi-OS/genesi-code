@@ -819,6 +819,29 @@ impl TypedActionView for CodeEditorView {
             return;
         }
 
+        // When the parent is showing an LSP completion popup, intercept the
+        // navigation/accept keys and forward them as events instead of moving
+        // the cursor or inserting a newline. Escape is already routed to the
+        // parent via `EscapePressed` (see `escape`). Typing/Backspace fall
+        // through so the buffer still edits and the parent re-filters.
+        if self.completion_active {
+            match action {
+                MoveDown => {
+                    ctx.emit(CodeEditorEvent::CompletionSelectNext);
+                    return;
+                }
+                MoveUp => {
+                    ctx.emit(CodeEditorEvent::CompletionSelectPrev);
+                    return;
+                }
+                Enter => {
+                    ctx.emit(CodeEditorEvent::CompletionAccept);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match action {
             UserTyped(content) => self.user_insert(content, ctx),
             VimUserTyped(content) => {

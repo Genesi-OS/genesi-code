@@ -19,10 +19,12 @@ use warpui::{AppContext, Element, SingletonEntity, ViewContext};
 use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use super::lsp_telemetry::LspTelemetryEvent;
 use crate::code::local_code_editor::{
-    HoverContentSegment, LocalCodeEditorView, LspHoverState, HOVER_TOOLTIP_MAX_HEIGHT,
-    HOVER_TOOLTIP_MAX_WIDTH,
+    HoverContentSegment, LocalCodeEditorView, LspCompletionState, LspHoverState,
+    COMPLETION_MAX_VISIBLE_ITEMS, COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH,
+    HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
 use crate::editor::InteractionState;
+use vec1::Vec1;
 
 /// A processed diagnostic with its converted offset range.
 /// Stored on LocalCodeEditorView and used for both decoration and hover display.
@@ -404,13 +406,10 @@ impl LocalCodeEditorView {
         self.lsp_hover_state = LspHoverState::Loading(Some(abort_handle));
     }
 
-    /// Request LSP completion candidates at the given (buffer) offset.
-    ///
-    /// For now this exercises the new `textDocument/completion` path end-to-end
-    /// and logs the returned candidates to both the server log and the app log.
-    /// The interactive popup that renders these results is wired in a follow-up;
-    /// keeping the request path separate lets us confirm on-device that servers
-    /// actually return completions now that the capability is advertised.
+    /// Request LSP completion candidates at the given (buffer) offset and, on
+    /// success, open the completion popup. `offset` is the cursor position at
+    /// request time and becomes the popup's `anchor` (the start of the
+    /// replaceable prefix — i.e. just after the trigger `.`).
     pub(super) fn completion_for_offset(
         &mut self,
         offset: CharOffset,
@@ -441,28 +440,289 @@ impl LocalCodeEditorView {
             }
         };
 
-        ctx.spawn(future, move |me, result, ctx| match result {
-            Ok(items) => {
-                let labels: Vec<String> =
-                    items.iter().take(8).map(|item| item.label.clone()).collect();
-                if let Some(server) = me.lsp_server.as_ref() {
-                    server.as_ref(ctx).log_to_server_log(
-                        LspServerLogLevel::Info,
-                        format!(
-                            "completion: received {} item(s); first: {labels:?}",
-                            items.len()
-                        ),
-                    );
+        let anchor = offset;
+        let abort_handle = ctx
+            .spawn(future, move |me, result, ctx| match result {
+                Ok(items) if !items.is_empty() => {
+                    if let Some(server) = me.lsp_server.as_ref() {
+                        server.as_ref(ctx).log_to_server_log(
+                            LspServerLogLevel::Info,
+                            format!("completion: received {} item(s)", items.len()),
+                        );
+                    }
+                    me.populate_completion(anchor, items, ctx);
                 }
-                log::info!(
-                    "LSP completion returned {} item(s); first: {labels:?}",
-                    items.len()
-                );
+                Ok(_) => {
+                    me.dismiss_completion(ctx);
+                }
+                Err(e) => {
+                    log::warn!("lsp.completion request failed: {e}");
+                    me.dismiss_completion(ctx);
+                }
+            })
+            .abort_handle();
+
+        self.lsp_completion_state = LspCompletionState::Loading(Some(abort_handle));
+    }
+
+    /// Build the active popup state from freshly-returned candidates, filtering
+    /// by whatever prefix the user has typed since the request was issued (they
+    /// may have kept typing while it was in flight).
+    fn populate_completion(
+        &mut self,
+        anchor: CharOffset,
+        items: Vec<lsp::CompletionItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
+        let Some(prefix) = self.completion_prefix(anchor, cursor, ctx) else {
+            // The user moved away or typed a non-identifier char — drop it.
+            self.dismiss_completion(ctx);
+            return;
+        };
+
+        let filtered = Self::completion_filter(&items, &prefix);
+        if filtered.is_empty() {
+            self.dismiss_completion(ctx);
+            return;
+        }
+
+        self.lsp_completion_state = LspCompletionState::Active {
+            items,
+            filtered,
+            selected: 0,
+            anchor,
+            scroll_state: Default::default(),
+        };
+        self.set_editor_completion_active(true, ctx);
+        ctx.notify();
+    }
+
+    /// Reads the typed prefix between `anchor` and `cursor`. Returns `None` when
+    /// the cursor is before the anchor or the gap contains a non-identifier
+    /// character (both mean the completion is no longer valid and should close).
+    fn completion_prefix(
+        &self,
+        anchor: CharOffset,
+        cursor: CharOffset,
+        ctx: &ViewContext<Self>,
+    ) -> Option<String> {
+        if cursor < anchor {
+            return None;
+        }
+        let editor = self.editor().as_ref(ctx);
+        let mut prefix = String::new();
+        for i in anchor.as_usize()..cursor.as_usize() {
+            match editor.char_at(CharOffset::from(i), ctx) {
+                Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => prefix.push(c),
+                _ => return None,
             }
-            Err(e) => {
-                log::warn!("lsp.completion request failed: {e}");
+        }
+        Some(prefix)
+    }
+
+    /// Case-insensitive prefix filter over the candidate list, capped so the
+    /// rendered/scrolled list stays bounded. Preserves the server's order.
+    fn completion_filter(items: &[lsp::CompletionItem], prefix: &str) -> Vec<usize> {
+        if prefix.is_empty() {
+            return (0..items.len().min(COMPLETION_MAX_VISIBLE_ITEMS)).collect();
+        }
+        let needle = prefix.to_lowercase();
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                let haystack = item.filter_text.as_deref().unwrap_or(&item.label);
+                haystack.to_lowercase().starts_with(&needle)
+            })
+            .map(|(index, _)| index)
+            .take(COMPLETION_MAX_VISIBLE_ITEMS)
+            .collect()
+    }
+
+    fn set_editor_completion_active(&mut self, active: bool, ctx: &mut ViewContext<Self>) {
+        self.editor.update(ctx, |editor, ctx| {
+            editor.set_completion_active(active, ctx);
+        });
+    }
+
+    /// Re-filter the open popup against the current typed prefix. Called on every
+    /// user content change while a popup is active; closes the popup when the
+    /// prefix becomes invalid or matches nothing.
+    pub(super) fn refilter_completion(&mut self, ctx: &mut ViewContext<Self>) {
+        let anchor = match &self.lsp_completion_state {
+            LspCompletionState::Active { anchor, .. } => *anchor,
+            _ => return,
+        };
+        let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
+        let Some(prefix) = self.completion_prefix(anchor, cursor, ctx) else {
+            self.dismiss_completion(ctx);
+            return;
+        };
+        let new_filtered = match &self.lsp_completion_state {
+            LspCompletionState::Active { items, .. } => Self::completion_filter(items, &prefix),
+            _ => return,
+        };
+        if new_filtered.is_empty() {
+            self.dismiss_completion(ctx);
+            return;
+        }
+        if let LspCompletionState::Active {
+            filtered, selected, ..
+        } = &mut self.lsp_completion_state
+        {
+            *filtered = new_filtered;
+            *selected = 0;
+        }
+        ctx.notify();
+    }
+
+    pub(super) fn completion_select_next(&mut self, ctx: &mut ViewContext<Self>) {
+        if let LspCompletionState::Active {
+            filtered, selected, ..
+        } = &mut self.lsp_completion_state
+        {
+            if !filtered.is_empty() {
+                *selected = (*selected + 1) % filtered.len();
+                ctx.notify();
+            }
+        }
+    }
+
+    pub(super) fn completion_select_prev(&mut self, ctx: &mut ViewContext<Self>) {
+        if let LspCompletionState::Active {
+            filtered, selected, ..
+        } = &mut self.lsp_completion_state
+        {
+            if !filtered.is_empty() {
+                *selected = if *selected == 0 {
+                    filtered.len() - 1
+                } else {
+                    *selected - 1
+                };
+                ctx.notify();
+            }
+        }
+    }
+
+    /// Apply the selected candidate: replace the typed prefix `anchor..cursor`
+    /// with the item's insert text, then close the popup.
+    pub(super) fn accept_completion(&mut self, ctx: &mut ViewContext<Self>) {
+        let (anchor, insert_text) = match &self.lsp_completion_state {
+            LspCompletionState::Active {
+                items,
+                filtered,
+                selected,
+                anchor,
+                ..
+            } => {
+                let Some(&item_index) = filtered.get(*selected) else {
+                    return;
+                };
+                let Some(item) = items.get(item_index) else {
+                    return;
+                };
+                (*anchor, item.insert_text.clone())
+            }
+            _ => return,
+        };
+
+        let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
+        self.editor.update(ctx, |editor, ctx| {
+            let edits = vec![(insert_text, anchor..cursor)];
+            if let Ok(edits) = Vec1::try_from_vec(edits) {
+                editor.apply_edits(edits, ctx);
             }
         });
+
+        self.dismiss_completion(ctx);
+    }
+
+    /// Close the completion popup (if any) and stop the editor from intercepting
+    /// navigation keys. Returns whether anything was dismissed.
+    pub(super) fn dismiss_completion(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        if self.lsp_completion_state.clear() {
+            self.set_editor_completion_active(false, ctx);
+            ctx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Render the completion popup if candidates are available.
+    pub(super) fn render_completion_popup(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        let (items, filtered, selected, scroll_state) = match &self.lsp_completion_state {
+            LspCompletionState::Active {
+                items,
+                filtered,
+                selected,
+                scroll_state,
+                ..
+            } => (items, filtered, *selected, scroll_state.clone()),
+            _ => return None,
+        };
+        if filtered.is_empty() {
+            return None;
+        }
+
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+
+        let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for (row_index, &item_index) in filtered.iter().enumerate() {
+            let Some(item) = items.get(item_index) else {
+                continue;
+            };
+            let is_selected = row_index == selected;
+
+            let text = FormattedText::new([FormattedTextLine::Line(vec![
+                FormattedTextFragment::plain_text(item.label.clone()),
+            ])]);
+            let label_element = FormattedTextElement::new(
+                text,
+                appearance.monospace_font_size(),
+                appearance.ui_font_family(),
+                appearance.monospace_font_family(),
+                theme.active_ui_text_color().into(),
+                HighlightedHyperlink::default(),
+            )
+            .finish();
+
+            let mut row = Container::new(label_element)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(2.);
+            if is_selected {
+                row = row.with_background(warpui::elements::Fill::Solid(
+                    internal_colors::neutral_3(theme),
+                ));
+            }
+            column.add_child(row.finish());
+        }
+
+        let scrollable_content = ClippedScrollable::vertical(
+            scroll_state,
+            column.finish(),
+            ScrollbarWidth::Auto,
+            theme.disabled_ui_text_color().into(),
+            theme.active_ui_text_color().into(),
+            warpui::elements::Fill::None,
+        )
+        .finish();
+
+        let constrained_content = ConstrainedBox::new(scrollable_content)
+            .with_width(COMPLETION_POPUP_MAX_WIDTH)
+            .with_max_height(COMPLETION_POPUP_MAX_HEIGHT)
+            .finish();
+
+        let popup = Container::new(constrained_content)
+            .with_vertical_padding(4.)
+            .with_background(theme.background())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_border(Border::all(1.).with_border_fill(internal_colors::neutral_4(theme)))
+            .finish();
+
+        Some(popup)
     }
 
     pub(super) fn create_highlighted_code_fragment(

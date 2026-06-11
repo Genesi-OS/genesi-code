@@ -111,6 +111,14 @@ pub enum CodeEditorEvent {
     /// Emitted when escape key is pressed (regardless of Vim state).
     /// This allows parent views to handle escape for closing overlays.
     EscapePressed,
+    /// Emitted when the completion popup is open and the user presses Down —
+    /// the parent moves the selection instead of moving the cursor.
+    CompletionSelectNext,
+    /// Emitted when the completion popup is open and the user presses Up.
+    CompletionSelectPrev,
+    /// Emitted when the completion popup is open and the user presses Enter —
+    /// the parent applies the selected candidate instead of inserting a newline.
+    CompletionAccept,
     /// Emitted when diff decorations are updated (line highlights, removed lines, etc.)
     DiffUpdated,
     /// Emitted when the plus icon is clicked to add diff hunk context
@@ -283,6 +291,11 @@ pub struct CodeEditorView {
     /// The offset where find references card is anchored (if showing).
     find_references_anchor_offset: Option<CharOffset>,
     window_id: WindowId,
+    /// Whether the parent `LocalCodeEditorView` is currently showing an LSP
+    /// completion popup. When true, navigation/accept keystrokes (Up/Down/Enter)
+    /// are intercepted in `handle_action` and forwarded as `CodeEditorEvent`s
+    /// instead of editing the buffer.
+    completion_active: bool,
 }
 
 impl CodeEditorView {
@@ -430,11 +443,20 @@ impl CodeEditorView {
             show_find_references_provider: render_options.show_find_references_provider,
             find_references_anchor_offset: None,
             window_id: ctx.window_id(),
+            completion_active: false,
         }
     }
 
     pub fn set_find_references_anchor_offset(&mut self, offset: Option<CharOffset>) {
         self.find_references_anchor_offset = offset;
+    }
+
+    /// Set by the parent `LocalCodeEditorView` to enable/disable completion
+    /// keyboard interception. When active, Up/Down/Enter are forwarded as
+    /// `CodeEditorEvent::Completion*` events rather than moving the cursor or
+    /// inserting a newline.
+    pub fn set_completion_active(&mut self, active: bool, _ctx: &mut ViewContext<Self>) {
+        self.completion_active = active;
     }
 
     pub fn find_references_save_position_id(&self) -> &str {

@@ -256,8 +256,46 @@ impl LspHoverState {
     }
 }
 
+/// State for the LSP completion popup (classic, non-AI autocomplete).
+pub(super) enum LspCompletionState {
+    None,
+    Loading(Option<AbortHandle>),
+    Active {
+        /// All candidates returned by the server (kept in server/sort order).
+        items: Vec<lsp::CompletionItem>,
+        /// Indices into `items` matching the current typed prefix.
+        filtered: Vec<usize>,
+        /// Selected position within `filtered`.
+        selected: usize,
+        /// Buffer offset where the replaceable prefix begins (just after the
+        /// trigger). Accept replaces `anchor..cursor` with the item's insert_text.
+        anchor: CharOffset,
+        /// Scroll state for the (possibly long) candidate list.
+        scroll_state: ClippedScrollStateHandle,
+    },
+}
+
+impl LspCompletionState {
+    /// Clears the state, aborting any in-flight request. Returns whether
+    /// anything was cleared (so callers can decide to `notify`).
+    pub(super) fn clear(&mut self) -> bool {
+        if matches!(self, LspCompletionState::None) {
+            return false;
+        }
+        if let Self::Loading(Some(handle)) = self {
+            handle.abort();
+        }
+        *self = LspCompletionState::None;
+        true
+    }
+}
+
 pub(super) const HOVER_TOOLTIP_MAX_WIDTH: f32 = 400.;
 pub(super) const HOVER_TOOLTIP_MAX_HEIGHT: f32 = 100.;
+pub(super) const COMPLETION_POPUP_MAX_WIDTH: f32 = 420.;
+pub(super) const COMPLETION_POPUP_MAX_HEIGHT: f32 = 220.;
+/// Max candidates kept after filtering (keeps rendering/scroll bounded).
+pub(super) const COMPLETION_MAX_VISIBLE_ITEMS: usize = 50;
 
 pub struct LocalCodeEditorView {
     pub(super) editor: ViewHandle<CodeEditorView>,
@@ -289,6 +327,8 @@ pub struct LocalCodeEditorView {
     hover_debounce_tx: async_channel::Sender<CharOffset>,
     /// State for the LSP hover tooltip.
     pub(super) lsp_hover_state: LspHoverState,
+    /// State for the LSP completion popup (classic, non-AI autocomplete).
+    pub(super) lsp_completion_state: LspCompletionState,
     /// Pending scroll position to apply after the file is loaded. This is used when
     /// `set_pending_scroll` is called before the file content has finished loading
     /// (e.g., in the GlobalBuffer path where content loads asynchronously).
@@ -348,6 +388,10 @@ impl LocalCodeEditorView {
                                 lsp::CompletionTrigger::TriggerCharacter('.'),
                                 ctx,
                             );
+                        } else {
+                            // Keep an already-open popup in sync as the user types
+                            // or deletes (no-op when no popup is active).
+                            me.refilter_completion(ctx);
                         }
                     }
                 }
@@ -473,6 +517,9 @@ impl LocalCodeEditorView {
                     _ => unreachable!(),
                 }
             }
+            CodeEditorEvent::CompletionSelectNext => me.completion_select_next(ctx),
+            CodeEditorEvent::CompletionSelectPrev => me.completion_select_prev(ctx),
+            CodeEditorEvent::CompletionAccept => me.accept_completion(ctx),
             _ => {}
         });
 
@@ -505,6 +552,7 @@ impl LocalCodeEditorView {
             context_menu_state: Default::default(),
             hover_debounce_tx,
             lsp_hover_state: LspHoverState::None,
+            lsp_completion_state: LspCompletionState::None,
             pending_scroll_on_load: None,
             processed_diagnostics: Vec::new(),
             diagnostic_decorations: Vec::new(),
@@ -867,6 +915,17 @@ impl LocalCodeEditorView {
         };
 
         self.compute_card_positioning(offset_start, HOVER_TOOLTIP_MAX_HEIGHT, app)
+    }
+
+    /// Positioning for the completion popup, anchored at the start of the
+    /// replaceable prefix (just after the trigger). Reuses the hover card
+    /// placement logic (above when there's room, otherwise below).
+    fn completion_popup_positioning(&self, app: &AppContext) -> Option<OffsetPositioning> {
+        let anchor = match &self.lsp_completion_state {
+            LspCompletionState::Active { anchor, .. } => *anchor,
+            _ => return None,
+        };
+        self.compute_card_positioning(anchor, COMPLETION_POPUP_MAX_HEIGHT, app)
     }
 
     /// Get the positioning for the find references card based on the request offset.
@@ -1990,7 +2049,8 @@ impl LocalCodeEditorView {
     fn dismiss_lsp_overlays(&mut self, ctx: &mut ViewContext<Self>) -> bool {
         let had_refs = self.close_find_references_card(ctx);
         let had_hover = self.lsp_hover_state.clear();
-        had_refs || had_hover
+        let had_completion = self.dismiss_completion(ctx);
+        had_refs || had_hover || had_completion
     }
 
     /// Perform goto definition at the cursor position and navigate directly.
@@ -2277,6 +2337,14 @@ impl View for LocalCodeEditorView {
             self.hover_tooltip_positioning(app),
         ) {
             stack.add_positioned_overlay_child(hover_tooltip, positioning);
+        }
+
+        // Render the classic (non-AI) LSP completion popup when active.
+        if let (Some(popup), Some(positioning)) = (
+            self.render_completion_popup(app),
+            self.completion_popup_positioning(app),
+        ) {
+            stack.add_positioned_overlay_child(popup, positioning);
         }
 
         if let Some(footer) = &self.footer {
