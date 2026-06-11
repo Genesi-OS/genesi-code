@@ -33,58 +33,141 @@ pub enum LanguageId {
     JavaScriptReact,
     C,
     Cpp,
+    Html,
 }
 
+/// Declarative description of a language Genesi Code understands.
+///
+/// `LANGUAGES` below is the single source of truth for language support: file
+/// extensions, the `languageId` sent to the server, which LSP server backs the
+/// language, and the characters that should auto-open the completion popup.
+/// Adding a new language is ideally just a new [`LanguageSpec`] entry there (plus
+/// an LSP server candidate in `supported_servers` when the server needs custom
+/// install/detection logic).
+#[derive(Debug, Clone, Copy)]
+pub struct LanguageSpec {
+    pub id: LanguageId,
+    /// Lowercased file extensions (without the leading dot) that map here.
+    pub extensions: &'static [&'static str],
+    /// The `languageId` string sent to the server in `textDocument/didOpen`.
+    pub lsp_id: &'static str,
+    /// The LSP server that handles this language.
+    pub server: LSPServerType,
+    /// Characters that, when typed, auto-open the completion popup (member
+    /// access `.`, tag open `<`, ...). Typing identifier characters opens the
+    /// popup too, independently of this list.
+    pub trigger_chars: &'static [char],
+}
+
+/// The language registry. First extension match wins.
+///
+/// NOTE on `.h`: ambiguous between C and C++. We map it to C++ because clangd
+/// defaults to C++ for headers anyway; with a `compile_commands.json` present
+/// clangd uses the correct language regardless of the `languageId` we send.
+pub const LANGUAGES: &[LanguageSpec] = &[
+    LanguageSpec {
+        id: LanguageId::Rust,
+        extensions: &["rs"],
+        lsp_id: "rust",
+        server: LSPServerType::RustAnalyzer,
+        trigger_chars: &['.', ':'],
+    },
+    LanguageSpec {
+        id: LanguageId::Go,
+        extensions: &["go"],
+        lsp_id: "go",
+        server: LSPServerType::GoPls,
+        trigger_chars: &['.'],
+    },
+    LanguageSpec {
+        id: LanguageId::Python,
+        extensions: &["py"],
+        lsp_id: "python",
+        server: LSPServerType::Pyright,
+        trigger_chars: &['.'],
+    },
+    LanguageSpec {
+        id: LanguageId::TypeScript,
+        extensions: &["ts"],
+        lsp_id: "typescript",
+        server: LSPServerType::TypeScriptLanguageServer,
+        trigger_chars: &['.'],
+    },
+    LanguageSpec {
+        id: LanguageId::TypeScriptReact,
+        extensions: &["tsx"],
+        lsp_id: "typescriptreact",
+        server: LSPServerType::TypeScriptLanguageServer,
+        trigger_chars: &['.', '<'],
+    },
+    LanguageSpec {
+        id: LanguageId::JavaScript,
+        extensions: &["js", "mjs", "cjs"],
+        lsp_id: "javascript",
+        server: LSPServerType::TypeScriptLanguageServer,
+        trigger_chars: &['.'],
+    },
+    LanguageSpec {
+        id: LanguageId::JavaScriptReact,
+        extensions: &["jsx"],
+        lsp_id: "javascriptreact",
+        server: LSPServerType::TypeScriptLanguageServer,
+        trigger_chars: &['.', '<'],
+    },
+    LanguageSpec {
+        id: LanguageId::C,
+        extensions: &["c"],
+        lsp_id: "c",
+        server: LSPServerType::Clangd,
+        trigger_chars: &['.', '>', ':'],
+    },
+    LanguageSpec {
+        id: LanguageId::Cpp,
+        extensions: &["cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"],
+        lsp_id: "cpp",
+        server: LSPServerType::Clangd,
+        trigger_chars: &['.', '>', ':'],
+    },
+    LanguageSpec {
+        id: LanguageId::Html,
+        extensions: &["html", "htm"],
+        lsp_id: "html",
+        server: LSPServerType::VscodeHtmlLanguageServer,
+        trigger_chars: &['<', '/', '"', '=', ':', '.', '&'],
+    },
+];
+
 impl LanguageId {
+    /// The registry entry for this language. Every `LanguageId` has exactly one.
+    fn spec(&self) -> &'static LanguageSpec {
+        LANGUAGES
+            .iter()
+            .find(|spec| spec.id == *self)
+            .expect("every LanguageId must have a LanguageSpec entry in LANGUAGES")
+    }
+
     pub fn from_path(path: &Path) -> Option<Self> {
-        let extn = path.extension()?;
-        match extn.to_str()? {
-            "rs" => Some(Self::Rust),
-            "go" => Some(Self::Go),
-            "py" => Some(Self::Python),
-            "ts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::TypeScriptReact),
-            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
-            "jsx" => Some(Self::JavaScriptReact),
-            "c" | "C" => Some(Self::C),
-            "cc" | "cpp" | "cxx" => Some(Self::Cpp),
-            // NOTE: `.h` files are ambiguous (could be C or C++). We map them to Cpp
-            // because clangd defaults to C++ for `.h` files anyway. When a
-            // compile_commands.json is present, clangd will use the correct language
-            // regardless of the languageId we send.
-            "h" | "H" | "hh" | "hpp" | "hxx" => Some(Self::Cpp),
-            _ => None,
-        }
+        let extn = path.extension()?.to_str()?.to_ascii_lowercase();
+        LANGUAGES
+            .iter()
+            .find(|spec| spec.extensions.contains(&extn.as_str()))
+            .map(|spec| spec.id)
     }
 
     /// Returns the language identifier as used by LSP.
     /// See: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem
     pub(crate) fn lsp_language_identifier(&self) -> &'static str {
-        match self {
-            LanguageId::Rust => "rust",
-            LanguageId::Go => "go",
-            LanguageId::Python => "python",
-            LanguageId::TypeScript => "typescript",
-            LanguageId::TypeScriptReact => "typescriptreact",
-            LanguageId::JavaScript => "javascript",
-            LanguageId::JavaScriptReact => "javascriptreact",
-            LanguageId::C => "c",
-            LanguageId::Cpp => "cpp",
-        }
+        self.spec().lsp_id
     }
 
-    /// For now we assume a 1:1 language -> LSP server type. This might change in the future as we support more configurabilities.
+    /// The LSP server type that handles this language.
     pub fn server_type(&self) -> LSPServerType {
-        match self {
-            LanguageId::Rust => LSPServerType::RustAnalyzer,
-            LanguageId::Go => LSPServerType::GoPls,
-            LanguageId::Python => LSPServerType::Pyright,
-            LanguageId::TypeScript
-            | LanguageId::TypeScriptReact
-            | LanguageId::JavaScript
-            | LanguageId::JavaScriptReact => LSPServerType::TypeScriptLanguageServer,
-            LanguageId::C | LanguageId::Cpp => LSPServerType::Clangd,
-        }
+        self.spec().server
+    }
+
+    /// Characters that should auto-open the completion popup for this language.
+    pub fn trigger_chars(&self) -> &'static [char] {
+        self.spec().trigger_chars
     }
 }
 

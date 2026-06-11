@@ -406,14 +406,19 @@ impl LocalCodeEditorView {
         self.lsp_hover_state = LspHoverState::Loading(Some(abort_handle));
     }
 
-    /// Request LSP completion candidates at the given (buffer) offset and, on
-    /// success, open the completion popup. `offset` is the cursor position at
-    /// request time and becomes the popup's `anchor` (the start of the
-    /// replaceable prefix — i.e. just after the trigger `.`).
+    /// Request LSP completion candidates at `request_offset` and, on success,
+    /// open (or refresh) the completion popup. `anchor` is the start of the
+    /// replaceable prefix (after a `.`-style trigger that's the cursor; while
+    /// typing an identifier it's the start of the word). When `preserve` is
+    /// true an already-open popup stays visible until the new candidates arrive
+    /// — used for keystroke re-queries so the list doesn't flicker or close
+    /// mid-typing.
     pub(super) fn completion_for_offset(
         &mut self,
-        offset: CharOffset,
+        request_offset: CharOffset,
+        anchor: CharOffset,
         trigger: lsp::CompletionTrigger,
+        preserve: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         let Some(file_path) = self.file_path() else {
@@ -426,7 +431,7 @@ impl LocalCodeEditorView {
         let lsp_position = self
             .editor()
             .as_ref(ctx)
-            .offset_to_lsp_position(offset, ctx);
+            .offset_to_lsp_position(request_offset, ctx);
 
         let future = match lsp_server.as_ref(ctx).completion(
             file_path.to_path_buf(),
@@ -440,29 +445,167 @@ impl LocalCodeEditorView {
             }
         };
 
-        let anchor = offset;
         let abort_handle = ctx
             .spawn(future, move |me, result, ctx| match result {
-                Ok(items) if !items.is_empty() => {
+                Ok(list) if !list.items.is_empty() => {
+                    // A preserve re-query that resolves after the user dismissed
+                    // the popup must not resurrect it.
+                    if preserve && matches!(me.lsp_completion_state, LspCompletionState::None) {
+                        return;
+                    }
                     if let Some(server) = me.lsp_server.as_ref() {
                         server.as_ref(ctx).log_to_server_log(
                             LspServerLogLevel::Info,
-                            format!("completion: received {} item(s)", items.len()),
+                            format!("completion: received {} item(s)", list.items.len()),
                         );
                     }
-                    me.populate_completion(anchor, items, ctx);
+                    me.populate_completion(anchor, list.items, list.is_incomplete, ctx);
                 }
                 Ok(_) => {
-                    me.dismiss_completion(ctx);
+                    // An empty result on a keystroke re-query is often transient
+                    // (server still indexing); don't tear down a popup the user is
+                    // actively reading. The client-side refilter already closes it
+                    // when the typed prefix truly matches nothing.
+                    if !preserve {
+                        me.dismiss_completion(ctx);
+                    }
                 }
                 Err(e) => {
                     log::warn!("lsp.completion request failed: {e}");
-                    me.dismiss_completion(ctx);
+                    if !preserve {
+                        me.dismiss_completion(ctx);
+                    }
                 }
             })
             .abort_handle();
 
-        self.lsp_completion_state = LspCompletionState::Loading(Some(abort_handle));
+        // Only show the loading state (which hides any current popup) for a fresh
+        // open. Re-queries keep the existing popup visible until results land.
+        if !preserve {
+            self.lsp_completion_state = LspCompletionState::Loading(Some(abort_handle));
+        }
+    }
+
+    /// Decide what to do with the completion popup after a user content change:
+    /// open it on a trigger character or while typing an identifier, keep it in
+    /// sync via client-side refilter, re-query the server when the cached list is
+    /// incomplete, or dismiss it when the context is no longer valid.
+    pub(super) fn handle_completion_trigger(&mut self, ctx: &mut ViewContext<Self>) {
+        // Read the cursor and the character just typed without holding an editor
+        // borrow across the later mutable calls.
+        let (cursor, typed) = {
+            let editor = self.editor().as_ref(ctx);
+            let cursor = editor.cursor_head_offset(ctx);
+            let typed = if cursor.as_usize() == 0 {
+                None
+            } else {
+                let before = cursor.saturating_sub(&CharOffset::from(1));
+                editor.char_at(before, ctx)
+            };
+            (cursor, typed)
+        };
+
+        let Some(typed) = typed else {
+            // Nothing before the cursor — keep an open popup in sync, else no-op.
+            self.refilter_completion(ctx);
+            return;
+        };
+
+        // Trigger characters are language-specific (member access `.`, tag open
+        // `<`, ...), sourced from the language registry. Default to `.` when the
+        // file's language is unknown.
+        const FALLBACK_TRIGGERS: &[char] = &['.'];
+        let trigger_chars = self
+            .file_path()
+            .and_then(lsp::LanguageId::from_path)
+            .map(|lang| lang.trigger_chars())
+            .unwrap_or(FALLBACK_TRIGGERS);
+
+        if trigger_chars.contains(&typed) {
+            // Member access / tag open / etc. Anchor at the cursor: the prefix
+            // grows from here as the user keeps typing.
+            self.completion_for_offset(
+                cursor,
+                cursor,
+                lsp::CompletionTrigger::TriggerCharacter(typed),
+                false,
+                ctx,
+            );
+            return;
+        }
+
+        let is_identifier_char = typed.is_alphanumeric() || typed == '_' || typed == '$';
+        if !is_identifier_char {
+            // Whitespace, punctuation, a closing bracket, ... — any open popup no
+            // longer applies.
+            self.dismiss_completion(ctx);
+            return;
+        }
+
+        match &self.lsp_completion_state {
+            LspCompletionState::Active { is_incomplete, .. } => {
+                let incomplete = *is_incomplete;
+                // Fast path: filter the cached candidates against the new prefix.
+                self.refilter_completion(ctx);
+                if matches!(self.lsp_completion_state, LspCompletionState::None) {
+                    // The client-side filter eliminated everything. This is the
+                    // `console.` -> `console.l` case when the cached list was
+                    // stale or partial: re-ask the server for the live prefix so
+                    // a valid member completion isn't lost (the popup would
+                    // otherwise just vanish as the user types).
+                    let anchor = self.completion_word_start(cursor, ctx);
+                    self.completion_for_offset(
+                        cursor,
+                        anchor,
+                        lsp::CompletionTrigger::Invoked,
+                        false,
+                        ctx,
+                    );
+                } else if incomplete {
+                    // The server flagged the list incomplete; ask again so
+                    // candidates absent from the first (partial) batch surface.
+                    let anchor = self.completion_word_start(cursor, ctx);
+                    self.completion_for_offset(
+                        cursor,
+                        anchor,
+                        lsp::CompletionTrigger::Invoked,
+                        true,
+                        ctx,
+                    );
+                }
+            }
+            LspCompletionState::Loading(_) => {
+                // A request is already in flight; it will filter to the live
+                // prefix when it resolves.
+            }
+            LspCompletionState::None => {
+                // Open a fresh popup for the identifier being typed (this is what
+                // makes plain-prefix completion like `con` -> `console` work).
+                let anchor = self.completion_word_start(cursor, ctx);
+                self.completion_for_offset(
+                    cursor,
+                    anchor,
+                    lsp::CompletionTrigger::Invoked,
+                    false,
+                    ctx,
+                );
+            }
+        }
+    }
+
+    /// Scan backwards from `cursor` over identifier characters to find the start
+    /// of the word currently being typed (the replaceable prefix anchor).
+    fn completion_word_start(&self, cursor: CharOffset, ctx: &ViewContext<Self>) -> CharOffset {
+        let editor = self.editor().as_ref(ctx);
+        let mut start = cursor.as_usize();
+        while start > 0 {
+            let prev = CharOffset::from(start - 1);
+            match editor.char_at(prev, ctx) {
+                Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => start -= 1,
+                _ => break,
+            }
+        }
+        CharOffset::from(start)
     }
 
     /// Build the active popup state from freshly-returned candidates, filtering
@@ -472,6 +615,7 @@ impl LocalCodeEditorView {
         &mut self,
         anchor: CharOffset,
         items: Vec<lsp::CompletionItem>,
+        is_incomplete: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
@@ -488,7 +632,7 @@ impl LocalCodeEditorView {
         }
 
         log::info!(
-            "completion popup: showing {} candidate(s) (anchor={anchor:?})",
+            "completion popup: showing {} candidate(s) (anchor={anchor:?}, incomplete={is_incomplete})",
             filtered.len()
         );
         self.lsp_completion_state = LspCompletionState::Active {
@@ -496,6 +640,7 @@ impl LocalCodeEditorView {
             filtered,
             selected: 0,
             anchor,
+            is_incomplete,
             scroll_state: Default::default(),
         };
         self.set_editor_completion_active(true, ctx);

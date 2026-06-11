@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
+use crate::config::LANGUAGES;
 use crate::servers::clangd::ClangdCandidate;
 use crate::servers::go::GoPlsCandidate;
+use crate::servers::html::HtmlLanguageServerCandidate;
 use crate::servers::pyright::PyrightCandidate;
 use crate::servers::rust::RustAnalyzerCandidate;
 use crate::servers::typescript_language_server::TypeScriptLanguageServerCandidate;
@@ -43,6 +45,7 @@ pub enum LSPServerType {
     Pyright,
     TypeScriptLanguageServer,
     Clangd,
+    VscodeHtmlLanguageServer,
 }
 
 /// Provides server-specific configuration for each LSP server type.
@@ -110,6 +113,10 @@ impl LSPServerType {
                     binary_path: path,
                     prepend_args: vec![],
                 }),
+            LSPServerType::VscodeHtmlLanguageServer => {
+                // PATH-only for now (ships with `vscode-langservers-extracted`).
+                None
+            }
         }
     }
 
@@ -133,6 +140,7 @@ impl LSPServerType {
             LSPServerType::Pyright => "pyright-langserver",
             LSPServerType::TypeScriptLanguageServer => "typescript-language-server",
             LSPServerType::Clangd => "clangd",
+            LSPServerType::VscodeHtmlLanguageServer => "vscode-html-language-server",
         }
     }
 
@@ -141,7 +149,9 @@ impl LSPServerType {
     fn args(&self) -> Vec<&'static str> {
         match self {
             LSPServerType::RustAnalyzer | LSPServerType::GoPls | LSPServerType::Clangd => vec![],
-            LSPServerType::Pyright | LSPServerType::TypeScriptLanguageServer => vec!["--stdio"],
+            LSPServerType::Pyright
+            | LSPServerType::TypeScriptLanguageServer
+            | LSPServerType::VscodeHtmlLanguageServer => vec!["--stdio"],
         }
     }
 
@@ -155,25 +165,19 @@ impl LSPServerType {
             LSPServerType::Pyright => vec!["--stdio"],
             LSPServerType::TypeScriptLanguageServer => vec!["--stdio"],
             LSPServerType::Clangd => vec![],
+            LSPServerType::VscodeHtmlLanguageServer => vec!["--stdio"],
         }
     }
 
-    /// Returns the languages supported by this LSP server.
+    /// Returns the languages supported by this LSP server, derived from the
+    /// language registry ([`crate::config::LANGUAGES`]) so there's a single
+    /// source of truth.
     pub fn languages(&self) -> Vec<LanguageId> {
-        match self {
-            LSPServerType::RustAnalyzer => vec![LanguageId::Rust],
-            LSPServerType::GoPls => vec![LanguageId::Go],
-            LSPServerType::Pyright => vec![LanguageId::Python],
-            LSPServerType::TypeScriptLanguageServer => {
-                vec![
-                    LanguageId::TypeScript,
-                    LanguageId::TypeScriptReact,
-                    LanguageId::JavaScript,
-                    LanguageId::JavaScriptReact,
-                ]
-            }
-            LSPServerType::Clangd => vec![LanguageId::C, LanguageId::Cpp],
-        }
+        LANGUAGES
+            .iter()
+            .filter(|spec| spec.server == *self)
+            .map(|spec| spec.id)
+            .collect()
     }
 
     /// Returns a display name for the languages supported by this server.
@@ -206,6 +210,9 @@ impl LSPServerType {
                 Box::new(TypeScriptLanguageServerCandidate::new(client))
             }
             LSPServerType::Clangd => Box::new(ClangdCandidate::new(client)),
+            LSPServerType::VscodeHtmlLanguageServer => {
+                Box::new(HtmlLanguageServerCandidate::new(client))
+            }
         }
     }
 

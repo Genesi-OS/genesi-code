@@ -24,7 +24,7 @@ use warp_util::on_cancel::OnCancelFutureExt;
 
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
-    CompletionItem, CompletionTrigger, HoverResult, LspDefinitionLocation, ReferenceLocation,
+    CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, ReferenceLocation,
     TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
@@ -749,7 +749,7 @@ impl<'a> TextDocumentService<'a> {
         path: &Path,
         position: Position,
         trigger: CompletionTrigger,
-    ) -> anyhow::Result<Vec<CompletionItem>> {
+    ) -> anyhow::Result<CompletionList> {
         let uri = path_to_lsp_uri(path)?;
 
         let context = match trigger {
@@ -787,14 +787,17 @@ impl<'a> TextDocumentService<'a> {
 
         // The LSP spec allows textDocument/completion to return null.
         let Some(response) = result? else {
-            return Ok(Vec::new());
+            return Ok(CompletionList::default());
         };
 
-        let items = match response {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
+        let (items, is_incomplete) = match response {
+            CompletionResponse::Array(items) => (items, false),
+            CompletionResponse::List(list) => (list.items, list.is_incomplete),
         };
 
-        Ok(items.into_iter().map(Into::into).collect())
+        Ok(CompletionList {
+            items: items.into_iter().map(Into::into).collect(),
+            is_incomplete,
+        })
     }
 }

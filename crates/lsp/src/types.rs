@@ -292,6 +292,17 @@ pub struct CompletionItem {
     pub filter_text: Option<String>,
 }
 
+/// The result of a `textDocument/completion` request.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionList {
+    /// The candidates returned by the server, in server/sort order.
+    pub items: Vec<CompletionItem>,
+    /// The server signalled the list is incomplete: further user input should
+    /// trigger a fresh request rather than relying on purely client-side
+    /// filtering of `items`.
+    pub is_incomplete: bool,
+}
+
 impl From<lsp_types::CompletionItem> for CompletionItem {
     fn from(item: lsp_types::CompletionItem) -> Self {
         // Prefer an explicit insert_text, then a text edit's new_text, then the

@@ -270,6 +270,9 @@ pub(super) enum LspCompletionState {
         /// Buffer offset where the replaceable prefix begins (just after the
         /// trigger). Accept replaces `anchor..cursor` with the item's insert_text.
         anchor: CharOffset,
+        /// The server flagged this candidate list as incomplete: keystrokes
+        /// should re-query the server rather than rely on client-side filtering.
+        is_incomplete: bool,
         /// Scroll state for the (possibly long) candidate list.
         scroll_state: ClippedScrollStateHandle,
     },
@@ -375,24 +378,12 @@ impl LocalCodeEditorView {
                     me.was_edited = true;
                     ctx.emit(LocalCodeEditorEvent::UserEdited);
 
-                    // Genesi: trigger classic (non-AI) LSP autocomplete when the user
-                    // types a member-access dot. The interactive popup that renders
-                    // these candidates is wired in a follow-up; for now this confirms
-                    // the textDocument/completion request path works end-to-end.
+                    // Genesi: drive classic (non-AI) LSP autocomplete. Opens on a
+                    // language trigger char (`.`, `<`, ...) or while typing an
+                    // identifier, keeps the popup filtered as the user types, and
+                    // dismisses it when the context no longer applies.
                     if me.is_lsp_server_available(ctx) {
-                        let cursor = me.editor().as_ref(ctx).cursor_head_offset(ctx);
-                        let before_cursor = cursor.saturating_sub(&CharOffset::from(1));
-                        if me.editor().as_ref(ctx).char_at(before_cursor, ctx) == Some('.') {
-                            me.completion_for_offset(
-                                cursor,
-                                lsp::CompletionTrigger::TriggerCharacter('.'),
-                                ctx,
-                            );
-                        } else {
-                            // Keep an already-open popup in sync as the user types
-                            // or deletes (no-op when no popup is active).
-                            me.refilter_completion(ctx);
-                        }
+                        me.handle_completion_trigger(ctx);
                     }
                 }
             }

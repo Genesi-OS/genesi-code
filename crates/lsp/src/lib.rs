@@ -29,7 +29,8 @@ pub use model::{
 };
 pub use service::LspService;
 pub use types::{
-    CompletionItem, CompletionTrigger, HoverContents, HoverResult, MarkupKind, ReferenceLocation,
+    CompletionItem, CompletionList, CompletionTrigger, HoverContents, HoverResult, MarkupKind,
+    ReferenceLocation,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
