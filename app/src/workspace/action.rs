@@ -307,6 +307,7 @@ pub enum WorkspaceAction {
     ToggleUserMenu,
     ToggleAIAssistant,
     ClickedAIAssistantIcon,
+    ToggleLocalAi,
     ToggleKeybindingsPage,
     ShowCommandSearch(CommandSearchOptions),
     CreatePersonalNotebook,
@@ -944,6 +945,7 @@ impl WorkspaceAction {
             | ToggleUserMenu
             | ClickedAIAssistantIcon
             | ToggleAIAssistant
+            | ToggleLocalAi
             | OpenCloudAgentSetupGuide
             | ToggleKeybindingsPage
             | ShowCommandSearch(_)

@@ -1165,6 +1165,16 @@ pub fn init(app: &mut AppContext) {
         .with_custom_action(CustomAction::NewAgentModePane),
     ]);
 
+    // Genesi: login-free local AI chat panel (ollama / Turbo), synced with AI Mode.
+    app.register_editable_bindings([EditableBinding::new(
+        "workspace:toggle_local_ai",
+        "Toggle Local AI",
+        WorkspaceAction::ToggleLocalAi,
+    )
+    .with_group(bindings::BindingGroup::WarpAi.as_str())
+    .with_context_predicate(id!("Workspace"))
+    .with_key_binding(cmd_or_ctrl_shift("g"))]);
+
     app.register_editable_bindings([
         EditableBinding::new(
             "workspace:create_team_env_vars",

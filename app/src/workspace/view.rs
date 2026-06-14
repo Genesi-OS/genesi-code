@@ -150,6 +150,7 @@ use super::util::{
 };
 use super::{util, ActiveSession, TabBarDropTargetData, TabBarLocation, WorkspaceRegistry};
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::local_chat_panel::{LocalAiChatEvent, LocalAiChatView};
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
@@ -1038,6 +1039,7 @@ pub struct Workspace {
     settings_file_error: Option<crate::settings::SettingsFileError>,
     settings_error_banner_dismissed: bool,
     ai_assistant_panel: ViewHandle<AIAssistantPanelView>,
+    local_ai_panel: ViewHandle<LocalAiChatView>,
     should_show_ai_assistant_warm_welcome: bool,
     ai_assistant_close_warm_welcome_mouse_state_handle: MouseStateHandle,
     auth_override_warning_modal: ViewHandle<AuthOverrideWarningModal>,
@@ -1678,6 +1680,15 @@ impl Workspace {
         });
 
         ai_assistant_panel
+    }
+
+    /// Genesi: build the login-free local AI chat panel and wire its events.
+    fn build_local_ai_panel_view(ctx: &mut ViewContext<Self>) -> ViewHandle<LocalAiChatView> {
+        let local_ai_panel = ctx.add_typed_action_view(LocalAiChatView::new);
+        ctx.subscribe_to_view(&local_ai_panel, |me, _, event, ctx| {
+            me.handle_local_ai_panel_event(event, ctx);
+        });
+        local_ai_panel
     }
 
     fn build_resource_center_view(
@@ -2990,6 +3001,8 @@ impl Workspace {
         let ai_assistant_panel =
             Self::build_ai_assistant_panel_view(ctx, server_api.clone(), ai_client.clone());
 
+        let local_ai_panel = Self::build_local_ai_panel_view(ctx);
+
         ctx.observe(&tips_completed, Workspace::on_tips_model_changed);
 
         let autoupdate_handle = AutoupdateState::handle(ctx);
@@ -3283,6 +3296,7 @@ impl Workspace {
             settings_file_error,
             settings_error_banner_dismissed: false,
             ai_assistant_panel,
+            local_ai_panel,
             should_show_ai_assistant_warm_welcome,
             ai_assistant_close_warm_welcome_mouse_state_handle: Default::default(),
             auth_override_warning_modal,
@@ -4626,11 +4640,52 @@ impl Workspace {
         if self.current_workspace_state.is_ai_assistant_panel_open {
             // Close the resource center panel if we open the AI Assistant panel.
             self.current_workspace_state.is_resource_center_open = false;
+            self.current_workspace_state.is_local_ai_panel_open = false;
             ctx.focus(&self.ai_assistant_panel);
         } else {
             self.focus_active_tab(ctx);
         }
         ctx.notify();
+    }
+
+    /// Genesi: open/close the login-free local AI chat panel. Mutually exclusive
+    /// with the other right-dock panels.
+    fn toggle_local_ai_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.current_workspace_state.is_local_ai_panel_open
+            && !self.local_ai_panel.is_self_or_child_focused(ctx)
+            && !self.current_workspace_state.is_any_modal_open(ctx)
+        {
+            ctx.focus(&self.local_ai_panel);
+            return;
+        }
+
+        self.current_workspace_state.is_local_ai_panel_open =
+            !self.current_workspace_state.is_local_ai_panel_open;
+
+        self.current_workspace_state.close_all_modals();
+
+        if self.current_workspace_state.is_local_ai_panel_open {
+            self.current_workspace_state.is_resource_center_open = false;
+            self.current_workspace_state.is_ai_assistant_panel_open = false;
+            ctx.focus(&self.local_ai_panel);
+        } else {
+            self.focus_active_tab(ctx);
+        }
+        ctx.notify();
+    }
+
+    fn handle_local_ai_panel_event(
+        &mut self,
+        event: &LocalAiChatEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            LocalAiChatEvent::ClosePanel => {
+                self.current_workspace_state.is_local_ai_panel_open = false;
+                self.focus_active_tab(ctx);
+                ctx.notify();
+            }
+        }
     }
 
     /// Sets focused to the index of either the selected object or the first item in WD
@@ -8726,6 +8781,7 @@ impl Workspace {
         // Close AI Assistant panel when resource center is opened
         if !self.current_workspace_state.is_resource_center_open {
             self.current_workspace_state.is_ai_assistant_panel_open = false;
+            self.current_workspace_state.is_local_ai_panel_open = false;
             self.focus_active_tab(ctx);
         }
 
@@ -21751,6 +21807,12 @@ impl Workspace {
                     ChildView::new(&self.ai_assistant_panel).finish(),
                     &PanelPosition::Right,
                 ))
+            } else if self.current_workspace_state.is_local_ai_panel_open {
+                Some(self.render_panel(
+                    app,
+                    ChildView::new(&self.local_ai_panel).finish(),
+                    &PanelPosition::Right,
+                ))
             } else {
                 log::warn!(
                     "is_right_panel_open() returned true, but neither the resource center nor AI \
@@ -23769,6 +23831,7 @@ impl TypedActionView for Workspace {
                     ctx
                 );
             }
+            ToggleLocalAi => self.toggle_local_ai_panel(ctx),
             ClickedAIAssistantIcon => {
                 if !FeatureFlag::AgentMode.is_enabled() {
                     self.toggle_ai_assistant_panel(ctx);
