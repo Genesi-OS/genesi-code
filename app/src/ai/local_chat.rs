@@ -166,3 +166,115 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
         .context("failed to parse the local model list")?;
     Ok(parsed.data.into_iter().map(|entry| entry.id).collect())
 }
+
+/// genesi-ai-turbo's speculative-decoding server (OpenAI API on :11435).
+/// Same payload shape as ollama; faster generation, identical output.
+pub const TURBO_LOCAL_BASE_URL: &str = "http://localhost:11435/v1";
+
+/// Where `genesi-aid` publishes its live status (tmpfs, daemon-written).
+pub const AI_MODE_STATE_FILE: &str = "/run/genesi-ai-mode/state.json";
+/// User-writable override the daemon reads: `on` | `off` | absent (= auto).
+pub const AI_MODE_FORCE_FILE: &str = "/run/genesi-ai-mode/force";
+
+/// The local inference endpoint the chat talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEndpoint {
+    /// Ollama's OpenAI-compatible API on :11434 (genesi-ai-mode default).
+    Ollama,
+    /// genesi-ai-turbo (speculative decoding) on :11435.
+    Turbo,
+}
+
+impl LocalEndpoint {
+    pub fn base_url(self) -> &'static str {
+        match self {
+            LocalEndpoint::Ollama => DEFAULT_LOCAL_BASE_URL,
+            LocalEndpoint::Turbo => TURBO_LOCAL_BASE_URL,
+        }
+    }
+
+    /// Short label for the endpoint chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalEndpoint::Ollama => "Local",
+            LocalEndpoint::Turbo => "Turbo",
+        }
+    }
+
+    /// The other endpoint (used by the chip that cycles between them).
+    pub fn toggled(self) -> Self {
+        match self {
+            LocalEndpoint::Ollama => LocalEndpoint::Turbo,
+            LocalEndpoint::Turbo => LocalEndpoint::Ollama,
+        }
+    }
+}
+
+/// Best-effort liveness probe: succeeds when the endpoint answers `GET /models`.
+/// Used to know whether Turbo (:11435) is actually up before offering it.
+pub async fn endpoint_available(base_url: &str) -> bool {
+    list_models(base_url).await.is_ok()
+}
+
+/// Snapshot of `genesi-aid`'s state, as published in `state.json`. Only the
+/// fields the chat panel surfaces are parsed; everything else is ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AiModeState {
+    /// Whether AI Mode optimizations are currently applied.
+    #[serde(default)]
+    pub ai_mode_active: bool,
+    /// Auto-detected workload: `active` | `warm` | `idle`.
+    #[serde(default)]
+    pub activity: String,
+    /// User override in effect: `on` | `off` | `auto`.
+    #[serde(default)]
+    pub force_mode: String,
+    /// Effective intensity profile: `max` | `balanced` | `battery` | `auto`.
+    #[serde(default)]
+    pub profile: String,
+    /// Last measured generation speed, when AI Mode is active.
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
+}
+
+impl AiModeState {
+    /// A compact human-readable status for the header badge.
+    pub fn badge_text(&self) -> String {
+        let base = if self.force_mode == "on" {
+            "AI Mode: on (forced)".to_string()
+        } else if self.force_mode == "off" {
+            "AI Mode: off (forced)".to_string()
+        } else if self.ai_mode_active {
+            format!("AI Mode: {}", if self.activity.is_empty() { "active" } else { &self.activity })
+        } else {
+            "AI Mode: idle".to_string()
+        };
+        match self.tokens_per_second {
+            Some(tps) if tps > 0.0 => format!("{base} · {tps:.0} tok/s"),
+            _ => base,
+        }
+    }
+}
+
+/// Read `genesi-aid`'s current state. Returns `None` when the daemon isn't
+/// running or its state file isn't present (e.g. on a dev box / non-Genesi host).
+pub fn read_ai_mode_state() -> Option<AiModeState> {
+    let raw = std::fs::read_to_string(AI_MODE_STATE_FILE).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Set the AI Mode override the daemon honors. `"on"`/`"off"` force the mode;
+/// `"auto"` clears the override (removes the file) so the daemon follows its
+/// automatic detection again. No-op-safe when the file is already absent.
+pub fn set_ai_mode_force(value: &str) -> Result<()> {
+    match value {
+        "auto" => match std::fs::remove_file(AI_MODE_FORCE_FILE) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow!("failed to clear AI Mode override: {e}")),
+        },
+        "on" | "off" => std::fs::write(AI_MODE_FORCE_FILE, value)
+            .map_err(|e| anyhow!("failed to set AI Mode override: {e}")),
+        other => Err(anyhow!("invalid AI Mode force value: {other}")),
+    }
+}
