@@ -34,6 +34,8 @@ pub enum LanguageId {
     C,
     Cpp,
     Html,
+    Css,
+    Json,
 }
 
 /// Declarative description of a language Genesi Code understands.
@@ -134,6 +136,20 @@ pub const LANGUAGES: &[LanguageSpec] = &[
         lsp_id: "html",
         server: LSPServerType::VscodeHtmlLanguageServer,
         trigger_chars: &['<', '/', '"', '=', ':', '.', '&'],
+    },
+    LanguageSpec {
+        id: LanguageId::Css,
+        extensions: &["css"],
+        lsp_id: "css",
+        server: LSPServerType::VscodeCssLanguageServer,
+        trigger_chars: &[':', '-', '/', '@', '.', '#', '!'],
+    },
+    LanguageSpec {
+        id: LanguageId::Json,
+        extensions: &["json"],
+        lsp_id: "json",
+        server: LSPServerType::VscodeJsonLanguageServer,
+        trigger_chars: &['"', ':', '/'],
     },
 ];
 

@@ -10,35 +10,29 @@ use crate::language_server_candidate::{LanguageServerCandidate, LanguageServerMe
 use crate::supported_servers::CustomBinaryConfig;
 use crate::CommandBuilder;
 
-/// Candidate for `vscode-html-language-server`, shipped as part of the npm
-/// package `vscode-langservers-extracted` (which also bundles the CSS and JSON
-/// servers). We manage a private install of that package under the data dir and
-/// run it via `node`, mirroring how Pyright / typescript-language-server work.
+/// Candidate for `vscode-json-language-server`, shipped in the same npm package
+/// as the HTML and CSS servers (`vscode-langservers-extracted`). We manage a
+/// private install of that package under the data dir and run it via `node`,
+/// mirroring the HTML server / typescript-language-server.
 #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
-pub struct HtmlLanguageServerCandidate {
+pub struct JsonLanguageServerCandidate {
     client: Arc<http_client::Client>,
 }
 
-impl HtmlLanguageServerCandidate {
-    /// Path to the HTML server launcher JS within the npm package, relative to
+impl JsonLanguageServerCandidate {
+    /// Path to the JSON server launcher JS within the npm package, relative to
     /// the install directory.
     #[cfg(feature = "local_fs")]
     const SERVER_JS_PATH: &str =
-        "node_modules/vscode-langservers-extracted/bin/vscode-html-language-server";
+        "node_modules/vscode-langservers-extracted/bin/vscode-json-language-server";
 
     pub fn new(client: Arc<http_client::Client>) -> Self {
         Self { client }
     }
 
-    /// Finds the configuration for running vscode-html-language-server from our
-    /// managed installation.
-    ///
-    /// Instead of running the bin wrapper (which relies on a shebang requiring
-    /// node in PATH), we run node directly with the launcher JS file. This is the
-    /// same pattern used for Pyright and typescript-language-server.
-    ///
-    /// # Arguments
-    /// * `path_env_var` - The PATH environment variable to use when checking for system node.
+    /// Finds the configuration for running vscode-json-language-server from our
+    /// managed installation. Runs node directly with the launcher JS rather than
+    /// the bin wrapper (which relies on a node-in-PATH shebang).
     #[cfg(feature = "local_fs")]
     pub async fn find_installed_binary_config(
         path_env_var: Option<&str>,
@@ -48,13 +42,12 @@ impl HtmlLanguageServerCandidate {
 
         if !server_js.is_file() {
             log::info!(
-                "vscode-html-language-server launcher not found at {}",
+                "vscode-json-language-server launcher not found at {}",
                 server_js.display()
             );
             return None;
         }
 
-        // Try to find a working node binary - first custom, then system.
         let node_binary = node_runtime::find_working_node_binary(path_env_var).await?;
 
         Some(CustomBinaryConfig {
@@ -66,10 +59,8 @@ impl HtmlLanguageServerCandidate {
 
 #[async_trait]
 #[cfg(feature = "local_fs")]
-impl LanguageServerCandidate for HtmlLanguageServerCandidate {
+impl LanguageServerCandidate for JsonLanguageServerCandidate {
     async fn should_suggest_for_repo(&self, _path: &Path, _executor: &CommandBuilder) -> bool {
-        // HTML has no manifest file to key off of; we don't proactively nudge.
-        // The "Install" affordance on an open .html file still drives install().
         false
     }
 
@@ -92,18 +83,16 @@ impl LanguageServerCandidate for HtmlLanguageServerCandidate {
         executor: &CommandBuilder,
     ) -> anyhow::Result<()> {
         log::info!(
-            "Installing vscode-langservers-extracted version {}",
+            "Installing vscode-langservers-extracted (JSON) version {}",
             metadata.version
         );
 
         let install_dir = warp_core::paths::data_dir().join("vscode-langservers-extracted");
 
-        // Create the installation directory
         async_fs::create_dir_all(&install_dir)
             .await
             .context("Failed to create vscode-langservers-extracted installation directory")?;
 
-        // First, check if system node is available and meets requirements
         let use_system_node = match executor.path_env_var() {
             Some(path) => node_runtime::detect_system_node(path).await.is_ok(),
             None => false,
@@ -121,14 +110,6 @@ impl LanguageServerCandidate for HtmlLanguageServerCandidate {
             ))
         };
 
-        log::info!(
-            "Installing vscode-langservers-extracted@{} using npm",
-            metadata.version
-        );
-
-        // Build the npm install command:
-        // - System node: run `npm` directly (it's on PATH)
-        // - Custom node: run `node <npm_path>` to avoid relying on shebang resolution
         let mut cmd = if let Some((node_path, npm_path)) = &custom_node_paths {
             let mut c = executor.command(node_path);
             c.arg(npm_path);
@@ -152,7 +133,7 @@ impl LanguageServerCandidate for HtmlLanguageServerCandidate {
             );
         }
 
-        log::info!("vscode-html-language-server installed successfully");
+        log::info!("vscode-json-language-server installed successfully");
         Ok(())
     }
 
@@ -166,7 +147,7 @@ impl LanguageServerCandidate for HtmlLanguageServerCandidate {
 
         Ok(LanguageServerMetadata {
             version,
-            url: None, // npm packages don't have direct download URLs
+            url: None,
             digest: None,
         })
     }
@@ -174,7 +155,7 @@ impl LanguageServerCandidate for HtmlLanguageServerCandidate {
 
 #[async_trait]
 #[cfg(not(feature = "local_fs"))]
-impl LanguageServerCandidate for HtmlLanguageServerCandidate {
+impl LanguageServerCandidate for JsonLanguageServerCandidate {
     async fn should_suggest_for_repo(&self, _path: &Path, _executor: &CommandBuilder) -> bool {
         false
     }

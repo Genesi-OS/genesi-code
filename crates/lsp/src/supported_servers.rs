@@ -11,8 +11,10 @@ use strum_macros::EnumIter;
 
 use crate::config::LANGUAGES;
 use crate::servers::clangd::ClangdCandidate;
+use crate::servers::css::CssLanguageServerCandidate;
 use crate::servers::go::GoPlsCandidate;
 use crate::servers::html::HtmlLanguageServerCandidate;
+use crate::servers::json::JsonLanguageServerCandidate;
 use crate::servers::pyright::PyrightCandidate;
 use crate::servers::rust::RustAnalyzerCandidate;
 use crate::servers::typescript_language_server::TypeScriptLanguageServerCandidate;
@@ -46,6 +48,8 @@ pub enum LSPServerType {
     TypeScriptLanguageServer,
     Clangd,
     VscodeHtmlLanguageServer,
+    VscodeCssLanguageServer,
+    VscodeJsonLanguageServer,
 }
 
 /// Provides server-specific configuration for each LSP server type.
@@ -116,6 +120,12 @@ impl LSPServerType {
             LSPServerType::VscodeHtmlLanguageServer => {
                 HtmlLanguageServerCandidate::find_installed_binary_config(path_env_var).await
             }
+            LSPServerType::VscodeCssLanguageServer => {
+                CssLanguageServerCandidate::find_installed_binary_config(path_env_var).await
+            }
+            LSPServerType::VscodeJsonLanguageServer => {
+                JsonLanguageServerCandidate::find_installed_binary_config(path_env_var).await
+            }
         }
     }
 
@@ -140,6 +150,8 @@ impl LSPServerType {
             LSPServerType::TypeScriptLanguageServer => "typescript-language-server",
             LSPServerType::Clangd => "clangd",
             LSPServerType::VscodeHtmlLanguageServer => "vscode-html-language-server",
+            LSPServerType::VscodeCssLanguageServer => "vscode-css-language-server",
+            LSPServerType::VscodeJsonLanguageServer => "vscode-json-language-server",
         }
     }
 
@@ -150,7 +162,9 @@ impl LSPServerType {
             LSPServerType::RustAnalyzer | LSPServerType::GoPls | LSPServerType::Clangd => vec![],
             LSPServerType::Pyright
             | LSPServerType::TypeScriptLanguageServer
-            | LSPServerType::VscodeHtmlLanguageServer => vec!["--stdio"],
+            | LSPServerType::VscodeHtmlLanguageServer
+            | LSPServerType::VscodeCssLanguageServer
+            | LSPServerType::VscodeJsonLanguageServer => vec!["--stdio"],
         }
     }
 
@@ -165,6 +179,8 @@ impl LSPServerType {
             LSPServerType::TypeScriptLanguageServer => vec!["--stdio"],
             LSPServerType::Clangd => vec![],
             LSPServerType::VscodeHtmlLanguageServer => vec!["--stdio"],
+            LSPServerType::VscodeCssLanguageServer => vec!["--stdio"],
+            LSPServerType::VscodeJsonLanguageServer => vec!["--stdio"],
         }
     }
 
@@ -211,6 +227,12 @@ impl LSPServerType {
             LSPServerType::Clangd => Box::new(ClangdCandidate::new(client)),
             LSPServerType::VscodeHtmlLanguageServer => {
                 Box::new(HtmlLanguageServerCandidate::new(client))
+            }
+            LSPServerType::VscodeCssLanguageServer => {
+                Box::new(CssLanguageServerCandidate::new(client))
+            }
+            LSPServerType::VscodeJsonLanguageServer => {
+                Box::new(JsonLanguageServerCandidate::new(client))
             }
         }
     }
