@@ -279,10 +279,11 @@ impl LocalAiChatView {
         text: impl Into<String>,
         size: f32,
         color: ColorU,
+        soft_wrap: bool,
     ) -> Box<dyn Element> {
         appearance
             .ui_builder()
-            .wrappable_text(text.into(), false)
+            .wrappable_text(text.into(), soft_wrap)
             .with_style(UiComponentStyles {
                 font_family_id: Some(appearance.ui_font_family()),
                 font_size: Some(size),
@@ -306,7 +307,7 @@ impl LocalAiChatView {
         } else {
             theme.disabled_text_color(theme.background()).into()
         };
-        let content = Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color))
+        let content = Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color, false))
             .with_horizontal_padding(8.)
             .with_vertical_padding(3.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
@@ -339,6 +340,7 @@ impl LocalAiChatView {
                 "Local AI",
                 TITLE_FONT_SIZE,
                 theme.active_ui_text_color().into(),
+                false,
             ))
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             .with_child(self.chip(
@@ -411,12 +413,14 @@ impl LocalAiChatView {
                 prefix,
                 CHIP_FONT_SIZE,
                 theme.disabled_text_color(theme.background()).into(),
+                false,
             ))
             .with_child(self.label_text(
                 appearance,
                 body,
                 BODY_FONT_SIZE,
                 theme.main_text_color(theme.background()).into(),
+                true,
             ))
             .finish();
 
@@ -443,6 +447,7 @@ impl LocalAiChatView {
                     hint,
                     BODY_FONT_SIZE,
                     theme.disabled_text_color(theme.background()).into(),
+                    true,
                 ))
                 .with_uniform_padding(8.)
                 .finish(),
@@ -566,6 +571,7 @@ impl View for LocalAiChatView {
                     error.clone(),
                     CHIP_FONT_SIZE,
                     theme.ui_error_color().into(),
+                    true,
                 ))
                 .with_horizontal_padding(PANEL_PADDING)
                 .with_padding_bottom(4.)
