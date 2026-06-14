@@ -72,13 +72,21 @@ jobs:
           set -euxo pipefail
           # Don't `-Syu` (upgrading pacman mid-CI can deadlock). DB refresh +
           # needed deps only, with retries for CachyOS CDN flakes.
+          #
+          # protoc links abseil at runtime; a partial `-Sy` can leave a stale
+          # abseil-cpp whose soname no longer matches the freshly-pulled protobuf
+          # (build fails: "libabsl_log_initialize.so.<ver>: cannot open shared
+          # object file"). Force abseil-cpp + protobuf to the current repo version
+          # together, in one transaction, so they stay in lockstep — two packages,
+          # not `-Syu`, so no mid-CI pacman/glibc deadlock risk.
           install_deps() {
             pacman -Syy --noconfirm && \
             pacman -S --needed --noconfirm --overwrite='*' \
               base-devel git git-lfs mold cmake clang pkgconf python openssl \
               protobuf \
               fontconfig freetype2 libxkbcommon wayland libx11 libxcb \
-              vulkan-icd-loader vulkan-headers mesa rustup
+              vulkan-icd-loader vulkan-headers mesa rustup && \
+            pacman -S --noconfirm --overwrite='*' abseil-cpp protobuf
           }
           for attempt in 1 2 3 4 5; do
             if install_deps; then echo "deps installed (attempt $attempt)"; break; fi
