@@ -4690,13 +4690,14 @@ impl Workspace {
                 ctx.notify();
             }
             LocalAiChatEvent::SubmitPrompt(text) => {
-                // Gather the focused file's context now (fresh) and hand both the
-                // prompt and the context to the panel, which decides whether to
-                // attach it based on its own toggle.
+                // Gather the focused file's context and the project root now
+                // (fresh) and hand them to the panel, which decides whether to
+                // attach context / run the agent based on its own toggles.
                 let context = self.focused_code_context(ctx);
+                let project_root = self.focused_project_root(ctx);
                 let text = text.clone();
                 self.local_ai_panel.update(ctx, |panel, ctx| {
-                    panel.send_with_context(text, context, ctx);
+                    panel.send_with_context(text, context, project_root, ctx);
                 });
             }
         }
@@ -5224,6 +5225,31 @@ impl Workspace {
             selection,
             file_text,
         })
+    }
+
+    /// Genesi: the project root the local AI agent should explore. Walks up from
+    /// the focused code editor's file to a project marker (.git, Cargo.toml, …),
+    /// falling back to the file's directory and finally the active terminal cwd.
+    fn focused_project_root(&self, ctx: &AppContext) -> Option<std::path::PathBuf> {
+        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+        let code_view = pane_group
+            .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
+            .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next());
+
+        if let Some(code_view) = code_view {
+            if let Some(editor_handle) = code_view.as_ref(ctx).active_editor() {
+                if let Some(path) = editor_handle.as_ref(ctx).file_path() {
+                    if let Some(root) = crate::ai::local_agent::project_root_from_file(path) {
+                        return Some(root);
+                    }
+                    if let Some(parent) = path.parent() {
+                        return Some(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        pane_group.active_session_path(ctx)
     }
 
     /// This is meant to be dispatched directly by actions.

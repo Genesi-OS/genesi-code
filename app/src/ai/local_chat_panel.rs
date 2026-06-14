@@ -7,6 +7,8 @@
 //! story lives in one place: no account, no cloud.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use warpui::color::ColorU;
 use warpui::elements::{
@@ -22,6 +24,7 @@ use warpui::{
     ViewHandle,
 };
 
+use super::local_agent::{self, MAX_AGENT_STEPS};
 use super::local_chat::{
     list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, turbo_health_ok, AiModeState,
     ChatMessage, ChatStreamItem, CodeContext, LocalEndpoint,
@@ -50,6 +53,8 @@ fn genesi_green() -> ColorU {
 enum ChatRole {
     User,
     Assistant,
+    /// An agent tool step (e.g. read_file) — rendered distinctly from prose.
+    Tool,
 }
 
 /// One line in the transcript. The assistant's text grows as tokens stream in.
@@ -86,6 +91,8 @@ pub enum LocalAiChatAction {
     Clear,
     /// Toggle auto-attaching the focused file as context.
     ToggleAttachContext,
+    /// Toggle agent mode (the model can read the project via tools).
+    ToggleAgent,
 }
 
 pub struct LocalAiChatView {
@@ -105,6 +112,23 @@ pub struct LocalAiChatView {
     /// When on, each send attaches the focused code editor's file (or selection)
     /// as context — like a normal AI IDE.
     attach_context: bool,
+
+    /// When on, the model runs as a codebase agent: it can read the project via
+    /// tools (read_file/list_files/grep) before answering.
+    agent_mode: bool,
+
+    // ── agent-loop state (only meaningful while an agent turn is in flight) ──
+    /// Project root the agent's tools resolve paths against.
+    agent_root: Option<PathBuf>,
+    /// The running conversation sent to the model (diverges from the visible
+    /// transcript: it carries raw tool calls and tool results).
+    agent_messages: Vec<ChatMessage>,
+    /// Model name pinned for the duration of the agent turn.
+    agent_model: String,
+    /// How many tool steps this turn has taken (bounded by [`MAX_AGENT_STEPS`]).
+    agent_step: u32,
+    /// Accumulates the current step's streamed tokens until it completes.
+    agent_step_buffer: String,
 }
 
 impl LocalAiChatView {
@@ -129,6 +153,12 @@ impl LocalAiChatView {
             in_flight: false,
             error: None,
             attach_context: true,
+            agent_mode: false,
+            agent_root: None,
+            agent_messages: Vec::new(),
+            agent_model: String::new(),
+            agent_step: 0,
+            agent_step_buffer: String::new(),
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -225,6 +255,7 @@ impl LocalAiChatView {
         &mut self,
         prompt: String,
         context: Option<CodeContext>,
+        project_root: Option<PathBuf>,
         ctx: &mut ViewContext<Self>,
     ) {
         let prompt = prompt.trim().to_string();
@@ -258,19 +289,16 @@ impl LocalAiChatView {
             text: prompt,
             context_label,
         });
-        // The assistant placeholder grows as tokens arrive.
-        self.messages.push(ChatEntry {
-            role: ChatRole::Assistant,
-            text: String::new(),
-            context_label: None,
-        });
-        self.in_flight = true;
-        self.scroll_to_bottom();
 
-        // Build the request from the full transcript (skipping the empty
-        // placeholder we just pushed), prefixed with a small system prompt and,
-        // when present, the attached file context as a second system message.
-        let mut request = vec![ChatMessage::system(SYSTEM_PROMPT)];
+        // System prompt: the agent variant (with tool instructions) in agent
+        // mode, otherwise the plain chat prompt. Then the attached file context,
+        // then the visible transcript text (tool steps are UI-only).
+        let system_prompt = if self.agent_mode {
+            local_agent::agent_system_prompt()
+        } else {
+            SYSTEM_PROMPT.to_string()
+        };
+        let mut request = vec![ChatMessage::system(system_prompt)];
         if let Some(context) = &context {
             request.push(context.to_system_message());
         }
@@ -278,12 +306,36 @@ impl LocalAiChatView {
             if entry.text.is_empty() {
                 continue;
             }
-            request.push(match entry.role {
-                ChatRole::User => ChatMessage::user(entry.text.clone()),
-                ChatRole::Assistant => ChatMessage::assistant(entry.text.clone()),
-            });
+            match entry.role {
+                ChatRole::User => request.push(ChatMessage::user(entry.text.clone())),
+                ChatRole::Assistant => request.push(ChatMessage::assistant(entry.text.clone())),
+                // Tool steps are UI-only; the model's real tool results live in
+                // `agent_messages` during a turn, not the visible transcript.
+                ChatRole::Tool => {}
+            }
         }
 
+        self.in_flight = true;
+        self.scroll_to_bottom();
+
+        if self.agent_mode {
+            // Drive the agent loop: the model may call read tools before it
+            // answers. Each step appends to `agent_messages`.
+            self.agent_root = project_root;
+            self.agent_model = model;
+            self.agent_messages = request;
+            self.agent_step = 0;
+            self.run_agent_step(ctx);
+            ctx.notify();
+            return;
+        }
+
+        // Plain chat: one streamed reply into a placeholder bubble.
+        self.messages.push(ChatEntry {
+            role: ChatRole::Assistant,
+            text: String::new(),
+            context_label: None,
+        });
         let stream = stream_chat(self.endpoint, &model, request);
         ctx.spawn_stream_local(
             stream,
@@ -297,6 +349,124 @@ impl LocalAiChatView {
             },
         );
         ctx.notify();
+    }
+
+    // ── agent loop ─────────────────────────────────────────────────────────
+
+    /// Run one agent step: stream the model's next message into a fresh bubble,
+    /// then settle it in [`Self::on_agent_step_end`] (execute a tool and loop, or
+    /// finish).
+    fn run_agent_step(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_step_buffer.clear();
+        self.messages.push(ChatEntry {
+            role: ChatRole::Assistant,
+            text: String::new(),
+            context_label: None,
+        });
+        let stream = stream_chat(self.endpoint, &self.agent_model, self.agent_messages.clone());
+        ctx.spawn_stream_local(
+            stream,
+            |me, item, ctx| me.on_agent_token(item, ctx),
+            |me, ctx| me.on_agent_step_end(ctx),
+        );
+    }
+
+    fn on_agent_token(&mut self, item: Result<ChatStreamItem>, ctx: &mut ViewContext<Self>) {
+        match item {
+            Ok(ChatStreamItem::Token(token)) => {
+                self.agent_step_buffer.push_str(&token);
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == ChatRole::Assistant {
+                        last.text.push_str(&token);
+                    }
+                }
+                self.scroll_to_bottom();
+                ctx.notify();
+            }
+            // The step is settled in `on_agent_step_end`.
+            Ok(ChatStreamItem::Done) => {}
+            Err(e) => self.finish_agent_with_error(format!("Local model error: {e}"), ctx),
+        }
+    }
+
+    fn on_agent_step_end(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.in_flight {
+            return; // already errored out
+        }
+        let reply = self.agent_step_buffer.trim().to_string();
+        self.agent_messages.push(ChatMessage::assistant(reply.clone()));
+
+        match local_agent::parse_tool_call(&reply) {
+            Some(tool) if self.agent_step < MAX_AGENT_STEPS => {
+                let result = match self.agent_root.clone() {
+                    Some(root) => local_agent::run_read_tool(&root, &tool),
+                    None => "error: no project is open, so I can't read files.".to_string(),
+                };
+
+                // Replace the streamed bubble (which held the raw tool tag) with
+                // a clean tool step.
+                let preview = Self::tool_preview(&result);
+                if let Some(last) = self.messages.last_mut() {
+                    last.role = ChatRole::Tool;
+                    last.text = format!("🔧 {}\n{preview}", tool.summary());
+                }
+
+                // Feed the full result back to the model and take another step.
+                self.agent_messages.push(ChatMessage::user(format!(
+                    "TOOL RESULT ({}):\n{result}",
+                    tool.name()
+                )));
+                self.agent_step += 1;
+                self.scroll_to_bottom();
+                ctx.notify();
+                self.run_agent_step(ctx);
+            }
+            _ => {
+                // No tool call (or the step budget is spent): the reply is the
+                // final answer, already in the last assistant bubble.
+                if self.agent_step >= MAX_AGENT_STEPS {
+                    if let Some(last) = self.messages.last_mut() {
+                        if last.role == ChatRole::Assistant && last.text.is_empty() {
+                            last.text = "(reached the tool-step limit)".to_string();
+                        }
+                    }
+                }
+                self.in_flight = false;
+                self.refresh_ai_mode();
+                self.scroll_to_bottom();
+                ctx.notify();
+            }
+        }
+    }
+
+    fn finish_agent_with_error(&mut self, message: String, ctx: &mut ViewContext<Self>) {
+        self.in_flight = false;
+        if let Some(last) = self.messages.last() {
+            if last.role == ChatRole::Assistant && last.text.is_empty() {
+                self.messages.pop();
+            }
+        }
+        self.error = Some(message);
+        ctx.notify();
+    }
+
+    /// A short preview of a tool result for the transcript; the full result is
+    /// what goes back to the model.
+    fn tool_preview(result: &str) -> String {
+        const MAX_LINES: usize = 6;
+        const MAX_CHARS: usize = 400;
+        let mut preview: String = result
+            .lines()
+            .take(MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if preview.chars().count() > MAX_CHARS {
+            preview = preview.chars().take(MAX_CHARS).collect();
+        }
+        if result.lines().count() > MAX_LINES || result.chars().count() > MAX_CHARS {
+            preview.push_str("\n…");
+        }
+        preview
     }
 
     fn on_stream_item(&mut self, item: Result<ChatStreamItem>, ctx: &mut ViewContext<Self>) {
@@ -442,6 +612,12 @@ impl LocalAiChatView {
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
                 appearance,
+                format!("🤖 Agent: {}", if self.agent_mode { "On" } else { "Off" }),
+                LocalAiChatAction::ToggleAgent,
+                self.agent_mode,
+            ))
+            .with_child(self.chip(
+                appearance,
                 format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
                 LocalAiChatAction::ToggleAttachContext,
                 self.attach_context,
@@ -476,10 +652,10 @@ impl LocalAiChatView {
         } else {
             theme.surface_1()
         };
-        let (prefix, role_color): (&str, ColorU) = if is_user {
-            ("You", genesi_green())
-        } else {
-            ("Genesi AI", theme.active_ui_text_color().into())
+        let (prefix, role_color): (&str, ColorU) = match entry.role {
+            ChatRole::User => ("You", genesi_green()),
+            ChatRole::Assistant => ("Genesi AI", theme.active_ui_text_color().into()),
+            ChatRole::Tool => ("Tool", theme.disabled_text_color(theme.background()).into()),
         };
 
         let body = if entry.text.is_empty() && self.in_flight {
@@ -680,6 +856,10 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::ToggleAttachContext => {
                 self.attach_context = !self.attach_context;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleAgent => {
+                self.agent_mode = !self.agent_mode;
                 ctx.notify();
             }
         }
