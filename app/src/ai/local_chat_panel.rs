@@ -24,7 +24,7 @@ use warpui::{
     ViewHandle,
 };
 
-use super::local_agent::{self, MAX_AGENT_STEPS};
+use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, turbo_health_ok, AiModeState,
     ChatMessage, ChatStreamItem, CodeContext, LocalEndpoint,
@@ -93,6 +93,12 @@ pub enum LocalAiChatAction {
     ToggleAttachContext,
     /// Toggle agent mode (the model can read the project via tools).
     ToggleAgent,
+    /// Toggle AUTO: run agent commands/edits without per-action approval.
+    ToggleAuto,
+    /// Approve the pending side-effecting tool and run it.
+    ApproveTool,
+    /// Deny the pending side-effecting tool.
+    DenyTool,
 }
 
 pub struct LocalAiChatView {
@@ -129,6 +135,13 @@ pub struct LocalAiChatView {
     agent_step: u32,
     /// Accumulates the current step's streamed tokens until it completes.
     agent_step_buffer: String,
+    /// Summary of the tool currently running, used to render its step.
+    agent_tool_summary: String,
+
+    /// When on, the agent runs commands/edits without asking. Off = approve each.
+    auto_approve: bool,
+    /// A side-effecting tool waiting for the user's Allow/Deny.
+    pending_tool: Option<AgentTool>,
 }
 
 impl LocalAiChatView {
@@ -159,6 +172,9 @@ impl LocalAiChatView {
             agent_model: String::new(),
             agent_step: 0,
             agent_step_buffer: String::new(),
+            agent_tool_summary: String::new(),
+            auto_approve: false,
+            pending_tool: None,
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -398,28 +414,18 @@ impl LocalAiChatView {
 
         match local_agent::parse_tool_call(&reply) {
             Some(tool) if self.agent_step < MAX_AGENT_STEPS => {
-                let result = match self.agent_root.clone() {
-                    Some(root) => local_agent::run_read_tool(&root, &tool),
-                    None => "error: no project is open, so I can't read files.".to_string(),
-                };
-
-                // Replace the streamed bubble (which held the raw tool tag) with
-                // a clean tool step.
-                let preview = Self::tool_preview(&result);
-                if let Some(last) = self.messages.last_mut() {
-                    last.role = ChatRole::Tool;
-                    last.text = format!("🔧 {}\n{preview}", tool.summary());
+                // Side-effecting tools pause for the user unless AUTO is on.
+                if tool.requires_approval() && !self.auto_approve {
+                    if let Some(last) = self.messages.last_mut() {
+                        last.role = ChatRole::Tool;
+                        last.text = format!("🔧 {} — awaiting approval", tool.summary());
+                    }
+                    self.pending_tool = Some(tool);
+                    self.scroll_to_bottom();
+                    ctx.notify();
+                    return;
                 }
-
-                // Feed the full result back to the model and take another step.
-                self.agent_messages.push(ChatMessage::user(format!(
-                    "TOOL RESULT ({}):\n{result}",
-                    tool.name()
-                )));
-                self.agent_step += 1;
-                self.scroll_to_bottom();
-                ctx.notify();
-                self.run_agent_step(ctx);
+                self.start_tool(tool, ctx);
             }
             _ => {
                 // No tool call (or the step budget is spent): the reply is the
@@ -448,6 +454,64 @@ impl LocalAiChatView {
         }
         self.error = Some(message);
         ctx.notify();
+    }
+
+    /// Begin running an (already-approved) tool: reads run inline; run_command
+    /// spawns. The loop continues in [`Self::finish_tool`].
+    fn start_tool(&mut self, tool: AgentTool, ctx: &mut ViewContext<Self>) {
+        self.agent_tool_summary = tool.summary();
+        self.agent_step += 1;
+
+        match &tool {
+            AgentTool::RunCommand { command } => {
+                if let Some(last) = self.messages.last_mut() {
+                    last.role = ChatRole::Tool;
+                    last.text = format!("🔧 {}\n(running…)", self.agent_tool_summary);
+                }
+                self.scroll_to_bottom();
+                ctx.notify();
+
+                let command = command.clone();
+                let root = self.agent_root.clone();
+                ctx.spawn(
+                    async move {
+                        match root {
+                            Some(root) => local_agent::run_command(&root, &command).await,
+                            None => "error: no project is open.".to_string(),
+                        }
+                    },
+                    |me, result, ctx| me.finish_tool("run_command", result, ctx),
+                );
+            }
+            _ => {
+                if let Some(last) = self.messages.last_mut() {
+                    last.role = ChatRole::Tool;
+                    last.text = format!("🔧 {}", self.agent_tool_summary);
+                }
+                let result = match self.agent_root.clone() {
+                    Some(root) => local_agent::run_read_tool(&root, &tool),
+                    None => "error: no project is open, so I can't read files.".to_string(),
+                };
+                self.finish_tool(tool.name(), result, ctx);
+            }
+        }
+    }
+
+    /// Settle a finished tool: show its result preview, feed the full result
+    /// back to the model, and take the next agent step.
+    fn finish_tool(&mut self, tool_name: &str, result: String, ctx: &mut ViewContext<Self>) {
+        let summary = self.agent_tool_summary.clone();
+        let preview = Self::tool_preview(&result);
+        if let Some(last) = self.messages.last_mut() {
+            last.role = ChatRole::Tool;
+            last.text = format!("🔧 {summary}\n{preview}");
+        }
+        self.agent_messages.push(ChatMessage::user(format!(
+            "TOOL RESULT ({tool_name}):\n{result}"
+        )));
+        self.scroll_to_bottom();
+        ctx.notify();
+        self.run_agent_step(ctx);
     }
 
     /// A short preview of a tool result for the transcript; the full result is
@@ -607,7 +671,9 @@ impl LocalAiChatView {
             ))
             .finish();
 
-        let actions_row = Flex::row()
+        // Agent controls: Agent toggle, AUTO (only meaningful in agent mode), and
+        // the file-context toggle.
+        let mut agent_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
@@ -615,13 +681,26 @@ impl LocalAiChatView {
                 format!("🤖 Agent: {}", if self.agent_mode { "On" } else { "Off" }),
                 LocalAiChatAction::ToggleAgent,
                 self.agent_mode,
-            ))
-            .with_child(self.chip(
+            ));
+        if self.agent_mode {
+            agent_row.add_child(self.chip(
                 appearance,
-                format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
-                LocalAiChatAction::ToggleAttachContext,
-                self.attach_context,
-            ))
+                format!("AUTO: {}", if self.auto_approve { "On" } else { "Off" }),
+                LocalAiChatAction::ToggleAuto,
+                self.auto_approve,
+            ));
+        }
+        agent_row.add_child(self.chip(
+            appearance,
+            format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
+            LocalAiChatAction::ToggleAttachContext,
+            self.attach_context,
+        ));
+        let agent_row = agent_row.finish();
+
+        let util_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
                 appearance,
                 "Refresh".to_string(),
@@ -640,8 +719,57 @@ impl LocalAiChatView {
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(Container::new(title_row).with_padding_bottom(6.).finish())
             .with_child(Container::new(selectors_row).with_padding_bottom(4.).finish())
-            .with_child(actions_row)
+            .with_child(Container::new(agent_row).with_padding_bottom(4.).finish())
+            .with_child(util_row)
             .finish()
+    }
+
+    /// The approval prompt shown while a side-effecting tool waits for the user.
+    fn render_approval(&self, appearance: &Appearance, tool: &AgentTool) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let command = match tool {
+            AgentTool::RunCommand { command } => command.clone(),
+            other => other.summary(),
+        };
+
+        let command_box = Container::new(self.label_text(
+            appearance,
+            command,
+            BODY_FONT_SIZE,
+            theme.main_text_color(theme.background()).into(),
+            true,
+        ))
+        .with_uniform_padding(8.)
+        .with_margin_top(4.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_background(theme.surface_1())
+        .finish();
+
+        let buttons = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(self.chip(appearance, "Allow".to_string(), LocalAiChatAction::ApproveTool, true))
+            .with_child(self.chip(appearance, "Deny".to_string(), LocalAiChatAction::DenyTool, true))
+            .finish();
+
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    "⚠ Allow this command?",
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
+                .with_child(command_box)
+                .with_child(Container::new(buttons).with_margin_top(6.).finish())
+                .finish(),
+        )
+        .with_horizontal_padding(PANEL_PADDING)
+        .with_padding_bottom(6.)
+        .finish()
     }
 
     fn render_message(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
@@ -852,6 +980,7 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::Clear => {
                 self.messages.clear();
                 self.error = None;
+                self.pending_tool = None;
                 ctx.notify();
             }
             LocalAiChatAction::ToggleAttachContext => {
@@ -860,6 +989,32 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::ToggleAgent => {
                 self.agent_mode = !self.agent_mode;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleAuto => {
+                self.auto_approve = !self.auto_approve;
+                ctx.notify();
+            }
+            LocalAiChatAction::ApproveTool => {
+                if let Some(tool) = self.pending_tool.take() {
+                    self.start_tool(tool, ctx);
+                }
+                ctx.notify();
+            }
+            LocalAiChatAction::DenyTool => {
+                if let Some(tool) = self.pending_tool.take() {
+                    if let Some(last) = self.messages.last_mut() {
+                        last.role = ChatRole::Tool;
+                        last.text = format!("🔧 {} — denied", tool.summary());
+                    }
+                    // Tell the model the user declined so it can adapt or answer.
+                    self.agent_messages.push(ChatMessage::user(format!(
+                        "TOOL RESULT ({}):\nThe user denied running this command.",
+                        tool.name()
+                    )));
+                    self.agent_step += 1;
+                    self.run_agent_step(ctx);
+                }
                 ctx.notify();
             }
         }
@@ -905,6 +1060,11 @@ impl View for LocalAiChatView {
                 .with_padding_bottom(4.)
                 .finish(),
             );
+        }
+
+        // A pending command waits for the user's Allow/Deny above the input.
+        if let Some(tool) = &self.pending_tool {
+            root.add_child(self.render_approval(appearance, tool));
         }
 
         // The input as a bordered, rounded compose box so it reads as an input
