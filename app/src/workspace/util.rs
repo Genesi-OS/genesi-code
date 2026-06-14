@@ -28,6 +28,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) more_info_banner_button: MouseStateHandle,
     pub(super) resource_center_icon: MouseStateHandle,
     pub(super) ai_tab_bar_button: MouseStateHandle,
+    /// Genesi: entrypoint button for the login-free local AI panel.
+    pub(super) local_ai_tab_bar_button: MouseStateHandle,
     pub(super) agent_management_view_button: MouseStateHandle,
     pub(super) left_panel_icon: MouseStateHandle,
     pub(super) settings_icon: MouseStateHandle,

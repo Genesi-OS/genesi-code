@@ -20281,6 +20281,14 @@ impl Workspace {
             }
         }
 
+        // Genesi: login-free local AI panel entrypoint. Always shown (no account
+        // required, works offline against localhost).
+        target.add_child(
+            Container::new(self.render_local_ai_entrypoint_button(appearance))
+                .with_margin_left(TAB_BAR_PADDING_LEFT)
+                .finish(),
+        );
+
         // Legacy AI assistant button (non-agent-mode only)
         if is_online
             && !FeatureFlag::AgentMode.is_enabled()
@@ -20903,6 +20911,26 @@ impl Workspace {
                 label,
                 self.cached_keybindings[ASK_AI_ASSISTANT_KEYBINDING_NAME].clone(),
                 false,
+                false,
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
+    /// Genesi: always-available entrypoint for the login-free local AI panel
+    /// (no account, talks to localhost). Mirrors the legacy AI assistant button.
+    fn render_local_ai_entrypoint_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let is_active = self.current_workspace_state.is_local_ai_panel_open;
+        Align::new(
+            self.render_tab_bar_icon_button(
+                appearance,
+                icons::Icon::Lightning,
+                &self.mouse_states.local_ai_tab_bar_button,
+                WorkspaceAction::ToggleLocalAi,
+                "Local AI".to_owned(),
+                None,
+                is_active,
                 false,
             )
             .finish(),
