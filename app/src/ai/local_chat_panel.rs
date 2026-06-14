@@ -224,7 +224,7 @@ impl LocalAiChatView {
             });
         }
 
-        let stream = stream_chat(self.endpoint.base_url(), &model, request);
+        let stream = stream_chat(self.endpoint, &model, request);
         ctx.spawn_stream_local(
             stream,
             |me, item, ctx| me.on_stream_item(item, ctx),

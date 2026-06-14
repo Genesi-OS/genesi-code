@@ -90,13 +90,112 @@ struct ChatDelta {
     content: Option<String>,
 }
 
-/// Open a streaming chat completion against `base_url` (e.g.
-/// `http://localhost:11434/v1`). The returned stream yields assistant text
+/// Native (non-OpenAI) request body for ollama's `/api/chat`.
+#[derive(Serialize)]
+struct OllamaChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+}
+
+/// ollama's native `/api/chat` reply (with `stream: false`).
+#[derive(Deserialize, Default)]
+struct OllamaChatResponse {
+    #[serde(default)]
+    message: OllamaResponseMessage,
+    /// Set when ollama itself errors (e.g. model not found).
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaResponseMessage {
+    #[serde(default)]
+    content: String,
+}
+
+/// ollama's native chat endpoint. Its OpenAI-compat `/v1/chat/completions`
+/// hangs on some versions (a raw curl to it never responds, while the native
+/// API and `ollama run` work) — the AI Mode monitor talks to the native API for
+/// exactly this reason, so we mirror it.
+const OLLAMA_NATIVE_CHAT_URL: &str = "http://localhost:11434/api/chat";
+
+/// Stream a chat completion from the given local endpoint. Yields assistant text
 /// chunks (`Token`) and a terminal `Done`. No auth headers are sent.
 ///
-/// Building the stream is cheap and synchronous; the request is driven as the
-/// caller polls the stream.
+/// The two endpoints speak different protocols: ollama uses its native
+/// `/api/chat` (its OpenAI-compat layer is unreliable), while genesi-ai-turbo's
+/// llama-server uses the OpenAI-compatible `/v1/chat/completions` SSE stream.
 pub fn stream_chat(
+    endpoint: LocalEndpoint,
+    model: &str,
+    messages: Vec<ChatMessage>,
+) -> futures::stream::LocalBoxStream<'static, Result<ChatStreamItem>> {
+    match endpoint {
+        LocalEndpoint::Ollama => {
+            stream_chat_ollama_native(model.to_string(), messages).boxed_local()
+        }
+        LocalEndpoint::Turbo => {
+            stream_chat_openai_sse(endpoint.base_url(), model, messages).boxed_local()
+        }
+    }
+}
+
+/// ollama's native `/api/chat` with `stream: false`: surface the whole reply as
+/// a single token. This reuses the exact `send()` + `json()` call path that
+/// already works for `list_models`, avoiding the SSE machinery that ollama's
+/// OpenAI-compat endpoint chokes on.
+fn stream_chat_ollama_native(
+    model: String,
+    messages: Vec<ChatMessage>,
+) -> impl Stream<Item = Result<ChatStreamItem>> {
+    async_stream::stream! {
+        let body = OllamaChatRequest {
+            model: &model,
+            messages: &messages,
+            stream: false,
+        };
+        let client = http_client::Client::new();
+        let sent = client
+            .post(OLLAMA_NATIVE_CHAT_URL)
+            .json(&body)
+            .timeout(CHAT_REQUEST_TIMEOUT)
+            .send()
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(e) => {
+                yield Err(anyhow!("failed to reach ollama at {OLLAMA_NATIVE_CHAT_URL}: {e}"));
+                return;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response.text().await.unwrap_or_default();
+            yield Err(anyhow!("ollama returned {status}: {detail}"));
+            return;
+        }
+        let parsed: OllamaChatResponse = match response.json().await {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                yield Err(anyhow!("failed to parse the ollama reply: {e}"));
+                return;
+            }
+        };
+        if let Some(err) = parsed.error {
+            yield Err(anyhow!("ollama error: {err}"));
+            return;
+        }
+        if !parsed.message.content.is_empty() {
+            yield Ok(ChatStreamItem::Token(parsed.message.content));
+        }
+        yield Ok(ChatStreamItem::Done);
+    }
+}
+
+/// OpenAI-compatible SSE streaming (`/v1/chat/completions`) — used for the Turbo
+/// (llama-server) endpoint, whose OpenAI compat layer works correctly.
+fn stream_chat_openai_sse(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
