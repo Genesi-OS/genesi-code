@@ -130,13 +130,13 @@ pub fn stream_chat(
     endpoint: LocalEndpoint,
     model: &str,
     messages: Vec<ChatMessage>,
-) -> futures::stream::LocalBoxStream<'static, Result<ChatStreamItem>> {
+) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match endpoint {
         LocalEndpoint::Ollama => {
-            stream_chat_ollama_native(model.to_string(), messages).boxed_local()
+            stream_chat_ollama_native(model.to_string(), messages).boxed()
         }
         LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), model, messages).boxed_local()
+            stream_chat_openai_sse(endpoint.base_url(), model, messages).boxed()
         }
     }
 }
