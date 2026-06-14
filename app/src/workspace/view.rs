@@ -547,6 +547,10 @@ const TAB_BAR_OVERFLOW_MENU_WIDTH: f32 = 300.;
 
 #[cfg(not(target_family = "wasm"))]
 const RESOURCE_CENTER_WIDTH: f32 = 361.;
+/// Genesi: fixed width for the login-free local AI chat panel. A bounded width
+/// is required — the right dock lays panels out with an infinite-width
+/// constraint, and the panel's flex/buffer children can't expand into it.
+const LOCAL_AI_PANEL_WIDTH: f32 = 380.;
 
 // Ratio of terminal : theme chooser when theme chooser is active
 const THEME_CHOOSER_RATIO: f32 = 3.5;
@@ -21810,7 +21814,9 @@ impl Workspace {
             } else if self.current_workspace_state.is_local_ai_panel_open {
                 Some(self.render_panel(
                     app,
-                    ChildView::new(&self.local_ai_panel).finish(),
+                    ConstrainedBox::new(ChildView::new(&self.local_ai_panel).finish())
+                        .with_width(LOCAL_AI_PANEL_WIDTH)
+                        .finish(),
                     &PanelPosition::Right,
                 ))
             } else {
