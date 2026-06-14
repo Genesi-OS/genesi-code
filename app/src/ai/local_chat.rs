@@ -209,12 +209,14 @@ fn stream_chat_openai_sse(
 
     // `json()` serializes eagerly into the builder, so `body` (and its borrow of
     // `messages`) is no longer needed once the request is built.
+    //
+    // NOTE: do NOT add reqwest's `.timeout()` here. `.eventsource()` is built
+    // synchronously inside the view's `send()` (no Tokio context), and a request
+    // timeout arms a Tokio timer at construction → "there is no reactor running"
+    // panic. The ollama path can use a timeout because it's polled lazily under
+    // spawn_stream_local (which has a Tokio context); the SSE path cannot.
     let client = http_client::Client::new();
-    let event_source = client
-        .post(url)
-        .json(&body)
-        .timeout(CHAT_REQUEST_TIMEOUT)
-        .eventsource();
+    let event_source = client.post(url).json(&body).eventsource();
 
     event_source.filter_map(|event| async move {
         match event {
