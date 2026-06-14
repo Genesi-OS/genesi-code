@@ -23,8 +23,8 @@ use warpui::{
 };
 
 use super::local_chat::{
-    endpoint_available, list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, AiModeState,
-    ChatMessage, ChatStreamItem, LocalEndpoint, TURBO_LOCAL_BASE_URL,
+    list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, turbo_health_ok, AiModeState,
+    ChatMessage, ChatStreamItem, LocalEndpoint,
 };
 use crate::appearance::Appearance;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
@@ -130,9 +130,13 @@ impl LocalAiChatView {
     /// Ask the active endpoint for its model list and probe whether Turbo is up.
     fn refresh_models(&mut self, ctx: &mut ViewContext<Self>) {
         let base = self.endpoint.base_url().to_string();
+        // Turbo (llama-server) already has its model loaded and its `/v1/models`
+        // isn't a reliable signal, so an empty/failed list there is not an error —
+        // readiness comes from the `/health` probe below instead.
+        let is_turbo = self.endpoint == LocalEndpoint::Turbo;
         ctx.spawn(
             async move { list_models(&base).await },
-            |me, result, ctx| {
+            move |me, result, ctx| {
                 match result {
                     Ok(models) => {
                         me.models = models;
@@ -141,7 +145,7 @@ impl LocalAiChatView {
                         } else {
                             Some(me.selected_model.unwrap_or(0).min(me.models.len() - 1))
                         };
-                        if me.models.is_empty() {
+                        if me.models.is_empty() && !is_turbo {
                             me.error = Some(
                                 "No local models found. Is ollama running? Try `ollama pull llama3.2`."
                                     .to_string(),
@@ -153,7 +157,11 @@ impl LocalAiChatView {
                     Err(e) => {
                         me.models.clear();
                         me.selected_model = None;
-                        me.error = Some(format!("Can't reach the local endpoint: {e}"));
+                        me.error = if is_turbo {
+                            None
+                        } else {
+                            Some(format!("Can't reach the local endpoint: {e}"))
+                        };
                     }
                 }
                 ctx.notify();
@@ -161,7 +169,7 @@ impl LocalAiChatView {
         );
 
         ctx.spawn(
-            async { endpoint_available(TURBO_LOCAL_BASE_URL).await },
+            async { turbo_health_ok().await },
             |me, available, ctx| {
                 me.turbo_available = available;
                 ctx.notify();
@@ -190,12 +198,19 @@ impl LocalAiChatView {
         if prompt.is_empty() || self.in_flight {
             return;
         }
-        let Some(model) = self.current_model() else {
-            self.error = Some(
-                "No model selected. Is ollama running? Try `ollama pull llama3.2`.".to_string(),
-            );
-            ctx.notify();
-            return;
+        // Turbo serves whatever model llama-server already loaded, so the `model`
+        // field is informational there — fall back to a placeholder when no model
+        // is listed. Ollama needs a real model name.
+        let model = match self.current_model() {
+            Some(model) => model,
+            None if self.endpoint == LocalEndpoint::Turbo => "local".to_string(),
+            None => {
+                self.error = Some(
+                    "No model selected. Is ollama running? Try `ollama pull llama3.2`.".to_string(),
+                );
+                ctx.notify();
+                return;
+            }
         };
 
         self.error = None;

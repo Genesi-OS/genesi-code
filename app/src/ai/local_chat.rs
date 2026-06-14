@@ -295,6 +295,11 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
 /// Same payload shape as ollama; faster generation, identical output.
 pub const TURBO_LOCAL_BASE_URL: &str = "http://localhost:11435/v1";
 
+/// llama-server's readiness endpoint (root, not under `/v1`). It answers 200
+/// once a model is loaded — the reliable liveness signal for Turbo, unlike
+/// `/v1/models`. This is what the AI Mode monitor polls too.
+pub const TURBO_HEALTH_URL: &str = "http://localhost:11435/health";
+
 /// Where `genesi-aid` publishes its live status (tmpfs, daemon-written).
 pub const AI_MODE_STATE_FILE: &str = "/run/genesi-ai-mode/state.json";
 /// User-writable override the daemon reads: `on` | `off` | absent (= auto).
@@ -338,6 +343,22 @@ impl LocalEndpoint {
 /// Used to know whether Turbo (:11435) is actually up before offering it.
 pub async fn endpoint_available(base_url: &str) -> bool {
     list_models(base_url).await.is_ok()
+}
+
+/// Turbo (llama-server) liveness via `GET /health`. llama-server's `/v1/models`
+/// isn't a reliable readiness signal, so probe `/health` like the AI Mode
+/// monitor does. Returns true when it answers 200.
+pub async fn turbo_health_ok() -> bool {
+    let client = http_client::Client::new();
+    match client
+        .get(TURBO_HEALTH_URL)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 /// Snapshot of `genesi-aid`'s state, as published in `state.json`. Only the
