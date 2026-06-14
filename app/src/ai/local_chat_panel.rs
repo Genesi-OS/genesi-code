@@ -24,7 +24,7 @@ use warpui::{
 
 use super::local_chat::{
     list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, turbo_health_ok, AiModeState,
-    ChatMessage, ChatStreamItem, LocalEndpoint,
+    ChatMessage, ChatStreamItem, CodeContext, LocalEndpoint,
 };
 use crate::appearance::Appearance;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
@@ -51,11 +51,19 @@ enum ChatRole {
 struct ChatEntry {
     role: ChatRole,
     text: String,
+    /// For user turns: a short label of the code context attached (if any), e.g.
+    /// `foo.rs · lines 12-40`. Shown faintly under the message.
+    context_label: Option<String>,
 }
 
-/// Events emitted to the workspace (so it can close the panel).
+/// Events emitted to the workspace.
 pub enum LocalAiChatEvent {
+    /// Close the panel.
     ClosePanel,
+    /// The user submitted a prompt; the workspace attaches fresh file context
+    /// and calls back into [`LocalAiChatView::send_with_context`]. Routing this
+    /// through the workspace is what gives the panel workspace awareness.
+    SubmitPrompt(String),
 }
 
 /// Click actions dispatched by the header chips.
@@ -71,6 +79,8 @@ pub enum LocalAiChatAction {
     Refresh,
     /// Clear the transcript.
     Clear,
+    /// Toggle auto-attaching the focused file as context.
+    ToggleAttachContext,
 }
 
 pub struct LocalAiChatView {
@@ -86,6 +96,10 @@ pub struct LocalAiChatView {
 
     in_flight: bool,
     error: Option<String>,
+
+    /// When on, each send attaches the focused code editor's file (or selection)
+    /// as context — like a normal AI IDE.
+    attach_context: bool,
 }
 
 impl LocalAiChatView {
@@ -109,6 +123,7 @@ impl LocalAiChatView {
             ai_mode: None,
             in_flight: false,
             error: None,
+            attach_context: true,
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -187,13 +202,26 @@ impl LocalAiChatView {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
-            SubmittableTextInputEvent::Submit(text) => self.send(text.clone(), ctx),
+            // Route the submit through the workspace so it can attach the
+            // focused file as context before we actually send (see
+            // `LocalAiChatEvent::SubmitPrompt`). The workspace calls back into
+            // `send_with_context`.
+            SubmittableTextInputEvent::Submit(text) => {
+                ctx.emit(LocalAiChatEvent::SubmitPrompt(text.clone()));
+            }
             SubmittableTextInputEvent::Escape => {}
         }
     }
 
-    /// Send the prompt and start streaming the assistant's reply.
-    fn send(&mut self, prompt: String, ctx: &mut ViewContext<Self>) {
+    /// Send the prompt and start streaming the assistant's reply, optionally
+    /// attaching the focused file as context. Called by the workspace after it
+    /// gathers `context` for the current turn.
+    pub fn send_with_context(
+        &mut self,
+        prompt: String,
+        context: Option<CodeContext>,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() || self.in_flight {
             return;
@@ -214,21 +242,33 @@ impl LocalAiChatView {
         };
 
         self.error = None;
+
+        // Attach the focused file only when the toggle is on. Recorded on the
+        // user entry so the transcript shows what the model was given.
+        let context = if self.attach_context { context } else { None };
+        let context_label = context.as_ref().map(CodeContext::label);
+
         self.messages.push(ChatEntry {
             role: ChatRole::User,
             text: prompt,
+            context_label,
         });
         // The assistant placeholder grows as tokens arrive.
         self.messages.push(ChatEntry {
             role: ChatRole::Assistant,
             text: String::new(),
+            context_label: None,
         });
         self.in_flight = true;
         self.scroll_to_bottom();
 
         // Build the request from the full transcript (skipping the empty
-        // placeholder we just pushed), prefixed with a small system prompt.
+        // placeholder we just pushed), prefixed with a small system prompt and,
+        // when present, the attached file context as a second system message.
         let mut request = vec![ChatMessage::system(SYSTEM_PROMPT)];
+        if let Some(context) = &context {
+            request.push(context.to_system_message());
+        }
         for entry in &self.messages {
             if entry.text.is_empty() {
                 continue;
@@ -389,6 +429,12 @@ impl LocalAiChatView {
             ))
             .with_child(self.chip(
                 appearance,
+                format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
+                LocalAiChatAction::ToggleAttachContext,
+                self.attach_context,
+            ))
+            .with_child(self.chip(
+                appearance,
                 "Refresh".to_string(),
                 LocalAiChatAction::Refresh,
                 true,
@@ -421,7 +467,7 @@ impl LocalAiChatView {
             entry.text.clone()
         };
 
-        let inner = Flex::column()
+        let mut inner = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(self.label_text(
                 appearance,
@@ -429,7 +475,20 @@ impl LocalAiChatView {
                 CHIP_FONT_SIZE,
                 theme.disabled_text_color(theme.background()).into(),
                 false,
-            ))
+            ));
+
+        // Show the attached file context (if any) faintly under the author line.
+        if let Some(label) = &entry.context_label {
+            inner.add_child(self.label_text(
+                appearance,
+                format!("📎 {label}"),
+                CHIP_FONT_SIZE,
+                theme.disabled_text_color(theme.background()).into(),
+                false,
+            ));
+        }
+
+        let inner = inner
             .with_child(self.label_text(
                 appearance,
                 body,
@@ -548,6 +607,10 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::Clear => {
                 self.messages.clear();
                 self.error = None;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleAttachContext => {
+                self.attach_context = !self.attach_context;
                 ctx.notify();
             }
         }

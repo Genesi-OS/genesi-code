@@ -4689,6 +4689,16 @@ impl Workspace {
                 self.focus_active_tab(ctx);
                 ctx.notify();
             }
+            LocalAiChatEvent::SubmitPrompt(text) => {
+                // Gather the focused file's context now (fresh) and hand both the
+                // prompt and the context to the panel, which decides whether to
+                // attach it based on its own toggle.
+                let context = self.focused_code_context(ctx);
+                let text = text.clone();
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.send_with_context(text, context, ctx);
+                });
+            }
         }
     }
 
@@ -5173,6 +5183,47 @@ impl Workspace {
         self.active_tab_pane_group()
             .as_ref(ctx)
             .selected_text_from_focused_pane(ctx)
+    }
+
+    /// Genesi: snapshot the code editor the user is focused on, for the local AI
+    /// panel to attach as context. Prefers the focused pane; falls back to any
+    /// open code pane so it still works when a terminal (or the right-dock AI
+    /// panel) holds focus. Returns `None` when no local-file code editor is open.
+    fn focused_code_context(&self, ctx: &AppContext) -> Option<crate::ai::local_chat::CodeContext> {
+        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+        let code_view = pane_group
+            .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
+            .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next())?;
+
+        let editor_handle = code_view.as_ref(ctx).active_editor()?;
+        let editor = editor_handle.as_ref(ctx);
+        let path = editor.file_path()?;
+        let display_path = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let language = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let inner = editor.editor().as_ref(ctx);
+        let selection = match (inner.selected_lines(ctx), inner.selected_text(ctx)) {
+            (Some((start, end)), Some(text)) if !text.is_empty() => Some((start, end, text)),
+            _ => None,
+        };
+        let file_text = if selection.is_some() {
+            None
+        } else {
+            Some(inner.text(ctx).as_str().to_string())
+        };
+
+        Some(crate::ai::local_chat::CodeContext {
+            path: display_path,
+            language,
+            selection,
+            file_text,
+        })
     }
 
     /// This is meant to be dispatched directly by actions.

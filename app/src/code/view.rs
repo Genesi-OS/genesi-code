@@ -261,6 +261,14 @@ impl CodeView {
         }
     }
 
+    /// The editor backing the currently active tab, if any. Used to attach the
+    /// focused file as context to the local AI panel.
+    pub fn active_editor(&self) -> Option<ViewHandle<LocalCodeEditorView>> {
+        self.tab_group
+            .get(self.active_tab_index)
+            .map(|tab| tab.editor_view.clone())
+    }
+
     pub fn new(
         source: CodeSource,
         line_col: Option<LineAndColumnArg>,

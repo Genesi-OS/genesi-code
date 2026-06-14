@@ -56,6 +56,88 @@ impl ChatMessage {
     }
 }
 
+/// Caps on how much of the active file is injected as context. A small local
+/// model has a tight context window, so the whole-file case is bounded; a
+/// selection is sent verbatim (the user picked it deliberately).
+const CONTEXT_MAX_LINES: usize = 200;
+const CONTEXT_MAX_CHARS: usize = 6000;
+
+/// Snapshot of the code editor the user is focused on, attached to a chat turn
+/// so the local model can answer about the code in front of the user — like a
+/// normal AI IDE. The workspace builds this at send time (see
+/// `Workspace::focused_code_context`) so it's always fresh.
+#[derive(Debug, Clone)]
+pub struct CodeContext {
+    /// Display name of the file (the file name, not the full path).
+    pub path: String,
+    /// Language hint for the markdown code fence (from the file extension).
+    pub language: String,
+    /// A user selection: `(start_line, end_line, text)`, 1-indexed lines.
+    pub selection: Option<(u32, u32, String)>,
+    /// The full file text, used only when there's no selection.
+    pub file_text: Option<String>,
+}
+
+impl CodeContext {
+    /// Short label for the chat UI, e.g. `foo.rs · lines 12-40`.
+    pub fn label(&self) -> String {
+        match &self.selection {
+            Some((start, end, _)) if start == end => format!("{} · line {start}", self.path),
+            Some((start, end, _)) => format!("{} · lines {start}-{end}", self.path),
+            None => self.path.clone(),
+        }
+    }
+
+    /// Render the context as a system message prepended to the turn. Bounded so a
+    /// large file can't blow a small local model's context window.
+    pub fn to_system_message(&self) -> ChatMessage {
+        let mut body = String::from(
+            "The user is editing code in Genesi Code. Use the file context below to \
+             answer their question; refer to it only as needed.\n\n",
+        );
+        match &self.selection {
+            Some((start, end, text)) => {
+                body.push_str(&format!(
+                    "File: {} (selected lines {start}-{end})\n",
+                    self.path
+                ));
+                body.push_str(&fenced(&self.language, &clamp_context(text)));
+            }
+            None => {
+                body.push_str(&format!("File: {}\n", self.path));
+                let text = self.file_text.as_deref().unwrap_or_default();
+                body.push_str(&fenced(&self.language, &clamp_context(text)));
+            }
+        }
+        ChatMessage::system(body)
+    }
+}
+
+/// Truncate context text to the line/char caps, marking it when cut.
+fn clamp_context(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_truncated = lines.len() > CONTEXT_MAX_LINES;
+    let line_capped = lines[..lines.len().min(CONTEXT_MAX_LINES)].join("\n");
+
+    let (mut out, char_truncated) = if line_capped.chars().count() > CONTEXT_MAX_CHARS {
+        (
+            line_capped.chars().take(CONTEXT_MAX_CHARS).collect::<String>(),
+            true,
+        )
+    } else {
+        (line_capped, false)
+    };
+    if line_truncated || char_truncated {
+        out.push_str("\n… [truncated]");
+    }
+    out
+}
+
+/// Wrap text in a markdown code fence with a language hint.
+fn fenced(language: &str, text: &str) -> String {
+    format!("```{language}\n{text}\n```\n")
+}
+
 /// One streamed update from the model.
 #[derive(Debug, Clone)]
 pub enum ChatStreamItem {
