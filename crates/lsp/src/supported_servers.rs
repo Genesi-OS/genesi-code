@@ -114,8 +114,7 @@ impl LSPServerType {
                     prepend_args: vec![],
                 }),
             LSPServerType::VscodeHtmlLanguageServer => {
-                // PATH-only for now (ships with `vscode-langservers-extracted`).
-                None
+                HtmlLanguageServerCandidate::find_installed_binary_config(path_env_var).await
             }
         }
     }
