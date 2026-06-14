@@ -236,12 +236,12 @@ pub fn run_read_tool(root: &Path, tool: &AgentTool) -> String {
 
 /// Run a shell command in the project root and return its bounded output
 /// (exit code + stdout + stderr). Races a timeout so a hanging command can't
-/// wedge the agent. Uses `async_process` (executor-agnostic — no tokio reactor
-/// needed, unlike the SSE path).
-pub async fn run_command(root: &Path, command: &str) -> String {
+/// wedge the agent. Uses the project's `command` crate (an `async_process`
+/// wrapper — executor-agnostic, no tokio reactor needed, unlike the SSE path).
+pub async fn run_command(root: &Path, shell_command: &str) -> String {
     let exec = async {
-        let mut cmd = async_process::Command::new("sh");
-        cmd.arg("-c").arg(command).current_dir(root);
+        let mut cmd = command::r#async::Command::new("sh");
+        cmd.arg("-c").arg(shell_command).current_dir(root);
         match cmd.output().await {
             Ok(output) => format_command_output(&output),
             Err(e) => format!("error: failed to run command: {e}"),
