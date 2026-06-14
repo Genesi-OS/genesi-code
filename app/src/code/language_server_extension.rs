@@ -778,19 +778,25 @@ impl LocalCodeEditorView {
 
         let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
 
-        // Defensive: if the char right before the anchor is already the trigger
-        // `.`, strip any leading dot the server may have baked into the insert
-        // text so we don't produce `a..at`.
+        // Defensive de-dup (generalizes the old `.`-only guard): some servers bake
+        // a punctuation char the user already typed into the insert text — e.g.
+        // typing `</` in HTML then accepting `body` returns `/body>`, which naively
+        // appended yields `<//body>`. If the punctuation char immediately before the
+        // anchor equals the first char of the insert text, drop it. Restricted to
+        // punctuation so plain identifier/member completions are untouched.
         let before_anchor = anchor.saturating_sub(&CharOffset::from(1));
-        let prev_is_dot = self.editor().as_ref(ctx).char_at(before_anchor, ctx) == Some('.');
-        let insert_text = if prev_is_dot {
-            insert_text.trim_start_matches('.').to_string()
-        } else {
-            insert_text
+        let char_before = self.editor().as_ref(ctx).char_at(before_anchor, ctx);
+        let insert_text = match insert_text.chars().next() {
+            Some(first)
+                if !first.is_alphanumeric() && first != '_' && char_before == Some(first) =>
+            {
+                insert_text[first.len_utf8()..].to_string()
+            }
+            _ => insert_text,
         };
 
         log::info!(
-            "completion accept: anchor={anchor:?} cursor={cursor:?} prev_is_dot={prev_is_dot} insert={insert_text:?}"
+            "completion accept: anchor={anchor:?} cursor={cursor:?} char_before={char_before:?} insert={insert_text:?}"
         );
 
         self.editor.update(ctx, |editor, ctx| {
