@@ -40,6 +40,11 @@ const SCROLL_TO_BOTTOM: f32 = 1.0e7;
 const SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant running locally on Genesi OS. Be concise.";
 
+/// The Genesi brand green, used as the panel's accent.
+fn genesi_green() -> ColorU {
+    ColorU::new(15, 143, 106, 255)
+}
+
 /// Who authored a transcript entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRole {
@@ -412,7 +417,10 @@ impl LocalAiChatView {
             None => "Model: none".to_string(),
         };
 
-        let controls_row = Flex::row()
+        // The panel is only ~380px wide, so the controls live on two rows: the
+        // endpoint/model selectors, then the action chips. Cramming all five into
+        // one row overflowed and clipped the last button.
+        let selectors_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
@@ -427,6 +435,11 @@ impl LocalAiChatView {
                 LocalAiChatAction::CycleModel,
                 !self.models.is_empty(),
             ))
+            .finish();
+
+        let actions_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
                 appearance,
                 format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
@@ -450,15 +463,23 @@ impl LocalAiChatView {
         Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(Container::new(title_row).with_padding_bottom(6.).finish())
-            .with_child(controls_row)
+            .with_child(Container::new(selectors_row).with_padding_bottom(4.).finish())
+            .with_child(actions_row)
             .finish()
     }
 
     fn render_message(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let (background, prefix): (ColorU, &str) = match entry.role {
-            ChatRole::User => (theme.surface_2().into(), "You"),
-            ChatRole::Assistant => (theme.surface_1().into(), "AI"),
+        let is_user = entry.role == ChatRole::User;
+        let background = if is_user {
+            theme.surface_2()
+        } else {
+            theme.surface_1()
+        };
+        let (prefix, role_color): (&str, ColorU) = if is_user {
+            ("You", genesi_green())
+        } else {
+            ("Genesi AI", theme.active_ui_text_color().into())
         };
 
         let body = if entry.text.is_empty() && self.in_flight {
@@ -469,41 +490,62 @@ impl LocalAiChatView {
 
         let mut inner = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.label_text(
-                appearance,
-                prefix,
-                CHIP_FONT_SIZE,
-                theme.disabled_text_color(theme.background()).into(),
-                false,
-            ));
+            .with_child(self.label_text(appearance, prefix, CHIP_FONT_SIZE, role_color, false));
 
-        // Show the attached file context (if any) faintly under the author line.
+        // Show the attached file context (if any) as a small left-aligned pill.
         if let Some(label) = &entry.context_label {
-            inner.add_child(self.label_text(
+            let pill = Container::new(self.label_text(
                 appearance,
                 format!("📎 {label}"),
                 CHIP_FONT_SIZE,
                 theme.disabled_text_color(theme.background()).into(),
                 false,
-            ));
+            ))
+            .with_horizontal_padding(6.)
+            .with_vertical_padding(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_background(theme.surface_2())
+            .finish();
+
+            inner.add_child(
+                Container::new(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_child(pill)
+                        .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
+                        .finish(),
+                )
+                .with_margin_top(4.)
+                .finish(),
+            );
         }
 
         let inner = inner
-            .with_child(self.label_text(
-                appearance,
-                body,
-                BODY_FONT_SIZE,
-                theme.main_text_color(theme.background()).into(),
-                true,
-            ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    body,
+                    BODY_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_margin_top(4.)
+                .finish(),
+            )
             .finish();
 
-        Container::new(inner)
-            .with_uniform_padding(8.)
-            .with_margin_bottom(6.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-            .with_background(background)
-            .finish()
+        let mut bubble = Container::new(inner)
+            .with_uniform_padding(10.)
+            .with_margin_bottom(8.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_background(background);
+
+        // Genesi-green left accent on the user's turns for a clear visual rhythm.
+        if is_user {
+            bubble = bubble.with_border(Border::left(2.).with_border_color(genesi_green()));
+        }
+        bubble.finish()
     }
 
     fn render_transcript(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -511,19 +553,46 @@ impl LocalAiChatView {
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
         if self.messages.is_empty() {
-            let hint = match self.current_model() {
-                Some(model) => format!("Chat with your local model. Current: {model}."),
-                None => "No local model available yet. Start ollama and pull a model.".to_string(),
+            let (title, hint) = match self.current_model() {
+                Some(model) => (
+                    "Ask your local model".to_string(),
+                    format!(
+                        "Running {model} on-device — no account, no cloud. With 📎 on, \
+                         the file you're editing is sent as context."
+                    ),
+                ),
+                None => (
+                    "No local model yet".to_string(),
+                    "Start ollama and pull a model (e.g. `ollama pull llama3.2`), then hit Refresh."
+                        .to_string(),
+                ),
             };
             column.add_child(
-                Container::new(self.label_text(
-                    appearance,
-                    hint,
-                    BODY_FONT_SIZE,
-                    theme.disabled_text_color(theme.background()).into(),
-                    true,
-                ))
-                .with_uniform_padding(8.)
+                Container::new(
+                    Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                        .with_child(self.label_text(
+                            appearance,
+                            title,
+                            TITLE_FONT_SIZE,
+                            theme.active_ui_text_color().into(),
+                            false,
+                        ))
+                        .with_child(
+                            Container::new(self.label_text(
+                                appearance,
+                                hint,
+                                BODY_FONT_SIZE,
+                                theme.disabled_text_color(theme.background()).into(),
+                                true,
+                            ))
+                            .with_margin_top(6.)
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_uniform_padding(12.)
+                .with_margin_top(8.)
                 .finish(),
             );
         } else {
@@ -637,6 +706,7 @@ impl View for LocalAiChatView {
         root.add_child(
             Container::new(self.render_header(appearance))
                 .with_uniform_padding(PANEL_PADDING)
+                .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
                 .finish(),
         );
 
@@ -657,9 +727,19 @@ impl View for LocalAiChatView {
             );
         }
 
+        // The input as a bordered, rounded compose box so it reads as an input
+        // rather than floating text.
+        let input_box = Container::new(ChildView::new(&self.input).finish())
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_background(theme.surface_1())
+            .finish();
         root.add_child(
-            Container::new(ChildView::new(&self.input).finish())
+            Container::new(input_box)
                 .with_horizontal_padding(PANEL_PADDING)
+                .with_padding_top(4.)
                 .with_padding_bottom(PANEL_PADDING)
                 .finish(),
         );
