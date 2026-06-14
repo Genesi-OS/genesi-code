@@ -10,10 +10,18 @@
 //! AI with no account and no cloud.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{Stream, StreamExt};
 use reqwest_eventsource::Event;
 use serde::{Deserialize, Serialize};
+
+/// Upper bound on a single chat request. A local model that never loads (or an
+/// ollama wedged on an oversized model) would otherwise leave the panel
+/// spinning forever; this surfaces a clear timeout error instead. Generous
+/// enough not to cut a slow-but-working generation from a small local model.
+const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default local endpoint: ollama's OpenAI-compatible API.
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
@@ -103,7 +111,11 @@ pub fn stream_chat(
     // `json()` serializes eagerly into the builder, so `body` (and its borrow of
     // `messages`) is no longer needed once the request is built.
     let client = http_client::Client::new();
-    let event_source = client.post(url).json(&body).eventsource();
+    let event_source = client
+        .post(url)
+        .json(&body)
+        .timeout(CHAT_REQUEST_TIMEOUT)
+        .eventsource();
 
     event_source.filter_map(|event| async move {
         match event {
@@ -133,7 +145,20 @@ pub fn stream_chat(
                     }
                 }
             }
-            Err(err) => Some(Err(anyhow!("local chat stream error: {err}"))),
+            Err(err) => {
+                // reqwest's Display hides the underlying cause (e.g. "connection
+                // refused" / "connection reset"), so walk the source chain and
+                // append it — otherwise every failure reads the same useless
+                // "error sending request for url".
+                use std::error::Error as _;
+                let mut detail = String::new();
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    detail.push_str(&format!(": {cause}"));
+                    source = cause.source();
+                }
+                Some(Err(anyhow!("local chat stream error: {err}{detail}")))
+            }
         }
     })
 }
