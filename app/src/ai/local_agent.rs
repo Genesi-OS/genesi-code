@@ -66,6 +66,11 @@ pub enum AgentTool {
     ListFiles { path: String },
     Grep { query: String, path: String },
     RunCommand { command: String },
+    EditFile {
+        path: String,
+        search: String,
+        replace: String,
+    },
 }
 
 impl AgentTool {
@@ -75,6 +80,7 @@ impl AgentTool {
             AgentTool::ListFiles { .. } => "list_files",
             AgentTool::Grep { .. } => "grep",
             AgentTool::RunCommand { .. } => "run_command",
+            AgentTool::EditFile { .. } => "edit_file",
         }
     }
 
@@ -85,13 +91,17 @@ impl AgentTool {
             AgentTool::ListFiles { path } => format!("list_files {path}"),
             AgentTool::Grep { query, path } => format!("grep \"{query}\" in {path}"),
             AgentTool::RunCommand { command } => format!("run {command}"),
+            AgentTool::EditFile { path, .. } => format!("edit {path}"),
         }
     }
 
     /// Whether running this tool needs the user's go-ahead (anything that can
     /// change the system). Reads never do.
     pub fn requires_approval(&self) -> bool {
-        matches!(self, AgentTool::RunCommand { .. })
+        matches!(
+            self,
+            AgentTool::RunCommand { .. } | AgentTool::EditFile { .. }
+        )
     }
 }
 
@@ -110,7 +120,14 @@ To use a tool, reply with ONLY the tool tag and nothing else:\n\
   <tool:list_files path=\".\"/>\n\
   <tool:read_file path=\"src/main.rs\"/>\n\
   <tool:grep query=\"some text\" path=\".\"/>\n\
-  <tool:run_command>echo hello</tool>\n\n\
+  <tool:run_command>echo hello</tool>\n\
+  <tool:edit_file path=\"src/main.rs\">\n\
+<<<<<<< SEARCH\n\
+exact text to find\n\
+=======\n\
+new text\n\
+>>>>>>> REPLACE\n\
+</tool>\n\n\
 After a tool runs, you receive its result as the next message. Then call another \
 tool, or give your final answer in plain text (no tool tag).\n\n\
 Example:\n\
@@ -124,6 +141,9 @@ for the root.\n\
 - Prefer list_files / read_file before answering questions about the code.\n\
 - run_command runs a shell command and returns its output (the user may be \
 asked to approve it first).\n\
+- edit_file replaces the EXACT text in the SEARCH block with the REPLACE block. \
+Read the file first so SEARCH matches it character-for-character (the user may \
+approve the edit).\n\
 - Be concise and reference the files and lines you actually read. Do not invent \
 file contents."
         .to_string()
@@ -134,7 +154,11 @@ file contents."
 /// and bare `<NAME>` tags, self-closing or block form, and quoted or unquoted
 /// attributes.
 pub fn parse_tool_call(text: &str) -> Option<AgentTool> {
-    // Block form first (run_command's body can contain anything).
+    // edit_file: a block with a `path` attr and a SEARCH/REPLACE body.
+    if let Some(tool) = parse_edit_file(text) {
+        return Some(tool);
+    }
+    // run_command: a plain block whose body can contain anything.
     if let Some(body) = block_tool_body(text, "run_command") {
         let command = body.trim().to_string();
         if !command.is_empty() {
@@ -220,17 +244,101 @@ fn attr(attrs: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Parse an `<tool:edit_file path="…"> … SEARCH/REPLACE … </tool>` call.
+fn parse_edit_file(text: &str) -> Option<AgentTool> {
+    let attrs = tag_attrs(text, "edit_file")?;
+    let path = attr(&attrs, "path")?;
+    let body = block_tool_body(text, "edit_file")?;
+    let (search, replace) = parse_search_replace(&body)?;
+    Some(AgentTool::EditFile {
+        path,
+        search,
+        replace,
+    })
+}
+
+/// Pull the SEARCH and REPLACE halves out of a conflict-marker block. Preserves
+/// the content's indentation (only the marker lines and their newlines are
+/// stripped).
+fn parse_search_replace(body: &str) -> Option<(String, String)> {
+    const SEARCH: &str = "<<<<<<< SEARCH";
+    const DIVIDER: &str = "=======";
+    const REPLACE: &str = ">>>>>>> REPLACE";
+
+    let after_search = &body[body.find(SEARCH)? + SEARCH.len()..];
+    let search_start = after_search.find('\n')? + 1;
+    let after = &after_search[search_start..];
+
+    let divider = after.find(DIVIDER)?;
+    let search = &after[..divider];
+
+    let after_divider = &after[divider + DIVIDER.len()..];
+    let replace_start = after_divider.find('\n')? + 1;
+    let after_replace = &after_divider[replace_start..];
+
+    let replace_end = after_replace.find(REPLACE)?;
+    let replace = &after_replace[..replace_end];
+
+    Some((strip_one_trailing_newline(search), strip_one_trailing_newline(replace)))
+}
+
+/// Remove the single trailing newline that sits before the next marker line,
+/// without touching the content's own trailing whitespace.
+fn strip_one_trailing_newline(s: &str) -> String {
+    s.strip_suffix('\n').unwrap_or(s).to_string()
+}
+
 /// Run a read-only tool against `root`, returning a bounded text result to feed
 /// back to the model. Never reads outside `root`.
-pub fn run_read_tool(root: &Path, tool: &AgentTool) -> String {
+pub fn run_local_tool(root: &Path, tool: &AgentTool) -> String {
     match tool {
         AgentTool::ReadFile { path } => read_file(root, path),
         AgentTool::ListFiles { path } => list_files(root, path),
         AgentTool::Grep { query, path } => grep(root, query, path),
+        AgentTool::EditFile {
+            path,
+            search,
+            replace,
+        } => edit_file(root, path, search, replace),
         // run_command is async and goes through `run_command` instead.
         AgentTool::RunCommand { .. } => {
             "error: run_command must be executed asynchronously".to_string()
         }
+    }
+}
+
+/// Apply a SEARCH/REPLACE edit to a file on disk. An empty SEARCH creates (or
+/// overwrites) the file with REPLACE. Otherwise the first exact match of SEARCH
+/// is replaced; a miss is reported so the model can re-read and retry.
+fn edit_file(root: &Path, rel: &str, search: &str, replace: &str) -> String {
+    let Some(path) = safe_resolve(root, rel) else {
+        return format!("error: path '{rel}' is outside the project");
+    };
+
+    if search.is_empty() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return match std::fs::write(&path, replace) {
+            Ok(()) => format!("wrote {rel} ({} bytes)", replace.len()),
+            Err(e) => format!("error writing '{rel}': {e}"),
+        };
+    }
+
+    let original = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) => return format!("error reading '{rel}': {e}"),
+    };
+    if !original.contains(search) {
+        return format!(
+            "error: the SEARCH block was not found in {rel}. Read the file and \
+             make SEARCH match it exactly."
+        );
+    }
+    let updated = original.replacen(search, replace, 1);
+    match std::fs::write(&path, &updated) {
+        Ok(()) => format!("edited {rel} (1 replacement)"),
+        Err(e) => format!("error writing '{rel}': {e}"),
     }
 }
 

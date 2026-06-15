@@ -489,7 +489,7 @@ impl LocalAiChatView {
                     last.text = format!("🔧 {}", self.agent_tool_summary);
                 }
                 let result = match self.agent_root.clone() {
-                    Some(root) => local_agent::run_read_tool(&root, &tool),
+                    Some(root) => local_agent::run_local_tool(&root, &tool),
                     None => "error: no project is open, so I can't read files.".to_string(),
                 };
                 self.finish_tool(tool.name(), result, ctx);
@@ -727,14 +727,31 @@ impl LocalAiChatView {
     /// The approval prompt shown while a side-effecting tool waits for the user.
     fn render_approval(&self, appearance: &Appearance, tool: &AgentTool) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let command = match tool {
-            AgentTool::RunCommand { command } => command.clone(),
-            other => other.summary(),
+        let clip = |s: &str| -> String {
+            if s.chars().count() > 240 {
+                s.chars().take(240).collect::<String>() + "…"
+            } else {
+                s.to_string()
+            }
+        };
+        let (title, detail) = match tool {
+            AgentTool::RunCommand { command } => {
+                ("⚠ Allow this command?".to_string(), command.clone())
+            }
+            AgentTool::EditFile {
+                path,
+                search,
+                replace,
+            } => (
+                format!("✏ Apply this edit to {path}?"),
+                format!("- {}\n+ {}", clip(search), clip(replace)),
+            ),
+            other => ("⚠ Allow this action?".to_string(), other.summary()),
         };
 
-        let command_box = Container::new(self.label_text(
+        let detail_box = Container::new(self.label_text(
             appearance,
-            command,
+            detail,
             BODY_FONT_SIZE,
             theme.main_text_color(theme.background()).into(),
             true,
@@ -756,14 +773,8 @@ impl LocalAiChatView {
         Container::new(
             Flex::column()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.label_text(
-                    appearance,
-                    "⚠ Allow this command?",
-                    CHIP_FONT_SIZE,
-                    genesi_green(),
-                    false,
-                ))
-                .with_child(command_box)
+                .with_child(self.label_text(appearance, title, CHIP_FONT_SIZE, genesi_green(), false))
+                .with_child(detail_box)
                 .with_child(Container::new(buttons).with_margin_top(6.).finish())
                 .finish(),
         )
@@ -1009,7 +1020,7 @@ impl TypedActionView for LocalAiChatView {
                     }
                     // Tell the model the user declined so it can adapt or answer.
                     self.agent_messages.push(ChatMessage::user(format!(
-                        "TOOL RESULT ({}):\nThe user denied running this command.",
+                        "TOOL RESULT ({}):\nThe user denied this action.",
                         tool.name()
                     )));
                     self.agent_step += 1;
