@@ -1999,32 +1999,40 @@ impl View for LocalAiChatView {
             root.add_child(self.render_approval(appearance, tool));
         }
 
-        // AI model picker popup — opens just above the control strip, IDE-style,
-        // so the user clicks the selector once and chooses from a list.
+        // AI model picker popup — opens ABOVE the compose box (IDE-style): the
+        // user clicks the selector that lives inside the box and the list pops
+        // up over it.
         if let Some(picker) = self.render_model_picker(appearance) {
             root.add_child(picker);
         }
 
-        // Control strip: the click-to-open AI selector, the Turbo toggle next to
-        // it, and the agent toggles — sitting right above the compose box.
-        root.add_child(
-            Container::new(self.render_control_strip(appearance))
-                .with_horizontal_padding(PANEL_PADDING)
-                .with_padding_bottom(4.)
-                .finish(),
-        );
-
-        // The input as a bordered, rounded compose box so it reads as an input
-        // rather than floating text.
-        let input_box = Container::new(ChildView::new(&self.input).finish())
+        // The compose box: a single full-width, bordered, rounded container that
+        // holds the prompt input on top and the AI controls (selector + Turbo +
+        // agent toggles) along its bottom edge — like a real IDE assistant, with
+        // everything in one surface instead of loose chips above a bare input.
+        let compose_inner = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(ChildView::new(&self.input).finish())
+                    .with_horizontal_padding(4.)
+                    .with_vertical_padding(2.)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(self.render_control_strip(appearance))
+                    .with_padding_top(6.)
+                    .finish(),
+            )
+            .finish();
+        let compose_box = Container::new(compose_inner)
             .with_horizontal_padding(8.)
-            .with_vertical_padding(6.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_vertical_padding(8.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
             .with_background(theme.surface_1())
             .finish();
         root.add_child(
-            Container::new(input_box)
+            Container::new(compose_box)
                 .with_horizontal_padding(PANEL_PADDING)
                 .with_padding_top(4.)
                 .with_padding_bottom(PANEL_PADDING)
