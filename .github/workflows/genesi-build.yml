@@ -26,6 +26,10 @@ jobs:
     # Needed so the build can publish a GitHub Release with the binary.
     permissions:
       contents: write
+    env:
+      # Whether the cross-repo dispatch token is configured (secrets can't be
+      # referenced directly in a step `if:`, so surface it as an env flag here).
+      HAS_DISPATCH_TOKEN: ${{ secrets.GENESIOS_DISPATCH_TOKEN != '' }}
     container:
       # cachyos-v3 ships CachyOS repos + a trusted keyring. Arch-native build ->
       # the resulting binary runs on Genesi OS (CachyOS-based).
@@ -172,3 +176,20 @@ jobs:
             Release build (optimized, self-contained — assets embedded). Latest
             asset is always at the
             `releases/latest/download/genesi-code-linux-x86_64.tar.zst` URL.
+
+      - name: Notify GenesiOS to republish [genesi-apps]
+        # The GenesiOS publish-apps cron never fires (0 scheduled runs observed),
+        # so ping it directly the instant a release lands: it rebuilds genesi-code
+        # into the [genesi-apps] pacman repo so genesi-update and the package
+        # installer see the new version immediately instead of staying stuck on an
+        # old build. Requires a PAT on zFreshy/GenesiOS (scope: repo, or
+        # fine-grained Contents:read-write + Actions:read-write) stored as the
+        # GENESIOS_DISPATCH_TOKEN secret in THIS repo's settings. Skipped (not
+        # failed) when the secret is absent, so the build still succeeds without it.
+        if: ${{ env.HAS_DISPATCH_TOKEN == 'true' }}
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GENESIOS_DISPATCH_TOKEN }}
+          repository: zFreshy/GenesiOS
+          event-type: genesi-code-release
+          client-payload: '{"tag": "v0.0.${{ github.run_number }}", "sha": "${{ github.sha }}"}'
