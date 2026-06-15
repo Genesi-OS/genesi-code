@@ -55,8 +55,10 @@ const ROOT_MARKERS: &[&str] = &[
 ];
 
 /// The maximum number of agent steps (tool calls) per user turn, so a confused
-/// model can't loop forever.
-pub const MAX_AGENT_STEPS: u32 = 8;
+/// model can't loop forever. Generous enough to read several files and then
+/// create/edit several more in one turn (multi-file changes), which the old
+/// budget of 8 cut short.
+pub const MAX_AGENT_STEPS: u32 = 24;
 
 /// A tool the agent can call. Reads run immediately; `run_command` is
 /// side-effecting and gated by user approval (unless AUTO is on).
@@ -80,6 +82,13 @@ pub enum AgentTool {
         search: String,
         replace: String,
     },
+    /// Create or overwrite a file with the full given content. Far more reliable
+    /// for small local models than a SEARCH/REPLACE diff — they routinely emit
+    /// the whole file, which is exactly what this takes.
+    WriteFile {
+        path: String,
+        content: String,
+    },
 }
 
 impl AgentTool {
@@ -90,6 +99,7 @@ impl AgentTool {
             AgentTool::Grep { .. } => "grep",
             AgentTool::RunCommand { .. } => "run_command",
             AgentTool::EditFile { .. } => "edit_file",
+            AgentTool::WriteFile { .. } => "write_file",
         }
     }
 
@@ -101,6 +111,7 @@ impl AgentTool {
             AgentTool::Grep { query, path } => format!("grep \"{query}\" in {path}"),
             AgentTool::RunCommand { command } => format!("run {command}"),
             AgentTool::EditFile { path, .. } => format!("edit {path}"),
+            AgentTool::WriteFile { path, .. } => format!("write {path}"),
         }
     }
 
@@ -109,7 +120,9 @@ impl AgentTool {
     pub fn requires_approval(&self) -> bool {
         matches!(
             self,
-            AgentTool::RunCommand { .. } | AgentTool::EditFile { .. }
+            AgentTool::RunCommand { .. }
+                | AgentTool::EditFile { .. }
+                | AgentTool::WriteFile { .. }
         )
     }
 }
@@ -130,6 +143,9 @@ To use a tool, reply with ONLY the tool tag and nothing else:\n\
   <tool:read_file path=\"src/main.rs\"/>\n\
   <tool:grep query=\"some text\" path=\".\"/>\n\
   <tool:run_command>echo hello</tool>\n\
+  <tool:write_file path=\"src/hello.js\">\n\
+the COMPLETE new contents of the file go here\n\
+</tool>\n\
   <tool:edit_file path=\"src/main.rs\">\n\
 <<<<<<< SEARCH\n\
 exact text to find\n\
@@ -139,20 +155,30 @@ new text\n\
 </tool>\n\n\
 After a tool runs, you receive its result as the next message. Then call another \
 tool, or give your final answer in plain text (no tool tag).\n\n\
-Example:\n\
-User: what files are in this folder?\n\
-Assistant: <tool:list_files path=\".\"/>\n\
-(result: index.html, test.js)\n\
-Assistant: This folder has two files: index.html and test.js.\n\n\
+Example — create a file:\n\
+User: create hello.js that logs hi\n\
+Assistant: <tool:write_file path=\"hello.js\">\n\
+console.log(\"hi\");\n\
+</tool>\n\
+(result: wrote hello.js)\n\
+Assistant: Done — I created hello.js.\n\n\
 Rules:\n\
 - Use ONE tool per message. Paths are relative to the project root; use \".\" \
 for the root.\n\
 - Prefer list_files / read_file before answering questions about the code.\n\
-- run_command runs a shell command and returns its output (the user may be \
-asked to approve it first).\n\
-- edit_file replaces the EXACT text in the SEARCH block with the REPLACE block. \
-Read the file first so SEARCH matches it character-for-character (the user may \
-approve the edit).\n\
+- To CREATE a new file, or to REWRITE a whole file, use write_file with the \
+COMPLETE file contents in the body. This is the preferred way to write code — \
+do NOT use SEARCH/REPLACE markers inside write_file.\n\
+- Use edit_file ONLY for a small change to an existing file: put the EXACT text \
+to find between `<<<<<<< SEARCH` and `=======`, and the new text between \
+`=======` and `>>>>>>> REPLACE`. Read the file first so SEARCH matches it \
+character-for-character. If you are unsure, prefer write_file with the full \
+contents instead.\n\
+- To change SEVERAL files, do them one at a time: one write_file/edit_file per \
+message, and keep going until every file is done before giving your final \
+answer.\n\
+- run_command runs a shell command and returns its output.\n\
+- Edits and commands may ask the user to approve them first.\n\
 - Be concise and reference the files and lines you actually read. Do not invent \
 file contents."
         .to_string()
@@ -163,7 +189,14 @@ file contents."
 /// and bare `<NAME>` tags, self-closing or block form, and quoted or unquoted
 /// attributes.
 pub fn parse_tool_call(text: &str) -> Option<AgentTool> {
-    // edit_file: a block with a `path` attr and a SEARCH/REPLACE body.
+    // write_file / create_file: a block whose body is the full file content.
+    // Checked before edit_file so an explicit write is never mis-parsed as a
+    // (markerless) edit.
+    if let Some(tool) = parse_write_file(text) {
+        return Some(tool);
+    }
+    // edit_file: a block with a `path` attr and a SEARCH/REPLACE body (falls
+    // back to a full write when the model omits/mangles the markers).
     if let Some(tool) = parse_edit_file(text) {
         return Some(tool);
     }
@@ -213,6 +246,8 @@ pub fn strip_tool_calls(text: &str) -> String {
         "<grep",
         "<run_command",
         "<edit_file",
+        "<write_file",
+        "<create_file",
         "<<<<<<< SEARCH",
     ];
     let cut = OPENERS
@@ -279,17 +314,74 @@ fn attr(attrs: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Parse a `<tool:write_file path="…">FULL CONTENT</tool>` (or `create_file`)
+/// call. The body is the complete file content, taken verbatim aside from a
+/// single leading/trailing newline around the markup. Small models handle this
+/// far more reliably than a SEARCH/REPLACE diff, so it's the preferred writer.
+fn parse_write_file(text: &str) -> Option<AgentTool> {
+    for name in ["write_file", "create_file"] {
+        let Some(attrs) = tag_attrs(text, name) else {
+            continue;
+        };
+        let Some(path) = attr(&attrs, "path") else {
+            continue;
+        };
+        let Some(body) = block_tool_body(text, name) else {
+            continue;
+        };
+        return Some(AgentTool::WriteFile {
+            path,
+            content: clean_file_body(&body),
+        });
+    }
+    None
+}
+
 /// Parse an `<tool:edit_file path="…"> … SEARCH/REPLACE … </tool>` call.
+///
+/// Small local models frequently get the conflict-marker format wrong — they
+/// drop the `<<<<<<< SEARCH` line, or emit the whole new file with no markers at
+/// all (see the create-a-file case). Rather than silently failing (which made
+/// the tag render as raw text and "nothing happened"), fall back to a full
+/// write of the body when a valid SEARCH/REPLACE block isn't present.
 fn parse_edit_file(text: &str) -> Option<AgentTool> {
     let attrs = tag_attrs(text, "edit_file")?;
     let path = attr(&attrs, "path")?;
     let body = block_tool_body(text, "edit_file")?;
-    let (search, replace) = parse_search_replace(&body)?;
-    Some(AgentTool::EditFile {
-        path,
-        search,
-        replace,
-    })
+    match parse_search_replace(&body) {
+        Some((search, replace)) => Some(AgentTool::EditFile {
+            path,
+            search,
+            replace,
+        }),
+        None => Some(AgentTool::WriteFile {
+            path,
+            content: clean_file_body(&body),
+        }),
+    }
+}
+
+/// Tidy a tool body into file content: drop a single leading/trailing newline
+/// introduced by the tags, and strip any stray conflict-marker lines a confused
+/// model left behind (`<<<<<<< SEARCH`, `=======`, `>>>>>>> REPLACE`) so they
+/// don't end up written into the file.
+fn clean_file_body(body: &str) -> String {
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    let has_marker = body.lines().any(is_conflict_marker);
+    if !has_marker {
+        return body.to_string();
+    }
+    body.lines()
+        .filter(|line| !is_conflict_marker(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a line is a git-style conflict marker the model may have emitted.
+fn is_conflict_marker(line: &str) -> bool {
+    let t = line.trim_end();
+    t.starts_with("<<<<<<<") || t == "=======" || t.starts_with(">>>>>>>")
 }
 
 /// Pull the SEARCH and REPLACE halves out of a conflict-marker block. Preserves
@@ -338,10 +430,33 @@ pub fn run_local_tool(root: &Path, tool: &AgentTool) -> String {
             search,
             replace,
         } => edit_file(root, path, search, replace),
+        AgentTool::WriteFile { path, content } => write_file(root, path, content),
         // run_command is async and goes through `run_command` instead.
         AgentTool::RunCommand { .. } => {
             "error: run_command must be executed asynchronously".to_string()
         }
+    }
+}
+
+/// Create or overwrite a file with the full given content, creating any missing
+/// parent directories. The reliable path for small models, which emit whole
+/// files far more dependably than they produce exact SEARCH/REPLACE diffs.
+fn write_file(root: &Path, rel: &str, content: &str) -> String {
+    let Some(path) = safe_resolve(root, rel) else {
+        return format!("error: path '{rel}' is outside the project");
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("error creating directories for '{rel}': {e}");
+        }
+    }
+    let existed = path.exists();
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            let verb = if existed { "overwrote" } else { "wrote" };
+            format!("{verb} {rel} ({} bytes)", content.len())
+        }
+        Err(e) => format!("error writing '{rel}': {e}"),
     }
 }
 

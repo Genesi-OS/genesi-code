@@ -1232,6 +1232,9 @@ impl LocalAiChatView {
                 format!("✏ Apply this edit to {path}?"),
                 format!("- {}\n+ {}", clip(search), clip(replace)),
             ),
+            AgentTool::WriteFile { path, content } => {
+                (format!("✏ Write {path}?"), clip(content))
+            }
             other => ("⚠ Allow this action?".to_string(), other.summary()),
         };
 

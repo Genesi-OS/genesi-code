@@ -182,7 +182,15 @@ struct OllamaChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    /// Keep the model resident this long after the reply, so the next message
+    /// (and the AI Mode Monitor, which shares the same ollama model) doesn't pay
+    /// a multi-second cold reload. ollama's default is only 5m, which expires
+    /// during normal back-and-forth and makes Code feel far slower than it is.
+    keep_alive: &'static str,
 }
+
+/// How long ollama should keep the model loaded between requests.
+const OLLAMA_KEEP_ALIVE: &str = "30m";
 
 /// One NDJSON line of ollama's native `/api/chat` stream: a `message.content`
 /// token and, on the last line, `done: true`.
@@ -261,6 +269,7 @@ fn stream_chat_ollama_native(
             model: &model,
             messages: &messages,
             stream: true,
+            keep_alive: OLLAMA_KEEP_ALIVE,
         };
         let client = http_client::Client::new();
         let sent = client.post(OLLAMA_NATIVE_CHAT_URL).json(&body).send().await;
