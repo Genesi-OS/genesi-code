@@ -10,11 +10,12 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Fill, Flex,
-    MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
+    FormattedTextElement, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
 };
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
@@ -35,6 +36,8 @@ use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
 const TITLE_FONT_SIZE: f32 = 15.;
 const CHIP_FONT_SIZE: f32 = 11.;
 const BODY_FONT_SIZE: f32 = 13.;
+/// Slightly smaller monospace size for tool output / terminal blocks.
+const MONO_FONT_SIZE: f32 = 12.;
 const PANEL_PADDING: f32 = 8.;
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
@@ -52,9 +55,26 @@ fn genesi_green() -> ColorU {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRole {
     User,
+    /// The model's final, human-facing answer — rendered as markdown.
     Assistant,
-    /// An agent tool step (e.g. read_file) — rendered distinctly from prose.
+    /// The model's reasoning for an agent step (the text it streamed before a
+    /// tool call). Shown as a collapsible "💭 Thought" so the raw tool markup
+    /// never clutters the transcript.
+    Thought,
+    /// A read-only agent tool step (read_file / list_files / grep / edit_file) —
+    /// a collapsible one-line summary with the result tucked underneath.
     Tool,
+    /// A `run_command` step — rendered as a terminal block (`$ cmd` + output).
+    Command,
+}
+
+/// How an agent step (Tool / Command / Thought) is doing, for its status icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepStatus {
+    Running,
+    Ok,
+    Error,
+    Denied,
 }
 
 /// One line in the transcript. The assistant's text grows as tokens stream in.
@@ -64,6 +84,29 @@ struct ChatEntry {
     /// For user turns: a short label of the code context attached (if any), e.g.
     /// `foo.rs · lines 12-40`. Shown faintly under the message.
     context_label: Option<String>,
+    /// For Tool steps: the one-line header (e.g. `read_file src/main.rs`).
+    tool_title: Option<String>,
+    /// For Command steps: the shell command line that was run.
+    command: Option<String>,
+    /// Collapsed state for the collapsible step kinds (Thought / Tool / Command).
+    collapsed: bool,
+    /// Status used to pick the step's icon/color.
+    status: StepStatus,
+}
+
+impl ChatEntry {
+    /// A plain prose entry (User / Assistant).
+    fn prose(role: ChatRole, text: String, context_label: Option<String>) -> Self {
+        Self {
+            role,
+            text,
+            context_label,
+            tool_title: None,
+            command: None,
+            collapsed: false,
+            status: StepStatus::Ok,
+        }
+    }
 }
 
 /// Events emitted to the workspace.
@@ -99,6 +142,10 @@ pub enum LocalAiChatAction {
     ApproveTool,
     /// Deny the pending side-effecting tool.
     DenyTool,
+    /// Interrupt the in-flight generation / agent loop.
+    Stop,
+    /// Expand/collapse the transcript entry at this index (thought/tool/command).
+    ToggleCollapse(usize),
 }
 
 pub struct LocalAiChatView {
@@ -108,12 +155,20 @@ pub struct LocalAiChatView {
 
     endpoint: LocalEndpoint,
     turbo_available: bool,
+    /// Set once the user picks an endpoint by hand, so the Turbo auto-default
+    /// (see [`Self::refresh_models`]) never overrides a deliberate choice.
+    endpoint_user_chosen: bool,
     models: Vec<String>,
     selected_model: Option<usize>,
     ai_mode: Option<AiModeState>,
 
     in_flight: bool,
     error: Option<String>,
+    /// Monotonic id of the current generation. Stop bumps it so stale stream
+    /// callbacks (from a turn the user interrupted) no-op instead of writing
+    /// into a fresh turn — the streams are detached and can't be cancelled
+    /// directly, so we guard their callbacks by id.
+    current_turn: u64,
 
     /// When on, each send attaches the focused code editor's file (or selection)
     /// as context — like a normal AI IDE.
@@ -160,11 +215,13 @@ impl LocalAiChatView {
             transcript_scroll: ClippedScrollStateHandle::default(),
             endpoint: LocalEndpoint::Ollama,
             turbo_available: false,
+            endpoint_user_chosen: false,
             models: Vec::new(),
             selected_model: None,
             ai_mode: None,
             in_flight: false,
             error: None,
+            current_turn: 0,
             attach_context: true,
             agent_mode: false,
             agent_root: None,
@@ -234,17 +291,24 @@ impl LocalAiChatView {
             },
         );
 
-        ctx.spawn(
-            async { turbo_health_ok().await },
-            |me, available, ctx| {
-                me.turbo_available = available;
-                ctx.notify();
-            },
-        );
+        ctx.spawn(async { turbo_health_ok().await }, |me, available, ctx| {
+            me.turbo_available = available;
+            // Default to the shared Turbo daemon when it's up and the user
+            // hasn't deliberately picked an endpoint — Code then inherits
+            // GPU offload, the q8 KV cache and the warm model for free
+            // (roadmap 4.1 / 4.0). One-shot: switching sets the endpoint, so
+            // the re-probe below sees `== Turbo` and won't loop.
+            if available && !me.endpoint_user_chosen && me.endpoint != LocalEndpoint::Turbo {
+                me.endpoint = LocalEndpoint::Turbo;
+                me.refresh_models(ctx);
+            }
+            ctx.notify();
+        });
     }
 
     fn scroll_to_bottom(&self) {
-        self.transcript_scroll.scroll_to(Pixels::new(SCROLL_TO_BOTTOM));
+        self.transcript_scroll
+            .scroll_to(Pixels::new(SCROLL_TO_BOTTOM));
     }
 
     fn handle_input_event(
@@ -300,11 +364,8 @@ impl LocalAiChatView {
         let context = if self.attach_context { context } else { None };
         let context_label = context.as_ref().map(CodeContext::label);
 
-        self.messages.push(ChatEntry {
-            role: ChatRole::User,
-            text: prompt,
-            context_label,
-        });
+        self.messages
+            .push(ChatEntry::prose(ChatRole::User, prompt, context_label));
 
         // System prompt: the agent variant (with tool instructions) in agent
         // mode, otherwise the plain chat prompt. Then the attached file context,
@@ -325,12 +386,15 @@ impl LocalAiChatView {
             match entry.role {
                 ChatRole::User => request.push(ChatMessage::user(entry.text.clone())),
                 ChatRole::Assistant => request.push(ChatMessage::assistant(entry.text.clone())),
-                // Tool steps are UI-only; the model's real tool results live in
-                // `agent_messages` during a turn, not the visible transcript.
-                ChatRole::Tool => {}
+                // Thought / Tool / Command steps are UI-only; the model's real
+                // tool calls + results live in `agent_messages` during a turn.
+                ChatRole::Thought | ChatRole::Tool | ChatRole::Command => {}
             }
         }
 
+        // A fresh generation: bump the turn id so any still-running callbacks
+        // from a previous (e.g. just-stopped) turn are ignored.
+        self.current_turn += 1;
         self.in_flight = true;
         self.scroll_to_bottom();
 
@@ -347,18 +411,16 @@ impl LocalAiChatView {
         }
 
         // Plain chat: one streamed reply into a placeholder bubble.
-        self.messages.push(ChatEntry {
-            role: ChatRole::Assistant,
-            text: String::new(),
-            context_label: None,
-        });
+        self.messages
+            .push(ChatEntry::prose(ChatRole::Assistant, String::new(), None));
+        let turn = self.current_turn;
         let stream = stream_chat(self.endpoint, &model, request);
         ctx.spawn_stream_local(
             stream,
-            |me, item, ctx| me.on_stream_item(item, ctx),
-            |me, ctx| {
+            move |me, item, ctx| me.on_stream_item(turn, item, ctx),
+            move |me, ctx| {
                 // Stream ended without an explicit `[DONE]` — settle the UI.
-                if me.in_flight {
+                if turn == me.current_turn && me.in_flight {
                     me.in_flight = false;
                     ctx.notify();
                 }
@@ -369,31 +431,51 @@ impl LocalAiChatView {
 
     // ── agent loop ─────────────────────────────────────────────────────────
 
-    /// Run one agent step: stream the model's next message into a fresh bubble,
-    /// then settle it in [`Self::on_agent_step_end`] (execute a tool and loop, or
-    /// finish).
+    /// Run one agent step: stream the model's next message into a fresh
+    /// "thought" bubble, then settle it in [`Self::on_agent_step_end`] (execute
+    /// a tool and loop, or promote the thought into the final answer).
     fn run_agent_step(&mut self, ctx: &mut ViewContext<Self>) {
         self.agent_step_buffer.clear();
         self.messages.push(ChatEntry {
-            role: ChatRole::Assistant,
+            role: ChatRole::Thought,
             text: String::new(),
             context_label: None,
+            tool_title: None,
+            command: None,
+            collapsed: false,
+            status: StepStatus::Running,
         });
-        let stream = stream_chat(self.endpoint, &self.agent_model, self.agent_messages.clone());
+        let turn = self.current_turn;
+        let stream = stream_chat(
+            self.endpoint,
+            &self.agent_model,
+            self.agent_messages.clone(),
+        );
         ctx.spawn_stream_local(
             stream,
-            |me, item, ctx| me.on_agent_token(item, ctx),
-            |me, ctx| me.on_agent_step_end(ctx),
+            move |me, item, ctx| me.on_agent_token(turn, item, ctx),
+            move |me, ctx| me.on_agent_step_end(turn, ctx),
         );
     }
 
-    fn on_agent_token(&mut self, item: Result<ChatStreamItem>, ctx: &mut ViewContext<Self>) {
+    fn on_agent_token(
+        &mut self,
+        turn: u64,
+        item: Result<ChatStreamItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if turn != self.current_turn {
+            return; // a stale turn (the user hit Stop, or started a new send)
+        }
         match item {
             Ok(ChatStreamItem::Token(token)) => {
                 self.agent_step_buffer.push_str(&token);
+                // Show only the human-facing prose as it streams — never the raw
+                // `<tool:…>` markup (that becomes a clean tool step once parsed).
+                let visible = local_agent::strip_tool_calls(&self.agent_step_buffer);
                 if let Some(last) = self.messages.last_mut() {
-                    if last.role == ChatRole::Assistant {
-                        last.text.push_str(&token);
+                    if last.role == ChatRole::Thought {
+                        last.text = visible;
                     }
                 }
                 self.scroll_to_bottom();
@@ -401,25 +483,27 @@ impl LocalAiChatView {
             }
             // The step is settled in `on_agent_step_end`.
             Ok(ChatStreamItem::Done) => {}
-            Err(e) => self.finish_agent_with_error(format!("Local model error: {e}"), ctx),
+            Err(e) => self.finish_agent_with_error(turn, format!("Local model error: {e}"), ctx),
         }
     }
 
-    fn on_agent_step_end(&mut self, ctx: &mut ViewContext<Self>) {
-        if !self.in_flight {
-            return; // already errored out
+    fn on_agent_step_end(&mut self, turn: u64, ctx: &mut ViewContext<Self>) {
+        if turn != self.current_turn || !self.in_flight {
+            return; // already errored out, stopped, or superseded
         }
         let reply = self.agent_step_buffer.trim().to_string();
-        self.agent_messages.push(ChatMessage::assistant(reply.clone()));
+        self.agent_messages
+            .push(ChatMessage::assistant(reply.clone()));
 
         match local_agent::parse_tool_call(&reply) {
             Some(tool) if self.agent_step < MAX_AGENT_STEPS => {
-                // Side-effecting tools pause for the user unless AUTO is on.
+                // Keep any reasoning the model wrote before the tag as a collapsed
+                // thought; drop the thought entirely if it was only the tag.
+                self.finalize_thought(&reply, true);
+                // Side-effecting tools pause for the user unless AUTO is on. The
+                // Allow/Deny prompt renders above the input (see `render`), so we
+                // don't add a transcript entry yet — just remember the tool.
                 if tool.requires_approval() && !self.auto_approve {
-                    if let Some(last) = self.messages.last_mut() {
-                        last.role = ChatRole::Tool;
-                        last.text = format!("🔧 {} — awaiting approval", tool.summary());
-                    }
                     self.pending_tool = Some(tool);
                     self.scroll_to_bottom();
                     ctx.notify();
@@ -429,10 +513,11 @@ impl LocalAiChatView {
             }
             _ => {
                 // No tool call (or the step budget is spent): the reply is the
-                // final answer, already in the last assistant bubble.
+                // final answer. Promote the thought bubble into the answer.
+                self.finalize_thought(&reply, false);
                 if self.agent_step >= MAX_AGENT_STEPS {
                     if let Some(last) = self.messages.last_mut() {
-                        if last.role == ChatRole::Assistant && last.text.is_empty() {
+                        if last.role == ChatRole::Assistant && last.text.trim().is_empty() {
                             last.text = "(reached the tool-step limit)".to_string();
                         }
                     }
@@ -445,10 +530,48 @@ impl LocalAiChatView {
         }
     }
 
-    fn finish_agent_with_error(&mut self, message: String, ctx: &mut ViewContext<Self>) {
+    /// Settle the streaming thought bubble for a finished step. When the step
+    /// ended in a tool call, keep the pre-tool reasoning as a collapsed thought
+    /// (or drop it if empty). Otherwise the reply *is* the final answer, so the
+    /// bubble becomes a normal (markdown) assistant message.
+    fn finalize_thought(&mut self, reply: &str, had_tool: bool) {
+        let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::Thought)
+        else {
+            return;
+        };
+        if had_tool {
+            let visible = local_agent::strip_tool_calls(reply);
+            if visible.is_empty() {
+                self.messages.remove(idx);
+            } else {
+                let entry = &mut self.messages[idx];
+                entry.text = visible;
+                entry.collapsed = true;
+                entry.status = StepStatus::Ok;
+            }
+        } else {
+            let entry = &mut self.messages[idx];
+            entry.role = ChatRole::Assistant;
+            entry.text = reply.to_string();
+            entry.collapsed = false;
+            entry.status = StepStatus::Ok;
+        }
+    }
+
+    fn finish_agent_with_error(&mut self, turn: u64, message: String, ctx: &mut ViewContext<Self>) {
+        if turn != self.current_turn {
+            return;
+        }
         self.in_flight = false;
+        // Drop a trailing empty thought/assistant placeholder if nothing useful
+        // streamed into it.
         if let Some(last) = self.messages.last() {
-            if last.role == ChatRole::Assistant && last.text.is_empty() {
+            if matches!(last.role, ChatRole::Assistant | ChatRole::Thought)
+                && last.text.trim().is_empty()
+            {
                 self.messages.pop();
             }
         }
@@ -461,13 +584,21 @@ impl LocalAiChatView {
     fn start_tool(&mut self, tool: AgentTool, ctx: &mut ViewContext<Self>) {
         self.agent_tool_summary = tool.summary();
         self.agent_step += 1;
+        let turn = self.current_turn;
 
         match &tool {
             AgentTool::RunCommand { command } => {
-                if let Some(last) = self.messages.last_mut() {
-                    last.role = ChatRole::Tool;
-                    last.text = format!("🔧 {}\n(running…)", self.agent_tool_summary);
-                }
+                // A terminal block: the command runs in the project root and its
+                // output is shown like an integrated terminal (`$ cmd` + output).
+                self.messages.push(ChatEntry {
+                    role: ChatRole::Command,
+                    text: String::new(),
+                    context_label: None,
+                    tool_title: None,
+                    command: Some(command.clone()),
+                    collapsed: false,
+                    status: StepStatus::Running,
+                });
                 self.scroll_to_bottom();
                 ctx.notify();
 
@@ -480,31 +611,55 @@ impl LocalAiChatView {
                             None => "error: no project is open.".to_string(),
                         }
                     },
-                    |me, result, ctx| me.finish_tool("run_command", result, ctx),
+                    move |me, result, ctx| me.finish_tool(turn, "run_command", result, ctx),
                 );
             }
             _ => {
-                if let Some(last) = self.messages.last_mut() {
-                    last.role = ChatRole::Tool;
-                    last.text = format!("🔧 {}", self.agent_tool_summary);
-                }
+                // A read tool: collapsed by default, showing just its one-line
+                // summary; the result is one click away.
+                self.messages.push(ChatEntry {
+                    role: ChatRole::Tool,
+                    text: String::new(),
+                    context_label: None,
+                    tool_title: Some(self.agent_tool_summary.clone()),
+                    command: None,
+                    collapsed: true,
+                    status: StepStatus::Running,
+                });
                 let result = match self.agent_root.clone() {
                     Some(root) => local_agent::run_local_tool(&root, &tool),
                     None => "error: no project is open, so I can't read files.".to_string(),
                 };
-                self.finish_tool(tool.name(), result, ctx);
+                self.finish_tool(turn, tool.name(), result, ctx);
             }
         }
     }
 
-    /// Settle a finished tool: show its result preview, feed the full result
-    /// back to the model, and take the next agent step.
-    fn finish_tool(&mut self, tool_name: &str, result: String, ctx: &mut ViewContext<Self>) {
-        let summary = self.agent_tool_summary.clone();
-        let preview = Self::tool_preview(&result);
+    /// Settle a finished tool: show its result, feed the full result back to the
+    /// model, and take the next agent step.
+    fn finish_tool(
+        &mut self,
+        turn: u64,
+        tool_name: &str,
+        result: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if turn != self.current_turn {
+            return; // the user stopped or started a new turn while this ran
+        }
+        let is_error = result.trim_start().starts_with("error");
         if let Some(last) = self.messages.last_mut() {
-            last.role = ChatRole::Tool;
-            last.text = format!("🔧 {summary}\n{preview}");
+            match last.role {
+                // The terminal block shows the full (already-capped) output.
+                ChatRole::Command => last.text = result.clone(),
+                ChatRole::Tool => last.text = Self::tool_preview(&result),
+                _ => {}
+            }
+            last.status = if is_error {
+                StepStatus::Error
+            } else {
+                StepStatus::Ok
+            };
         }
         self.agent_messages.push(ChatMessage::user(format!(
             "TOOL RESULT ({tool_name}):\n{result}"
@@ -514,11 +669,51 @@ impl LocalAiChatView {
         self.run_agent_step(ctx);
     }
 
-    /// A short preview of a tool result for the transcript; the full result is
-    /// what goes back to the model.
+    /// Interrupt the in-flight generation / agent loop. The detached streams
+    /// can't be cancelled directly, so bump the turn id (their callbacks then
+    /// no-op) and settle whatever was on screen.
+    fn stop_turn(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.in_flight {
+            return;
+        }
+        self.current_turn += 1;
+        self.in_flight = false;
+        self.pending_tool = None;
+
+        let trailing = self
+            .messages
+            .last()
+            .map(|m| (m.role, m.text.trim().is_empty()));
+        match trailing {
+            Some((ChatRole::Thought, true)) | Some((ChatRole::Assistant, true)) => {
+                self.messages.pop();
+            }
+            Some((ChatRole::Thought, false)) => {
+                if let Some(last) = self.messages.last_mut() {
+                    last.role = ChatRole::Assistant;
+                    last.collapsed = false;
+                    last.status = StepStatus::Ok;
+                }
+            }
+            Some((ChatRole::Command, _)) | Some((ChatRole::Tool, _)) => {
+                if let Some(last) = self.messages.last_mut() {
+                    if last.status == StepStatus::Running {
+                        last.status = StepStatus::Denied;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.error = None;
+        self.refresh_ai_mode();
+        ctx.notify();
+    }
+
+    /// A short preview of a read-tool result for the collapsed step; the full
+    /// result is what goes back to the model.
     fn tool_preview(result: &str) -> String {
-        const MAX_LINES: usize = 6;
-        const MAX_CHARS: usize = 400;
+        const MAX_LINES: usize = 8;
+        const MAX_CHARS: usize = 600;
         let mut preview: String = result
             .lines()
             .take(MAX_LINES)
@@ -533,7 +728,15 @@ impl LocalAiChatView {
         preview
     }
 
-    fn on_stream_item(&mut self, item: Result<ChatStreamItem>, ctx: &mut ViewContext<Self>) {
+    fn on_stream_item(
+        &mut self,
+        turn: u64,
+        item: Result<ChatStreamItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if turn != self.current_turn {
+            return; // a stopped / superseded turn
+        }
         match item {
             Ok(ChatStreamItem::Token(token)) => {
                 if let Some(last) = self.messages.last_mut() {
@@ -575,17 +778,76 @@ impl LocalAiChatView {
         color: ColorU,
         soft_wrap: bool,
     ) -> Box<dyn Element> {
+        self.styled_text(appearance, text, size, color, soft_wrap, false)
+    }
+
+    /// Like [`Self::label_text`] but in the monospace family — for tool output
+    /// and terminal blocks, where columns and code need to line up.
+    fn mono_text(
+        &self,
+        appearance: &Appearance,
+        text: impl Into<String>,
+        size: f32,
+        color: ColorU,
+        soft_wrap: bool,
+    ) -> Box<dyn Element> {
+        self.styled_text(appearance, text, size, color, soft_wrap, true)
+    }
+
+    fn styled_text(
+        &self,
+        appearance: &Appearance,
+        text: impl Into<String>,
+        size: f32,
+        color: ColorU,
+        soft_wrap: bool,
+        monospace: bool,
+    ) -> Box<dyn Element> {
+        let family = if monospace {
+            appearance.monospace_font_family()
+        } else {
+            appearance.ui_font_family()
+        };
         appearance
             .ui_builder()
             .wrappable_text(text.into(), soft_wrap)
             .with_style(UiComponentStyles {
-                font_family_id: Some(appearance.ui_font_family()),
+                font_family_id: Some(family),
                 font_size: Some(size),
                 font_color: Some(color),
                 ..Default::default()
             })
             .build()
             .finish()
+    }
+
+    /// Render markdown (headings, lists, **bold**, `code`, fenced blocks) into a
+    /// laid-out element so the assistant's replies read like a real AI IDE
+    /// instead of showing raw `#`/`*`/backtick characters.
+    fn markdown_text(
+        &self,
+        appearance: &Appearance,
+        text: &str,
+        color: ColorU,
+    ) -> Box<dyn Element> {
+        let formatted = parse_markdown(text).unwrap_or_else(|_| {
+            FormattedText::new([FormattedTextLine::Line(vec![
+                FormattedTextFragment::plain_text(text.to_string()),
+            ])])
+        });
+        Box::new(
+            FormattedTextElement::new(
+                formatted,
+                BODY_FONT_SIZE,
+                appearance.ui_font_family(),
+                appearance.monospace_font_family(),
+                color,
+                Default::default(),
+            )
+            // Behave like static text in the scroll view (no selection/hyperlink
+            // handling stealing scroll or clicks).
+            .disable_mouse_interaction(),
+        )
     }
 
     fn chip(
@@ -601,14 +863,15 @@ impl LocalAiChatView {
         } else {
             theme.disabled_text_color(theme.background()).into()
         };
-        let content = Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color, false))
-            .with_horizontal_padding(8.)
-            .with_vertical_padding(3.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_2())
-            .with_margin_right(6.)
-            .finish();
+        let content =
+            Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color, false))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(3.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_background(theme.surface_2())
+                .with_margin_right(6.)
+                .finish();
 
         EventHandler::new(content)
             .on_left_mouse_down(move |ctx, _, _| {
@@ -698,27 +961,41 @@ impl LocalAiChatView {
         ));
         let agent_row = agent_row.finish();
 
-        let util_row = Flex::row()
+        // The util row gains a Stop chip while a generation is in flight, so the
+        // user can interrupt a runaway model or agent loop.
+        let mut util_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip(
+            .with_main_axis_size(MainAxisSize::Max);
+        if self.in_flight {
+            util_row.add_child(self.chip(
                 appearance,
-                "Refresh".to_string(),
-                LocalAiChatAction::Refresh,
+                "⏹ Stop".to_string(),
+                LocalAiChatAction::Stop,
                 true,
-            ))
-            .with_child(self.chip(
-                appearance,
-                "Clear".to_string(),
-                LocalAiChatAction::Clear,
-                !self.messages.is_empty(),
-            ))
-            .finish();
+            ));
+        }
+        util_row.add_child(self.chip(
+            appearance,
+            "Refresh".to_string(),
+            LocalAiChatAction::Refresh,
+            true,
+        ));
+        util_row.add_child(self.chip(
+            appearance,
+            "Clear".to_string(),
+            LocalAiChatAction::Clear,
+            !self.messages.is_empty(),
+        ));
+        let util_row = util_row.finish();
 
         Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(Container::new(title_row).with_padding_bottom(6.).finish())
-            .with_child(Container::new(selectors_row).with_padding_bottom(4.).finish())
+            .with_child(
+                Container::new(selectors_row)
+                    .with_padding_bottom(4.)
+                    .finish(),
+            )
             .with_child(Container::new(agent_row).with_padding_bottom(4.).finish())
             .with_child(util_row)
             .finish()
@@ -749,10 +1026,10 @@ impl LocalAiChatView {
             other => ("⚠ Allow this action?".to_string(), other.summary()),
         };
 
-        let detail_box = Container::new(self.label_text(
+        let detail_box = Container::new(self.mono_text(
             appearance,
             detail,
-            BODY_FONT_SIZE,
+            MONO_FONT_SIZE,
             theme.main_text_color(theme.background()).into(),
             true,
         ))
@@ -766,14 +1043,30 @@ impl LocalAiChatView {
         let buttons = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip(appearance, "Allow".to_string(), LocalAiChatAction::ApproveTool, true))
-            .with_child(self.chip(appearance, "Deny".to_string(), LocalAiChatAction::DenyTool, true))
+            .with_child(self.chip(
+                appearance,
+                "Allow".to_string(),
+                LocalAiChatAction::ApproveTool,
+                true,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "Deny".to_string(),
+                LocalAiChatAction::DenyTool,
+                true,
+            ))
             .finish();
 
         Container::new(
             Flex::column()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.label_text(appearance, title, CHIP_FONT_SIZE, genesi_green(), false))
+                .with_child(self.label_text(
+                    appearance,
+                    title,
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
                 .with_child(detail_box)
                 .with_child(Container::new(buttons).with_margin_top(6.).finish())
                 .finish(),
@@ -783,7 +1076,36 @@ impl LocalAiChatView {
         .finish()
     }
 
-    fn render_message(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
+    /// A clickable, collapse/expand header for the thought/tool/command steps.
+    fn step_header(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        title: String,
+        color: ColorU,
+        collapsed: bool,
+    ) -> Box<dyn Element> {
+        let caret = if collapsed { "▸" } else { "▾" };
+        let row = Container::new(self.label_text(
+            appearance,
+            format!("{caret} {title}"),
+            CHIP_FONT_SIZE,
+            color,
+            false,
+        ))
+        .with_vertical_padding(2.)
+        .finish();
+
+        EventHandler::new(row)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LocalAiChatAction::ToggleCollapse(index));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A user or assistant message bubble (assistant text rendered as markdown).
+    fn render_bubble(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
         let theme = appearance.theme();
         let is_user = entry.role == ChatRole::User;
         let background = if is_user {
@@ -791,16 +1113,10 @@ impl LocalAiChatView {
         } else {
             theme.surface_1()
         };
-        let (prefix, role_color): (&str, ColorU) = match entry.role {
-            ChatRole::User => ("You", genesi_green()),
-            ChatRole::Assistant => ("Genesi AI", theme.active_ui_text_color().into()),
-            ChatRole::Tool => ("Tool", theme.disabled_text_color(theme.background()).into()),
-        };
-
-        let body = if entry.text.is_empty() && self.in_flight {
-            "…".to_string()
+        let (prefix, role_color): (&str, ColorU) = if is_user {
+            ("You", genesi_green())
         } else {
-            entry.text.clone()
+            ("Genesi AI", theme.active_ui_text_color().into())
         };
 
         let mut inner = Flex::column()
@@ -836,18 +1152,25 @@ impl LocalAiChatView {
             );
         }
 
-        let inner = inner
-            .with_child(
-                Container::new(self.label_text(
-                    appearance,
-                    body,
-                    BODY_FONT_SIZE,
-                    theme.main_text_color(theme.background()).into(),
-                    true,
-                ))
-                .with_margin_top(4.)
-                .finish(),
+        let body_color = theme.main_text_color(theme.background()).into();
+        let body_el: Box<dyn Element> = if entry.text.trim().is_empty() {
+            // Streaming placeholder before the first token lands.
+            let dots = if self.in_flight { "…" } else { "" };
+            self.label_text(appearance, dots, BODY_FONT_SIZE, body_color, true)
+        } else if entry.role == ChatRole::Assistant {
+            self.markdown_text(appearance, &entry.text, body_color)
+        } else {
+            self.label_text(
+                appearance,
+                entry.text.clone(),
+                BODY_FONT_SIZE,
+                body_color,
+                true,
             )
+        };
+
+        let inner = inner
+            .with_child(Container::new(body_el).with_margin_top(4.).finish())
             .finish();
 
         let mut bubble = Container::new(inner)
@@ -861,6 +1184,189 @@ impl LocalAiChatView {
             bubble = bubble.with_border(Border::left(2.).with_border_color(genesi_green()));
         }
         bubble.finish()
+    }
+
+    /// A collapsible "💭 Thought" — the model's reasoning for a step, kept out of
+    /// the way so the transcript stays clean.
+    fn render_thought(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        entry: &ChatEntry,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let title = if entry.status == StepStatus::Running {
+            "💭 Thinking…".to_string()
+        } else {
+            "💭 Thought".to_string()
+        };
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.step_header(appearance, index, title, muted, entry.collapsed));
+
+        if !entry.collapsed && !entry.text.trim().is_empty() {
+            column.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    entry.text.clone(),
+                    BODY_FONT_SIZE,
+                    muted,
+                    true,
+                ))
+                .with_horizontal_padding(10.)
+                .with_margin_top(2.)
+                .finish(),
+            );
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(6.)
+            .finish()
+    }
+
+    /// A collapsible read-tool step: a one-line summary with the (previewed)
+    /// result one click away.
+    fn render_tool_step(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        entry: &ChatEntry,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let (icon, color): (&str, ColorU) = match entry.status {
+            StepStatus::Running => ("📄", muted),
+            StepStatus::Ok => ("📄", genesi_green()),
+            StepStatus::Error => ("⚠", theme.ui_error_color().into()),
+            StepStatus::Denied => ("🚫", muted),
+        };
+        let suffix = match entry.status {
+            StepStatus::Running => " · running…",
+            StepStatus::Error => " · error",
+            StepStatus::Denied => " · denied",
+            StepStatus::Ok => "",
+        };
+        let title = format!(
+            "{icon} {}{suffix}",
+            entry.tool_title.clone().unwrap_or_default()
+        );
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.step_header(appearance, index, title, color, entry.collapsed));
+
+        if !entry.collapsed && !entry.text.trim().is_empty() {
+            let body = Container::new(self.mono_text(
+                appearance,
+                entry.text.clone(),
+                MONO_FONT_SIZE,
+                theme.main_text_color(theme.background()).into(),
+                true,
+            ))
+            .with_uniform_padding(8.)
+            .with_margin_top(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_background(theme.surface_1())
+            .finish();
+            column.add_child(body);
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(6.)
+            .finish()
+    }
+
+    /// A `run_command` step, rendered like the app's integrated terminal: a dark
+    /// block with a green `$ command` prompt and the captured output beneath.
+    fn render_command_step(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        entry: &ChatEntry,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let green: ColorU = theme.terminal_colors().normal.green.into();
+        let suffix = match entry.status {
+            StepStatus::Running => " · running…",
+            StepStatus::Error => " · exited with error",
+            StepStatus::Denied => " · stopped",
+            StepStatus::Ok => "",
+        };
+        let header_color: ColorU = if entry.status == StepStatus::Error {
+            theme.ui_error_color().into()
+        } else {
+            green
+        };
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.step_header(
+                appearance,
+                index,
+                format!("⌘ Terminal{suffix}"),
+                header_color,
+                entry.collapsed,
+            ));
+
+        if !entry.collapsed {
+            let command = entry.command.clone().unwrap_or_default();
+            let mut terminal = Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.mono_text(
+                    appearance,
+                    format!("$ {command}"),
+                    MONO_FONT_SIZE,
+                    green,
+                    true,
+                ));
+            let body = if entry.text.trim().is_empty() && entry.status == StepStatus::Running {
+                "running…".to_string()
+            } else {
+                entry.text.clone()
+            };
+            if !body.trim().is_empty() {
+                terminal.add_child(
+                    Container::new(self.mono_text(
+                        appearance,
+                        body,
+                        MONO_FONT_SIZE,
+                        theme.main_text_color(theme.background()).into(),
+                        true,
+                    ))
+                    .with_margin_top(4.)
+                    .finish(),
+                );
+            }
+            let block = Container::new(terminal.finish())
+                .with_uniform_padding(8.)
+                .with_margin_top(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_background(theme.background())
+                .finish();
+            column.add_child(block);
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(6.)
+            .finish()
+    }
+
+    fn render_entry(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        entry: &ChatEntry,
+    ) -> Box<dyn Element> {
+        match entry.role {
+            ChatRole::User | ChatRole::Assistant => self.render_bubble(appearance, entry),
+            ChatRole::Thought => self.render_thought(appearance, index, entry),
+            ChatRole::Tool => self.render_tool_step(appearance, index, entry),
+            ChatRole::Command => self.render_command_step(appearance, index, entry),
+        }
     }
 
     fn render_transcript(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -911,8 +1417,8 @@ impl LocalAiChatView {
                 .finish(),
             );
         } else {
-            for entry in &self.messages {
-                column.add_child(self.render_message(appearance, entry));
+            for (index, entry) in self.messages.iter().enumerate() {
+                column.add_child(self.render_entry(appearance, index, entry));
             }
         }
 
@@ -940,6 +1446,9 @@ impl TypedActionView for LocalAiChatView {
     fn handle_action(&mut self, action: &LocalAiChatAction, ctx: &mut ViewContext<Self>) {
         match action {
             LocalAiChatAction::CycleEndpoint => {
+                // A deliberate choice — stop the Turbo auto-default from
+                // overriding it on the next probe.
+                self.endpoint_user_chosen = true;
                 let next = self.endpoint.toggled();
                 if next == LocalEndpoint::Turbo && !self.turbo_available {
                     self.error = Some(
@@ -1014,17 +1523,38 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::DenyTool => {
                 if let Some(tool) = self.pending_tool.take() {
-                    if let Some(last) = self.messages.last_mut() {
-                        last.role = ChatRole::Tool;
-                        last.text = format!("🔧 {} — denied", tool.summary());
-                    }
+                    let name = tool.name();
+                    let denied = ChatEntry {
+                        role: match tool {
+                            AgentTool::RunCommand { .. } => ChatRole::Command,
+                            _ => ChatRole::Tool,
+                        },
+                        text: "(denied by user)".to_string(),
+                        context_label: None,
+                        tool_title: Some(tool.summary()),
+                        command: match &tool {
+                            AgentTool::RunCommand { command } => Some(command.clone()),
+                            _ => None,
+                        },
+                        collapsed: false,
+                        status: StepStatus::Denied,
+                    };
+                    self.messages.push(denied);
                     // Tell the model the user declined so it can adapt or answer.
                     self.agent_messages.push(ChatMessage::user(format!(
-                        "TOOL RESULT ({}):\nThe user denied this action.",
-                        tool.name()
+                        "TOOL RESULT ({name}):\nThe user denied this action."
                     )));
                     self.agent_step += 1;
                     self.run_agent_step(ctx);
+                }
+                ctx.notify();
+            }
+            LocalAiChatAction::Stop => {
+                self.stop_turn(ctx);
+            }
+            LocalAiChatAction::ToggleCollapse(index) => {
+                if let Some(entry) = self.messages.get_mut(*index) {
+                    entry.collapsed = !entry.collapsed;
                 }
                 ctx.notify();
             }

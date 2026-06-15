@@ -62,10 +62,19 @@ pub const MAX_AGENT_STEPS: u32 = 8;
 /// side-effecting and gated by user approval (unless AUTO is on).
 #[derive(Debug, Clone)]
 pub enum AgentTool {
-    ReadFile { path: String },
-    ListFiles { path: String },
-    Grep { query: String, path: String },
-    RunCommand { command: String },
+    ReadFile {
+        path: String,
+    },
+    ListFiles {
+        path: String,
+    },
+    Grep {
+        query: String,
+        path: String,
+    },
+    RunCommand {
+        command: String,
+    },
     EditFile {
         path: String,
         search: String,
@@ -188,6 +197,32 @@ pub fn parse_tool_call(text: &str) -> Option<AgentTool> {
     None
 }
 
+/// Strip any tool-call markup from a model reply, leaving only the human-facing
+/// prose that precedes it. The panel uses this so it never shows raw
+/// `<tool:read_file …/>` tags while a step streams — the tag becomes a clean
+/// collapsible tool step instead of flashing as ugly XML in the transcript.
+///
+/// Returns the trimmed prose before the first tool marker (often empty, since
+/// the prompt tells the model to reply with ONLY the tool tag).
+pub fn strip_tool_calls(text: &str) -> String {
+    const OPENERS: &[&str] = &[
+        "<tool:",
+        "<tool ",
+        "<read_file",
+        "<list_files",
+        "<grep",
+        "<run_command",
+        "<edit_file",
+        "<<<<<<< SEARCH",
+    ];
+    let cut = OPENERS
+        .iter()
+        .filter_map(|opener| text.find(opener))
+        .min()
+        .unwrap_or(text.len());
+    text[..cut].trim().to_string()
+}
+
 /// Find an opening `<tool:NAME ...>` / `<NAME ...>` tag and return its attribute
 /// string (everything between the name and the closing `>`, minus a trailing
 /// `/`). Returns `None` if no such tag is present.
@@ -279,7 +314,10 @@ fn parse_search_replace(body: &str) -> Option<(String, String)> {
     let replace_end = after_replace.find(REPLACE)?;
     let replace = &after_replace[..replace_end];
 
-    Some((strip_one_trailing_newline(search), strip_one_trailing_newline(replace)))
+    Some((
+        strip_one_trailing_newline(search),
+        strip_one_trailing_newline(replace),
+    ))
 }
 
 /// Remove the single trailing newline that sits before the next marker line,
@@ -357,7 +395,10 @@ pub async fn run_command(root: &Path, shell_command: &str) -> String {
     };
     let timeout = async {
         warpui::r#async::Timer::after(COMMAND_TIMEOUT).await;
-        format!("error: command timed out after {}s", COMMAND_TIMEOUT.as_secs())
+        format!(
+            "error: command timed out after {}s",
+            COMMAND_TIMEOUT.as_secs()
+        )
     };
     futures_lite::future::or(exec, timeout).await
 }
