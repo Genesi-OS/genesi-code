@@ -180,11 +180,15 @@ struct OllamaChatRequest<'a> {
     stream: bool,
 }
 
-/// ollama's native `/api/chat` reply (with `stream: false`).
+/// One NDJSON line of ollama's native `/api/chat` stream: a `message.content`
+/// token and, on the last line, `done: true`.
 #[derive(Deserialize, Default)]
 struct OllamaChatResponse {
     #[serde(default)]
     message: OllamaResponseMessage,
+    /// True on the final streamed line.
+    #[serde(default)]
+    done: bool,
     /// Set when ollama itself errors (e.g. model not found).
     #[serde(default)]
     error: Option<String>,
@@ -223,10 +227,15 @@ pub fn stream_chat(
     }
 }
 
-/// ollama's native `/api/chat` with `stream: false`: surface the whole reply as
-/// a single token. This reuses the exact `send()` + `json()` call path that
-/// already works for `list_models`, avoiding the SSE machinery that ollama's
-/// OpenAI-compat endpoint chokes on.
+/// ollama's native `/api/chat` with `stream: true`: parse the NDJSON token
+/// stream and yield tokens as they arrive. The OpenAI-compat endpoint hangs on
+/// some ollama versions, so we use the native API the AI Mode monitor uses.
+///
+/// NOTE: deliberately NO total `.timeout()`. A GPU-less 7B streams for a while,
+/// and ollama emits tokens continuously once connected, so a whole-response
+/// deadline (the old 120s) aborted slow-but-working generations — exactly the
+/// "error sending request" failure. Streaming removes that wall; an unreachable
+/// ollama still errors quickly on `send()`.
 fn stream_chat_ollama_native(
     model: String,
     messages: Vec<ChatMessage>,
@@ -235,19 +244,17 @@ fn stream_chat_ollama_native(
         let body = OllamaChatRequest {
             model: &model,
             messages: &messages,
-            stream: false,
+            stream: true,
         };
         let client = http_client::Client::new();
-        let sent = client
-            .post(OLLAMA_NATIVE_CHAT_URL)
-            .json(&body)
-            .timeout(CHAT_REQUEST_TIMEOUT)
-            .send()
-            .await;
+        let sent = client.post(OLLAMA_NATIVE_CHAT_URL).json(&body).send().await;
         let response = match sent {
             Ok(response) => response,
             Err(e) => {
-                yield Err(anyhow!("failed to reach ollama at {OLLAMA_NATIVE_CHAT_URL}: {e}"));
+                yield Err(anyhow!(
+                    "failed to reach ollama at {OLLAMA_NATIVE_CHAT_URL}: {}",
+                    error_chain(&e)
+                ));
                 return;
             }
         };
@@ -257,22 +264,58 @@ fn stream_chat_ollama_native(
             yield Err(anyhow!("ollama returned {status}: {detail}"));
             return;
         }
-        let parsed: OllamaChatResponse = match response.json().await {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                yield Err(anyhow!("failed to parse the ollama reply: {e}"));
-                return;
+
+        // ollama streams newline-delimited JSON, one object per token.
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    yield Err(anyhow!("ollama stream error: {}", error_chain(&e)));
+                    return;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=newline).collect();
+                let line = &line[..line.len() - 1]; // drop the newline
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                match serde_json::from_slice::<OllamaChatResponse>(line) {
+                    Ok(parsed) => {
+                        if let Some(err) = parsed.error {
+                            yield Err(anyhow!("ollama error: {err}"));
+                            return;
+                        }
+                        if !parsed.message.content.is_empty() {
+                            yield Ok(ChatStreamItem::Token(parsed.message.content));
+                        }
+                        if parsed.done {
+                            yield Ok(ChatStreamItem::Done);
+                            return;
+                        }
+                    }
+                    Err(e) => log::warn!("ollama: skipping malformed NDJSON line: {e}"),
+                }
             }
-        };
-        if let Some(err) = parsed.error {
-            yield Err(anyhow!("ollama error: {err}"));
-            return;
-        }
-        if !parsed.message.content.is_empty() {
-            yield Ok(ChatStreamItem::Token(parsed.message.content));
         }
         yield Ok(ChatStreamItem::Done);
     }
+}
+
+/// Walk an error's source chain into one string so callers see the real cause
+/// (e.g. "connection refused") instead of reqwest's opaque "error sending
+/// request for url".
+fn error_chain<E: std::error::Error>(err: &E) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    out
 }
 
 /// OpenAI-compatible SSE streaming (`/v1/chat/completions`) — used for the Turbo
