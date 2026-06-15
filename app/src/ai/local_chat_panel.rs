@@ -160,6 +160,13 @@ pub enum LocalAiChatAction {
     ToggleAgent,
     /// Toggle AUTO: run agent commands/edits without per-action approval.
     ToggleAuto,
+    /// Open/close the AI model picker popup (above the compose box).
+    ToggleModelPicker,
+    /// Pick the local model at this index from the picker, and use the local
+    /// (ollama) endpoint.
+    PickModel(usize),
+    /// Turn the Turbo (full-GPU) endpoint on or off.
+    ToggleTurbo,
     /// Approve the pending side-effecting tool and run it.
     ApproveTool,
     /// Deny the pending side-effecting tool.
@@ -233,6 +240,10 @@ pub struct LocalAiChatView {
     cloud_active: bool,
     /// What the compose box's next submit means (a prompt, or a key/model value).
     input_mode: InputMode,
+
+    /// Whether the click-to-open AI model picker (the popup above the compose
+    /// box) is currently expanded.
+    model_picker_open: bool,
 }
 
 impl LocalAiChatView {
@@ -271,6 +282,7 @@ impl LocalAiChatView {
             cloud: load_cloud_config().unwrap_or_default(),
             cloud_active: false,
             input_mode: InputMode::Chat,
+            model_picker_open: false,
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -1045,6 +1057,10 @@ impl LocalAiChatView {
             .finish()
     }
 
+    /// The top bar: brand mark + AI Mode status badge, and the utility chips
+    /// (Stop while generating, Refresh, Clear). The model/Turbo/agent controls
+    /// live in the bottom control strip (next to the compose box) instead, so
+    /// the panel reads top-down like a real IDE assistant.
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
 
@@ -1053,12 +1069,12 @@ impl LocalAiChatView {
             None => "AI Mode: n/a".to_string(),
         };
 
-        let title_row = Flex::row()
+        let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.label_text(
                 appearance,
-                "Local AI",
+                "✦ Genesi AI",
                 TITLE_FONT_SIZE,
                 theme.active_ui_text_color().into(),
                 false,
@@ -1069,144 +1085,235 @@ impl LocalAiChatView {
                 ai_mode_label,
                 LocalAiChatAction::CycleAiMode,
                 self.ai_mode.is_some(),
-            ))
-            .finish();
-
-        let endpoint_label = if self.cloud_active {
-            format!("Endpoint: ☁ {}", self.cloud_label())
-        } else {
-            format!("Endpoint: {}", self.endpoint.label())
-        };
-        // Model chip: in cloud mode it edits the provider's model id; locally it
-        // cycles the installed models.
-        let (model_label, model_action, model_enabled) = if self.cloud_active {
-            let model = self.cloud.model.trim();
-            (
-                format!("Model: {}", if model.is_empty() { "set…" } else { model }),
-                LocalAiChatAction::SetModel,
-                true,
-            )
-        } else {
-            let label = match self.current_model() {
-                Some(model) => format!("Model: {model}"),
-                None => "Model: none".to_string(),
-            };
-            (
-                label,
-                LocalAiChatAction::CycleModel,
-                !self.models.is_empty(),
-            )
-        };
-
-        // The panel is only ~380px wide, so the controls live on two rows: the
-        // endpoint/model selectors, then the action chips. Cramming all five into
-        // one row overflowed and clipped the last button.
-        let selectors_row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip(
-                appearance,
-                endpoint_label,
-                LocalAiChatAction::CycleEndpoint,
-                self.cloud_active,
-            ))
-            .with_child(self.chip(appearance, model_label, model_action, model_enabled))
-            .finish();
-
-        // BYOK row — only while the cloud endpoint is active. Pick a provider and
-        // paste a key; local stays the default, this is opt-in.
-        let cloud_row = self.cloud_active.then(|| {
-            let has_key = !self.cloud.api_key.trim().is_empty();
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_child(self.chip(
-                    appearance,
-                    format!("Provider: {}", self.cloud_label()),
-                    LocalAiChatAction::CycleProvider,
-                    true,
-                ))
-                .with_child(self.chip(
-                    appearance,
-                    if has_key {
-                        "🔑 Key ✓".to_string()
-                    } else {
-                        "🔑 Set key".to_string()
-                    },
-                    LocalAiChatAction::SetKey,
-                    has_key,
-                ))
-                .finish()
-        });
-
-        // Agent controls: Agent toggle, AUTO (only meaningful in agent mode), and
-        // the file-context toggle.
-        let mut agent_row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip(
-                appearance,
-                format!("🤖 Agent: {}", if self.agent_mode { "On" } else { "Off" }),
-                LocalAiChatAction::ToggleAgent,
-                self.agent_mode,
             ));
-        if self.agent_mode {
-            agent_row.add_child(self.chip(
-                appearance,
-                format!("AUTO: {}", if self.auto_approve { "On" } else { "Off" }),
-                LocalAiChatAction::ToggleAuto,
-                self.auto_approve,
-            ));
-        }
-        agent_row.add_child(self.chip(
-            appearance,
-            format!("📎 {}", if self.attach_context { "On" } else { "Off" }),
-            LocalAiChatAction::ToggleAttachContext,
-            self.attach_context,
-        ));
-        let agent_row = agent_row.finish();
-
-        // The util row gains a Stop chip while a generation is in flight, so the
-        // user can interrupt a runaway model or agent loop.
-        let mut util_row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max);
         if self.in_flight {
-            util_row.add_child(self.chip(
+            row.add_child(self.chip(
                 appearance,
                 "⏹ Stop".to_string(),
                 LocalAiChatAction::Stop,
                 true,
             ));
         }
-        util_row.add_child(self.chip(
-            appearance,
-            "Refresh".to_string(),
-            LocalAiChatAction::Refresh,
-            true,
-        ));
-        util_row.add_child(self.chip(
+        row.add_child(self.chip(appearance, "Refresh".to_string(), LocalAiChatAction::Refresh, true));
+        row.add_child(self.chip(
             appearance,
             "Clear".to_string(),
             LocalAiChatAction::Clear,
             !self.messages.is_empty(),
         ));
-        let util_row = util_row.finish();
+        row.finish()
+    }
 
-        let mut column = Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(Container::new(title_row).with_padding_bottom(6.).finish())
-            .with_child(
-                Container::new(selectors_row)
-                    .with_padding_bottom(4.)
-                    .finish(),
-            );
-        if let Some(cloud_row) = cloud_row {
-            column.add_child(Container::new(cloud_row).with_padding_bottom(4.).finish());
+    /// The bottom control strip, sitting just above the compose box like a real
+    /// IDE: a click-to-open AI selector, the Turbo toggle next to it, and the
+    /// agent toggles. The model picker itself is a popup (see
+    /// [`Self::render_model_picker`]) so the user clicks once and chooses.
+    fn render_control_strip(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let model_name = self.current_model().unwrap_or_else(|| "no model".to_string());
+        let selector_label = if self.endpoint == LocalEndpoint::Turbo {
+            format!("⚡ {model_name}  ⌄")
+        } else {
+            format!("✦ {model_name}  ⌄")
+        };
+
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(self.selector_button(
+                appearance,
+                selector_label,
+                LocalAiChatAction::ToggleModelPicker,
+                self.model_picker_open,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "⚡ Turbo".to_string(),
+                LocalAiChatAction::ToggleTurbo,
+                self.endpoint == LocalEndpoint::Turbo,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "🤖 Agent".to_string(),
+                LocalAiChatAction::ToggleAgent,
+                self.agent_mode,
+            ));
+        // AUTO only matters in agent mode (approve-less commands/edits).
+        if self.agent_mode {
+            row.add_child(self.chip(
+                appearance,
+                format!("AUTO {}", if self.auto_approve { "on" } else { "off" }),
+                LocalAiChatAction::ToggleAuto,
+                self.auto_approve,
+            ));
         }
-        column
-            .with_child(Container::new(agent_row).with_padding_bottom(4.).finish())
-            .with_child(util_row)
+        row.add_child(self.chip(
+            appearance,
+            "📎".to_string(),
+            LocalAiChatAction::ToggleAttachContext,
+            self.attach_context,
+        ));
+        row.finish()
+    }
+
+    /// A dropdown-style button (surface fill + border + caret) used as the AI
+    /// selector. Highlights green while its popup is open.
+    fn selector_button(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        action: LocalAiChatAction,
+        open: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color: ColorU = theme.active_ui_text_color().into();
+        let mut container =
+            Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_margin_right(6.)
+                .with_margin_top(2.);
+        container = if open {
+            container
+                .with_background_color(green_tint())
+                .with_border(Border::all(1.).with_border_color(green_soft()))
+        } else {
+            container
+                .with_background(theme.surface_2())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        };
+
+        EventHandler::new(container.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// The AI picker popup: a card listing the on-device models (click to pick),
+    /// the Turbo accelerated endpoint, and a disabled "Cloud — coming soon" slot
+    /// (BYOK provider selection is on the roadmap). Returns `None` when closed.
+    fn render_model_picker(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
+        if !self.model_picker_open {
+            return None;
+        }
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+
+        let section = |me: &Self, text: &str| -> Box<dyn Element> {
+            Container::new(me.label_text(appearance, text, CHIP_FONT_SIZE, muted, false))
+                .with_horizontal_padding(8.)
+                .with_padding_top(4.)
+                .with_padding_bottom(2.)
+                .finish()
+        };
+
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        list.add_child(section(self, "On-device models"));
+
+        if self.models.is_empty() {
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "No models yet — start ollama, pull one (e.g. `ollama pull llama3.2`), then Refresh.",
+                    BODY_FONT_SIZE,
+                    muted,
+                    true,
+                ))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .finish(),
+            );
+        } else {
+            for (index, model) in self.models.iter().enumerate() {
+                let selected = !self.cloud_active
+                    && self.endpoint == LocalEndpoint::Ollama
+                    && self.selected_model == Some(index);
+                let mark = if selected { "●  " } else { "○  " };
+                list.add_child(self.picker_row(
+                    appearance,
+                    format!("{mark}{model}"),
+                    LocalAiChatAction::PickModel(index),
+                    selected,
+                ));
+            }
+        }
+
+        list.add_child(section(self, "Accelerated"));
+        let turbo_selected = self.endpoint == LocalEndpoint::Turbo;
+        let turbo_label = if self.turbo_available || turbo_selected {
+            format!(
+                "{}⚡ Turbo — full GPU offload",
+                if turbo_selected { "●  " } else { "○  " }
+            )
+        } else {
+            "○  ⚡ Turbo — not running".to_string()
+        };
+        list.add_child(self.picker_row(
+            appearance,
+            turbo_label,
+            LocalAiChatAction::ToggleTurbo,
+            turbo_selected,
+        ));
+
+        // Cloud (BYOK) is deferred to the roadmap; show the slot disabled so it's
+        // discoverable without being wired up yet.
+        list.add_child(
+            Container::new(self.label_text(
+                appearance,
+                "☁  Cloud providers — coming soon",
+                BODY_FONT_SIZE,
+                muted,
+                false,
+            ))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(6.)
+            .finish(),
+        );
+
+        let card = Container::new(list.finish())
+            .with_uniform_padding(6.)
+            .with_margin_bottom(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_background(theme.surface_1())
+            .finish();
+        Some(
+            Container::new(card)
+                .with_horizontal_padding(PANEL_PADDING)
+                .finish(),
+        )
+    }
+
+    /// One clickable row in the model picker: a full-width hit target that tints
+    /// green when it's the active selection.
+    fn picker_row(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        action: LocalAiChatAction,
+        active: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let color: ColorU = if active {
+            genesi_green()
+        } else {
+            theme.main_text_color(theme.background()).into()
+        };
+        let mut row = Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, color, false))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
+        if active {
+            row = row.with_background_color(green_tint());
+        }
+
+        EventHandler::new(row.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
             .finish()
     }
 
@@ -1759,6 +1866,46 @@ impl TypedActionView for LocalAiChatView {
                 self.auto_approve = !self.auto_approve;
                 ctx.notify();
             }
+            LocalAiChatAction::ToggleModelPicker => {
+                self.model_picker_open = !self.model_picker_open;
+                ctx.notify();
+            }
+            LocalAiChatAction::PickModel(index) => {
+                // A deliberate local-model choice: pin the local (ollama)
+                // endpoint and stop the Turbo auto-default from overriding it.
+                self.endpoint_user_chosen = true;
+                self.cloud_active = false;
+                self.endpoint = LocalEndpoint::Ollama;
+                if *index < self.models.len() {
+                    self.selected_model = Some(*index);
+                }
+                self.model_picker_open = false;
+                self.error = None;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleTurbo => {
+                self.endpoint_user_chosen = true;
+                self.cloud_active = false;
+                self.error = None;
+                if self.endpoint == LocalEndpoint::Turbo {
+                    // Turn Turbo off -> back to the local ollama endpoint.
+                    self.endpoint = LocalEndpoint::Ollama;
+                } else {
+                    // Turn Turbo on. refresh_models re-probes /health, so a stale
+                    // turbo_available can't pin us to a dead endpoint for long.
+                    self.endpoint = LocalEndpoint::Turbo;
+                    if !self.turbo_available {
+                        self.error = Some(
+                            "Turbo (genesi-ai-turbo) isn't up yet — start it and it'll be used \
+                             automatically once /health responds."
+                                .to_string(),
+                        );
+                    }
+                }
+                self.model_picker_open = false;
+                self.refresh_models(ctx);
+                ctx.notify();
+            }
             LocalAiChatAction::ApproveTool => {
                 if let Some(tool) = self.pending_tool.take() {
                     self.start_tool(tool, ctx);
@@ -1851,6 +1998,21 @@ impl View for LocalAiChatView {
         if let Some(tool) = &self.pending_tool {
             root.add_child(self.render_approval(appearance, tool));
         }
+
+        // AI model picker popup — opens just above the control strip, IDE-style,
+        // so the user clicks the selector once and chooses from a list.
+        if let Some(picker) = self.render_model_picker(appearance) {
+            root.add_child(picker);
+        }
+
+        // Control strip: the click-to-open AI selector, the Turbo toggle next to
+        // it, and the agent toggles — sitting right above the compose box.
+        root.add_child(
+            Container::new(self.render_control_strip(appearance))
+                .with_horizontal_padding(PANEL_PADDING)
+                .with_padding_bottom(4.)
+                .finish(),
+        );
 
         // The input as a bordered, rounded compose box so it reads as an input
         // rather than floating text.
