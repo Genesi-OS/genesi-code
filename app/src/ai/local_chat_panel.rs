@@ -27,8 +27,9 @@ use warpui::{
 
 use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
-    list_models, read_ai_mode_state, set_ai_mode_force, stream_chat, turbo_health_ok, AiModeState,
-    ChatMessage, ChatStreamItem, CodeContext, LocalEndpoint,
+    cloud_presets, list_models, load_cloud_config, read_ai_mode_state, save_cloud_config,
+    set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok, AiModeState, ChatMessage,
+    ChatStreamItem, CloudConfig, CodeContext, LocalEndpoint,
 };
 use crate::appearance::Appearance;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
@@ -49,6 +50,27 @@ const SYSTEM_PROMPT: &str =
 /// The Genesi brand green, used as the panel's accent.
 fn genesi_green() -> ColorU {
     ColorU::new(15, 143, 106, 255)
+}
+
+/// A very translucent Genesi green — for the subtle fill behind the user's
+/// messages and the active control chips.
+fn green_tint() -> ColorU {
+    ColorU::new(15, 143, 106, 38)
+}
+
+/// A semi-opaque Genesi green — for the borders of active controls and the
+/// user-message accent.
+fn green_soft() -> ColorU {
+    ColorU::new(15, 143, 106, 130)
+}
+
+/// What the compose box is currently capturing: a chat prompt, or a one-shot
+/// value for the BYOK cloud provider (its API key or model id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Chat,
+    CloudKey,
+    CloudModel,
 }
 
 /// Who authored a transcript entry.
@@ -146,6 +168,12 @@ pub enum LocalAiChatAction {
     Stop,
     /// Expand/collapse the transcript entry at this index (thought/tool/command).
     ToggleCollapse(usize),
+    /// Cycle the BYOK cloud provider preset (HuggingFace / OpenAI / …).
+    CycleProvider,
+    /// Capture the cloud provider's API key in the compose box.
+    SetKey,
+    /// Capture the cloud provider's model id in the compose box.
+    SetModel,
 }
 
 pub struct LocalAiChatView {
@@ -197,6 +225,14 @@ pub struct LocalAiChatView {
     auto_approve: bool,
     /// A side-effecting tool waiting for the user's Allow/Deny.
     pending_tool: Option<AgentTool>,
+
+    // ── BYOK: optional cloud provider (off by default; local stays the default) ──
+    /// The user's saved cloud provider (endpoint + key + model). Empty until set.
+    cloud: CloudConfig,
+    /// When on, prompts go to the cloud provider instead of Local/Turbo.
+    cloud_active: bool,
+    /// What the compose box's next submit means (a prompt, or a key/model value).
+    input_mode: InputMode,
 }
 
 impl LocalAiChatView {
@@ -232,17 +268,46 @@ impl LocalAiChatView {
             agent_tool_summary: String::new(),
             auto_approve: false,
             pending_tool: None,
+            cloud: load_cloud_config().unwrap_or_default(),
+            cloud_active: false,
+            input_mode: InputMode::Chat,
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
         view
     }
 
-    /// Name of the currently selected model, if any.
+    /// Name of the currently selected model, if any. In cloud mode this is the
+    /// configured provider model; otherwise the picked local model.
     fn current_model(&self) -> Option<String> {
+        if self.cloud_active {
+            let model = self.cloud.model.trim();
+            return (!model.is_empty()).then(|| model.to_string());
+        }
         self.selected_model
             .and_then(|index| self.models.get(index))
             .cloned()
+    }
+
+    /// Build the chat stream for the active backend: the user's cloud provider
+    /// (BYOK) when it's selected and ready, otherwise the local Ollama / Turbo
+    /// endpoint. Both yield the same `ChatStreamItem` stream so the agent loop
+    /// and plain chat don't care which one is in use.
+    fn build_stream(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+    ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
+        if self.cloud_active && self.cloud.is_ready() {
+            stream_chat_cloud(
+                &self.cloud.base_url,
+                model,
+                self.cloud.api_key.clone(),
+                messages,
+            )
+        } else {
+            stream_chat(self.endpoint, model, messages)
+        }
     }
 
     /// Re-read the daemon's published AI Mode state (cheap, synchronous).
@@ -252,6 +317,11 @@ impl LocalAiChatView {
 
     /// Ask the active endpoint for its model list and probe whether Turbo is up.
     fn refresh_models(&mut self, ctx: &mut ViewContext<Self>) {
+        // In cloud (BYOK) mode there's no local server to enumerate — the model is
+        // whatever the user configured, so skip the local probes entirely.
+        if self.cloud_active {
+            return;
+        }
         let base = self.endpoint.base_url().to_string();
         // Turbo (llama-server) already has its model loaded and its `/v1/models`
         // isn't a reliable signal, so an empty/failed list there is not an error —
@@ -317,15 +387,89 @@ impl LocalAiChatView {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
-            // Route the submit through the workspace so it can attach the
-            // focused file as context before we actually send (see
-            // `LocalAiChatEvent::SubmitPrompt`). The workspace calls back into
-            // `send_with_context`.
-            SubmittableTextInputEvent::Submit(text) => {
-                ctx.emit(LocalAiChatEvent::SubmitPrompt(text.clone()));
+            // In a cloud key/model entry mode the submit is the value to save;
+            // otherwise it's a chat prompt. Route the prompt through the workspace
+            // so it can attach the focused file as context before we send (see
+            // `LocalAiChatEvent::SubmitPrompt`).
+            SubmittableTextInputEvent::Submit(text) => match self.input_mode {
+                InputMode::CloudKey | InputMode::CloudModel => {
+                    self.save_cloud_field(self.input_mode, text.clone(), ctx);
+                }
+                InputMode::Chat => ctx.emit(LocalAiChatEvent::SubmitPrompt(text.clone())),
+            },
+            // Escape backs out of a key/model entry without saving.
+            SubmittableTextInputEvent::Escape => {
+                if self.input_mode != InputMode::Chat {
+                    self.set_input_mode(InputMode::Chat, ctx);
+                }
             }
-            SubmittableTextInputEvent::Escape => {}
         }
+    }
+
+    /// A friendly name for the configured cloud provider (or "cloud").
+    fn cloud_label(&self) -> String {
+        if self.cloud.label.trim().is_empty() {
+            "cloud".to_string()
+        } else {
+            self.cloud.label.clone()
+        }
+    }
+
+    /// Switch what the compose box captures next, updating its placeholder.
+    fn set_input_mode(&mut self, mode: InputMode, ctx: &mut ViewContext<Self>) {
+        self.input_mode = mode;
+        let placeholder = match mode {
+            InputMode::Chat => " Ask the model...".to_string(),
+            InputMode::CloudKey => {
+                format!(" Paste your {} API key, then Enter", self.cloud_label())
+            }
+            InputMode::CloudModel => {
+                format!(
+                    " Model id for {} (e.g. {}), then Enter",
+                    self.cloud_label(),
+                    {
+                        let m = self.cloud.model.trim();
+                        if m.is_empty() {
+                            "gpt-4o-mini"
+                        } else {
+                            m
+                        }
+                    }
+                )
+            }
+        };
+        self.input.update(ctx, |input, ctx| {
+            input.set_placeholder_text(placeholder, ctx)
+        });
+        ctx.notify();
+    }
+
+    /// Persist a typed key or model id onto the cloud config, then return to chat.
+    fn save_cloud_field(&mut self, which: InputMode, value: String, ctx: &mut ViewContext<Self>) {
+        let value = value.trim().to_string();
+        match which {
+            InputMode::CloudKey => self.cloud.api_key = value,
+            InputMode::CloudModel => self.cloud.model = value,
+            InputMode::Chat => {}
+        }
+        // Seed sensible defaults from the first preset if the user jumped straight
+        // to pasting a key without picking a provider.
+        if self.cloud.label.trim().is_empty() {
+            if let Some((label, base, model)) = cloud_presets().first() {
+                self.cloud.label = label.to_string();
+                if self.cloud.base_url.trim().is_empty() {
+                    self.cloud.base_url = base.to_string();
+                }
+                if self.cloud.model.trim().is_empty() {
+                    self.cloud.model = model.to_string();
+                }
+            }
+        }
+        match save_cloud_config(&self.cloud) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(format!("Couldn't save cloud config: {e}")),
+        }
+        self.set_input_mode(InputMode::Chat, ctx);
     }
 
     /// Send the prompt and start streaming the assistant's reply, optionally
@@ -342,11 +486,24 @@ impl LocalAiChatView {
         if prompt.is_empty() || self.in_flight {
             return;
         }
+        // BYOK: a selected cloud provider needs its key before it can be used.
+        if self.cloud_active && !self.cloud.is_ready() {
+            self.error =
+                Some("Add your API key for the cloud provider first (🔑 Set key).".to_string());
+            ctx.notify();
+            return;
+        }
         // Turbo serves whatever model llama-server already loaded, so the `model`
         // field is informational there — fall back to a placeholder when no model
-        // is listed. Ollama needs a real model name.
+        // is listed. Ollama and cloud providers need a real model name.
         let model = match self.current_model() {
             Some(model) => model,
+            None if self.cloud_active => {
+                self.error =
+                    Some("Set a model for the cloud provider (the Model chip).".to_string());
+                ctx.notify();
+                return;
+            }
             None if self.endpoint == LocalEndpoint::Turbo => "local".to_string(),
             None => {
                 self.error = Some(
@@ -414,7 +571,7 @@ impl LocalAiChatView {
         self.messages
             .push(ChatEntry::prose(ChatRole::Assistant, String::new(), None));
         let turn = self.current_turn;
-        let stream = stream_chat(self.endpoint, &model, request);
+        let stream = self.build_stream(&model, request);
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_stream_item(turn, item, ctx),
@@ -446,11 +603,7 @@ impl LocalAiChatView {
             status: StepStatus::Running,
         });
         let turn = self.current_turn;
-        let stream = stream_chat(
-            self.endpoint,
-            &self.agent_model,
-            self.agent_messages.clone(),
-        );
+        let stream = self.build_stream(&self.agent_model, self.agent_messages.clone());
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_agent_token(turn, item, ctx),
@@ -855,23 +1008,34 @@ impl LocalAiChatView {
         appearance: &Appearance,
         label: String,
         action: LocalAiChatAction,
-        enabled: bool,
+        active: bool,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let color: ColorU = if enabled {
-            theme.active_ui_text_color().into()
+        // Active / highlighted chips wear the Genesi green (a soft tinted fill +
+        // green border + green text); the rest stay quiet so the panel reads as a
+        // calm, on-brand control strip instead of a wall of grey buttons.
+        let text_color: ColorU = if active {
+            genesi_green()
         } else {
             theme.disabled_text_color(theme.background()).into()
         };
-        let content =
-            Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color, false))
-                .with_horizontal_padding(8.)
-                .with_vertical_padding(3.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-                .with_border(Border::all(1.).with_border_fill(theme.outline()))
-                .with_background(theme.surface_2())
+        let mut container =
+            Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false))
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(4.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
                 .with_margin_right(6.)
-                .finish();
+                .with_margin_top(2.);
+        container = if active {
+            container
+                .with_background_color(green_tint())
+                .with_border(Border::all(1.).with_border_color(green_soft()))
+        } else {
+            container
+                .with_background(theme.surface_2())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        };
+        let content = container.finish();
 
         EventHandler::new(content)
             .on_left_mouse_down(move |ctx, _, _| {
@@ -908,10 +1072,30 @@ impl LocalAiChatView {
             ))
             .finish();
 
-        let endpoint_label = format!("Endpoint: {}", self.endpoint.label());
-        let model_label = match self.current_model() {
-            Some(model) => format!("Model: {model}"),
-            None => "Model: none".to_string(),
+        let endpoint_label = if self.cloud_active {
+            format!("Endpoint: ☁ {}", self.cloud_label())
+        } else {
+            format!("Endpoint: {}", self.endpoint.label())
+        };
+        // Model chip: in cloud mode it edits the provider's model id; locally it
+        // cycles the installed models.
+        let (model_label, model_action, model_enabled) = if self.cloud_active {
+            let model = self.cloud.model.trim();
+            (
+                format!("Model: {}", if model.is_empty() { "set…" } else { model }),
+                LocalAiChatAction::SetModel,
+                true,
+            )
+        } else {
+            let label = match self.current_model() {
+                Some(model) => format!("Model: {model}"),
+                None => "Model: none".to_string(),
+            };
+            (
+                label,
+                LocalAiChatAction::CycleModel,
+                !self.models.is_empty(),
+            )
         };
 
         // The panel is only ~380px wide, so the controls live on two rows: the
@@ -924,15 +1108,36 @@ impl LocalAiChatView {
                 appearance,
                 endpoint_label,
                 LocalAiChatAction::CycleEndpoint,
-                true,
+                self.cloud_active,
             ))
-            .with_child(self.chip(
-                appearance,
-                model_label,
-                LocalAiChatAction::CycleModel,
-                !self.models.is_empty(),
-            ))
+            .with_child(self.chip(appearance, model_label, model_action, model_enabled))
             .finish();
+
+        // BYOK row — only while the cloud endpoint is active. Pick a provider and
+        // paste a key; local stays the default, this is opt-in.
+        let cloud_row = self.cloud_active.then(|| {
+            let has_key = !self.cloud.api_key.trim().is_empty();
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(self.chip(
+                    appearance,
+                    format!("Provider: {}", self.cloud_label()),
+                    LocalAiChatAction::CycleProvider,
+                    true,
+                ))
+                .with_child(self.chip(
+                    appearance,
+                    if has_key {
+                        "🔑 Key ✓".to_string()
+                    } else {
+                        "🔑 Set key".to_string()
+                    },
+                    LocalAiChatAction::SetKey,
+                    has_key,
+                ))
+                .finish()
+        });
 
         // Agent controls: Agent toggle, AUTO (only meaningful in agent mode), and
         // the file-context toggle.
@@ -988,14 +1193,18 @@ impl LocalAiChatView {
         ));
         let util_row = util_row.finish();
 
-        Flex::column()
+        let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(Container::new(title_row).with_padding_bottom(6.).finish())
             .with_child(
                 Container::new(selectors_row)
                     .with_padding_bottom(4.)
                     .finish(),
-            )
+            );
+        if let Some(cloud_row) = cloud_row {
+            column.add_child(Container::new(cloud_row).with_padding_bottom(4.).finish());
+        }
+        column
             .with_child(Container::new(agent_row).with_padding_bottom(4.).finish())
             .with_child(util_row)
             .finish()
@@ -1108,15 +1317,12 @@ impl LocalAiChatView {
     fn render_bubble(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
         let theme = appearance.theme();
         let is_user = entry.role == ChatRole::User;
-        let background = if is_user {
-            theme.surface_2()
-        } else {
-            theme.surface_1()
-        };
+        // A small "●" dot before the name reads as a tiny avatar — green for the
+        // user, neutral for the assistant.
         let (prefix, role_color): (&str, ColorU) = if is_user {
-            ("You", genesi_green())
+            ("●  You", genesi_green())
         } else {
-            ("Genesi AI", theme.active_ui_text_color().into())
+            ("●  Genesi AI", theme.active_ui_text_color().into())
         };
 
         let mut inner = Flex::column()
@@ -1173,16 +1379,19 @@ impl LocalAiChatView {
             .with_child(Container::new(body_el).with_margin_top(4.).finish())
             .finish();
 
-        let mut bubble = Container::new(inner)
-            .with_uniform_padding(10.)
-            .with_margin_bottom(8.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            .with_background(background);
-
-        // Genesi-green left accent on the user's turns for a clear visual rhythm.
-        if is_user {
-            bubble = bubble.with_border(Border::left(2.).with_border_color(genesi_green()));
-        }
+        let bubble = Container::new(inner)
+            .with_uniform_padding(11.)
+            .with_margin_bottom(9.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)));
+        // The user's turns read as a soft Genesi-green card with a green left
+        // accent; the assistant's sit on the calmer surface.
+        let bubble = if is_user {
+            bubble
+                .with_background_color(green_tint())
+                .with_border(Border::left(3.).with_border_color(genesi_green()))
+        } else {
+            bubble.with_background(theme.surface_1())
+        };
         bubble.finish()
     }
 
@@ -1447,21 +1656,53 @@ impl TypedActionView for LocalAiChatView {
         match action {
             LocalAiChatAction::CycleEndpoint => {
                 // A deliberate choice — stop the Turbo auto-default from
-                // overriding it on the next probe.
+                // overriding it on the next probe. Cycle: Local -> Turbo (if up)
+                // -> Cloud (BYOK) -> Local.
                 self.endpoint_user_chosen = true;
-                let next = self.endpoint.toggled();
-                if next == LocalEndpoint::Turbo && !self.turbo_available {
-                    self.error = Some(
-                        "Turbo (:11435) isn't running. Start it with `genesi-ai-turbo serve <model>`."
-                            .to_string(),
-                    );
-                } else {
-                    self.endpoint = next;
-                    self.error = None;
+                self.error = None;
+                if self.cloud_active {
+                    self.cloud_active = false;
+                    self.endpoint = LocalEndpoint::Ollama;
                     self.refresh_models(ctx);
+                } else if self.endpoint == LocalEndpoint::Ollama && self.turbo_available {
+                    self.endpoint = LocalEndpoint::Turbo;
+                    self.refresh_models(ctx);
+                } else {
+                    // From Turbo, or from Local when Turbo is down -> Cloud.
+                    // Reset the local endpoint so leaving cloud returns to Local.
+                    self.endpoint = LocalEndpoint::Ollama;
+                    self.cloud_active = true;
+                    if !self.cloud.is_ready() {
+                        self.error = Some(format!(
+                            "Pick a provider and add your key (🔑 Set key) to use {}.",
+                            self.cloud_label()
+                        ));
+                    }
                 }
                 ctx.notify();
             }
+            LocalAiChatAction::CycleProvider => {
+                let presets = cloud_presets();
+                let current = presets
+                    .iter()
+                    .position(|(label, _, _)| *label == self.cloud.label);
+                let next = current.map(|i| (i + 1) % presets.len()).unwrap_or(0);
+                let (label, base_url, default_model) = presets[next];
+                // Replace the model only if it was empty or still the old preset's
+                // default — never clobber a model the user typed by hand.
+                let replace_model = self.cloud.model.trim().is_empty()
+                    || current.is_some_and(|i| self.cloud.model == presets[i].2);
+                self.cloud.label = label.to_string();
+                self.cloud.base_url = base_url.to_string();
+                if replace_model {
+                    self.cloud.model = default_model.to_string();
+                }
+                let _ = save_cloud_config(&self.cloud);
+                self.error = None;
+                ctx.notify();
+            }
+            LocalAiChatAction::SetKey => self.set_input_mode(InputMode::CloudKey, ctx),
+            LocalAiChatAction::SetModel => self.set_input_mode(InputMode::CloudModel, ctx),
             LocalAiChatAction::CycleModel => {
                 if !self.models.is_empty() {
                     let next = self

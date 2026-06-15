@@ -10,6 +10,7 @@
 //! AI with no account and no cloud.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -121,7 +122,10 @@ fn clamp_context(text: &str) -> String {
 
     let (mut out, char_truncated) = if line_capped.chars().count() > CONTEXT_MAX_CHARS {
         (
-            line_capped.chars().take(CONTEXT_MAX_CHARS).collect::<String>(),
+            line_capped
+                .chars()
+                .take(CONTEXT_MAX_CHARS)
+                .collect::<String>(),
             true,
         )
     } else {
@@ -218,13 +222,25 @@ pub fn stream_chat(
     messages: Vec<ChatMessage>,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match endpoint {
-        LocalEndpoint::Ollama => {
-            stream_chat_ollama_native(model.to_string(), messages).boxed()
-        }
+        LocalEndpoint::Ollama => stream_chat_ollama_native(model.to_string(), messages).boxed(),
         LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), model, messages).boxed()
+            stream_chat_openai_sse(endpoint.base_url(), model, messages, None).boxed()
         }
     }
+}
+
+/// Stream a chat completion from a user-configured cloud provider (BYOK). Any
+/// OpenAI-compatible endpoint works — OpenAI, OpenRouter, Groq, Together, or
+/// Hugging Face's free router (`https://router.huggingface.co/v1`) — with the
+/// user's own API key sent as a bearer token. Local stays the default; this is
+/// purely opt-in for a bigger/faster model than the machine can run.
+pub fn stream_chat_cloud(
+    base_url: &str,
+    model: &str,
+    api_key: String,
+    messages: Vec<ChatMessage>,
+) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
+    stream_chat_openai_sse(base_url, model, messages, Some(api_key)).boxed()
 }
 
 /// ollama's native `/api/chat` with `stream: true`: parse the NDJSON token
@@ -324,6 +340,7 @@ fn stream_chat_openai_sse(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    api_key: Option<String>,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = ChatRequest {
@@ -341,7 +358,14 @@ fn stream_chat_openai_sse(
     // panic. The ollama path can use a timeout because it's polled lazily under
     // spawn_stream_local (which has a Tokio context); the SSE path cannot.
     let client = http_client::Client::new();
-    let event_source = client.post(url).json(&body).eventsource();
+    let mut request = client.post(url);
+    // BYOK: cloud providers (OpenAI / OpenRouter / Groq / HuggingFace …) need the
+    // user's key as a bearer token. The local Turbo server ignores auth, so it's
+    // only attached when a non-empty key is supplied.
+    if let Some(key) = api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        request = request.bearer_auth(key.trim());
+    }
+    let event_source = request.json(&body).eventsource();
 
     event_source.filter_map(|event| async move {
         match event {
@@ -517,7 +541,14 @@ impl AiModeState {
         } else if self.force_mode == "off" {
             "AI Mode: off (forced)".to_string()
         } else if self.ai_mode_active {
-            format!("AI Mode: {}", if self.activity.is_empty() { "active" } else { &self.activity })
+            format!(
+                "AI Mode: {}",
+                if self.activity.is_empty() {
+                    "active"
+                } else {
+                    &self.activity
+                }
+            )
         } else {
             "AI Mode: idle".to_string()
         };
@@ -549,4 +580,95 @@ pub fn set_ai_mode_force(value: &str) -> Result<()> {
             .map_err(|e| anyhow!("failed to set AI Mode override: {e}")),
         other => Err(anyhow!("invalid AI Mode force value: {other}")),
     }
+}
+
+// ── BYOK: user-configured cloud provider ──────────────────────────────────────
+
+/// A user-supplied cloud provider (Bring Your Own Key). Any OpenAI-compatible
+/// endpoint works. Persisted to `~/.config/genesi-code/cloud.json`. Local stays
+/// the default — this is purely opt-in, for a bigger/faster model than the
+/// machine can run (or a frontier model for hard tasks). Stored on-device only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudConfig {
+    /// Display label, e.g. "HuggingFace" or "OpenAI".
+    #[serde(default)]
+    pub label: String,
+    /// OpenAI-compatible base URL (usually ending in `/v1`).
+    #[serde(default)]
+    pub base_url: String,
+    /// The user's API key, sent as a bearer token.
+    #[serde(default)]
+    pub api_key: String,
+    /// The model id to request, e.g. `gpt-4o-mini` or a Hugging Face repo id.
+    #[serde(default)]
+    pub model: String,
+}
+
+impl CloudConfig {
+    /// Whether this config can actually be used (has an endpoint + key).
+    pub fn is_ready(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
+    }
+}
+
+/// Provider presets: `(label, base_url, default_model)`. Picking one fills in the
+/// endpoint + a sensible default model so the user only has to paste their key.
+/// Hugging Face's router exposes many models' free inference API behind one key.
+pub fn cloud_presets() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        (
+            "HuggingFace",
+            "https://router.huggingface.co/v1",
+            "meta-llama/Llama-3.1-8B-Instruct",
+        ),
+        ("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
+        (
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            "meta-llama/llama-3.1-8b-instruct",
+        ),
+        (
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            "llama-3.1-8b-instant",
+        ),
+        (
+            "Together",
+            "https://api.together.xyz/v1",
+            "meta-llama/Llama-3.1-8B-Instruct-Turbo",
+        ),
+        (
+            "Google Gemini",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-1.5-flash",
+        ),
+    ]
+}
+
+/// Path to the on-device BYOK config (`$XDG_CONFIG_HOME` or `~/.config`).
+pub fn cloud_config_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(dir.join("genesi-code").join("cloud.json"))
+}
+
+/// Load the saved cloud provider, if any.
+pub fn load_cloud_config() -> Option<CloudConfig> {
+    let path = cloud_config_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Persist the cloud provider to disk (creating the config directory).
+pub fn save_cloud_config(cfg: &CloudConfig) -> Result<()> {
+    let path = cloud_config_path().ok_or_else(|| anyhow!("no config directory (HOME unset)"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| anyhow!("failed to create config dir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(cfg)
+        .map_err(|e| anyhow!("failed to serialize config: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| anyhow!("failed to write cloud config: {e}"))?;
+    Ok(())
 }

@@ -589,6 +589,18 @@ pub fn init(ctx: &mut AppContext) {
         )
         .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
         .with_key_binding("ctrl-u"),
+        // Plain ctrl-c / ctrl-v copy & paste for TEXT editors (the AI chat input,
+        // code editor, modals) — NOT the terminal command line (`!id!("Input")`),
+        // which keeps ctrl-c = interrupt / clear. Warp's terminal heritage only
+        // bound copy to ctrl-shift-c and paste to ctrl-shift-v, so a normal
+        // ctrl-c in the chat input did nothing useful; these add the desktop
+        // convention on Linux/Windows (Mac already copies/pastes via cmd-c/v).
+        EditableBinding::new("editor_view:copy", "Copy", EditorAction::Copy)
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen") & !id!("Input"))
+            .with_linux_or_windows_key_binding("ctrl-c"),
+        EditableBinding::new("editor_view:paste", "Paste", EditorAction::Paste)
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen") & !id!("Input"))
+            .with_linux_or_windows_key_binding("ctrl-v"),
         EditableBinding::new(
             "editor_view:add_next_occurrence",
             "Add selection for next occurrence",
