@@ -114,6 +114,9 @@ struct ChatEntry {
     collapsed: bool,
     /// Status used to pick the step's icon/color.
     status: StepStatus,
+    /// For a file write/edit Tool step: `(added, removed)` line counts, rendered
+    /// as a `+N −N` diff card. `None` for every other step.
+    diff_stat: Option<(u32, u32)>,
 }
 
 impl ChatEntry {
@@ -127,7 +130,30 @@ impl ChatEntry {
             command: None,
             collapsed: false,
             status: StepStatus::Ok,
+            diff_stat: None,
         }
+    }
+}
+
+/// A file the agent created or edited this turn, tracked so the review bar can
+/// summarize the changes and undo them (restore the captured original, or delete
+/// a file that didn't exist before).
+struct PendingEdit {
+    /// Project-relative path.
+    path: String,
+    added: u32,
+    removed: u32,
+    /// The file's content before the edit, or `None` if the file was created.
+    original: Option<String>,
+}
+
+/// Count lines for a diff stat: 0 for empty, else the number of lines (a
+/// trailing newline doesn't add a phantom empty line).
+fn count_lines(s: &str) -> u32 {
+    if s.is_empty() {
+        0
+    } else {
+        s.lines().count() as u32
     }
 }
 
@@ -167,6 +193,10 @@ pub enum LocalAiChatAction {
     PickModel(usize),
     /// Turn the Turbo (full-GPU) endpoint on or off.
     ToggleTurbo,
+    /// Accept the agent's file changes and dismiss the review bar.
+    KeepEdits,
+    /// Undo the agent's file changes (restore each captured original).
+    UndoEdits,
     /// Approve the pending side-effecting tool and run it.
     ApproveTool,
     /// Deny the pending side-effecting tool.
@@ -244,6 +274,10 @@ pub struct LocalAiChatView {
     /// Whether the click-to-open AI model picker (the popup above the compose
     /// box) is currently expanded.
     model_picker_open: bool,
+
+    /// Files the agent created/edited this turn, for the review bar (Undo all /
+    /// Keep) — each carries its captured pre-edit original so Undo can restore it.
+    pending_edits: Vec<PendingEdit>,
 }
 
 impl LocalAiChatView {
@@ -283,6 +317,7 @@ impl LocalAiChatView {
             cloud_active: false,
             input_mode: InputMode::Chat,
             model_picker_open: false,
+            pending_edits: Vec::new(),
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -613,6 +648,7 @@ impl LocalAiChatView {
             command: None,
             collapsed: false,
             status: StepStatus::Running,
+            diff_stat: None,
         });
         let turn = self.current_turn;
         let stream = self.build_stream(&self.agent_model, self.agent_messages.clone());
@@ -744,6 +780,49 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    /// Snapshot a write/edit *before* it runs: `(path, added, removed,
+    /// original_content)`. Returns `None` for read tools. Best-effort — the line
+    /// stats drive the `+N −N` diff card, the original drives Undo.
+    fn capture_edit(&self, tool: &AgentTool) -> Option<(String, u32, u32, Option<String>)> {
+        let root = self.agent_root.as_ref()?;
+        let read_original = |path: &str| {
+            local_agent::resolve_in_project(root, path).and_then(|p| std::fs::read_to_string(p).ok())
+        };
+        match tool {
+            AgentTool::WriteFile { path, content } => {
+                let original = read_original(path);
+                let removed = original.as_deref().map(count_lines).unwrap_or(0);
+                Some((path.clone(), count_lines(content), removed, original))
+            }
+            AgentTool::EditFile {
+                path,
+                search,
+                replace,
+            } => {
+                let original = read_original(path);
+                Some((path.clone(), count_lines(replace), count_lines(search), original))
+            }
+            _ => None,
+        }
+    }
+
+    /// Record a successful edit for the review bar. Re-editing the same file keeps
+    /// the EARLIEST original (so Undo restores the pre-turn state) and refreshes
+    /// the displayed stats.
+    fn record_edit(&mut self, path: String, added: u32, removed: u32, original: Option<String>) {
+        if let Some(existing) = self.pending_edits.iter_mut().find(|e| e.path == path) {
+            existing.added = added;
+            existing.removed = removed;
+        } else {
+            self.pending_edits.push(PendingEdit {
+                path,
+                added,
+                removed,
+                original,
+            });
+        }
+    }
+
     /// Begin running an (already-approved) tool: reads run inline; run_command
     /// spawns. The loop continues in [`Self::finish_tool`].
     fn start_tool(&mut self, tool: AgentTool, ctx: &mut ViewContext<Self>) {
@@ -763,6 +842,7 @@ impl LocalAiChatView {
                     command: Some(command.clone()),
                     collapsed: false,
                     status: StepStatus::Running,
+                    diff_stat: None,
                 });
                 self.scroll_to_bottom();
                 ctx.notify();
@@ -780,21 +860,37 @@ impl LocalAiChatView {
                 );
             }
             _ => {
+                // For a write/edit, snapshot the file first so we can show a
+                // `+N −N` diff card and later undo it. Reads return None here.
+                let edit_meta = self.capture_edit(&tool);
+                let (title, diff_stat) = match &edit_meta {
+                    Some((path, added, removed, _)) => {
+                        (path.clone(), Some((*added, *removed)))
+                    }
+                    None => (self.agent_tool_summary.clone(), None),
+                };
                 // A read tool: collapsed by default, showing just its one-line
-                // summary; the result is one click away.
+                // summary; an edit shows the file card. The detail is one click away.
                 self.messages.push(ChatEntry {
                     role: ChatRole::Tool,
                     text: String::new(),
                     context_label: None,
-                    tool_title: Some(self.agent_tool_summary.clone()),
+                    tool_title: Some(title),
                     command: None,
                     collapsed: true,
                     status: StepStatus::Running,
+                    diff_stat,
                 });
                 let result = match self.agent_root.clone() {
                     Some(root) => local_agent::run_local_tool(&root, &tool),
                     None => "error: no project is open, so I can't read files.".to_string(),
                 };
+                // Record a successful edit for the review bar (Undo all / Keep).
+                if let Some((path, added, removed, original)) = edit_meta {
+                    if !result.trim_start().starts_with("error") {
+                        self.record_edit(path, added, removed, original);
+                    }
+                }
                 self.finish_tool(turn, tool.name(), result, ctx);
             }
         }
@@ -1317,6 +1413,61 @@ impl LocalAiChatView {
             .finish()
     }
 
+    /// The review bar: a summary of the file changes the agent has made this
+    /// turn, with "Undo all" / "Keep" — like the reference's "N files need
+    /// review". Sits just above the compose box; `None` when nothing's pending.
+    fn render_review_bar(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
+        if self.pending_edits.is_empty() {
+            return None;
+        }
+        let theme = appearance.theme();
+        let n = self.pending_edits.len();
+        let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
+        let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
+        let label = format!(
+            "✎ {n} file{} changed   +{added} −{removed}",
+            if n == 1 { "" } else { "s" }
+        );
+
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(self.label_text(
+                appearance,
+                label,
+                CHIP_FONT_SIZE,
+                theme.main_text_color(theme.background()).into(),
+                false,
+            ))
+            .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
+            .with_child(self.chip(
+                appearance,
+                "Undo all".to_string(),
+                LocalAiChatAction::UndoEdits,
+                false,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "Keep".to_string(),
+                LocalAiChatAction::KeepEdits,
+                true,
+            ))
+            .finish();
+
+        let bar = Container::new(row)
+            .with_uniform_padding(8.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_background(theme.surface_2())
+            .finish();
+        Some(
+            Container::new(bar)
+                .with_horizontal_padding(PANEL_PADDING)
+                .with_padding_bottom(4.)
+                .finish(),
+        )
+    }
+
     /// The approval prompt shown while a side-effecting tool waits for the user.
     fn render_approval(&self, appearance: &Appearance, tool: &AgentTool) -> Box<dyn Element> {
         let theme = appearance.theme();
@@ -1567,14 +1718,66 @@ impl LocalAiChatView {
             StepStatus::Denied => " · denied",
             StepStatus::Ok => "",
         };
-        let title = format!(
-            "{icon} {}{suffix}",
-            entry.tool_title.clone().unwrap_or_default()
-        );
+        let path = entry.tool_title.clone().unwrap_or_default();
+        let header: Box<dyn Element> = if let Some((added, removed)) = entry.diff_stat {
+            // A file write/edit renders as an IDE-style diff card: `✏ path  +A −R`
+            // with the count of added (green) and removed (red) lines, clickable
+            // to expand the result. Mirrors the reference "file.name +N -0".
+            let caret = if entry.collapsed { "▸" } else { "▾" };
+            let green: ColorU = genesi_green();
+            let red: ColorU = theme.ui_error_color().into();
+            let row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(self.label_text(
+                    appearance,
+                    format!("{caret} ✏ {path}{suffix}"),
+                    CHIP_FONT_SIZE,
+                    color,
+                    false,
+                ))
+                .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        format!("+{added}"),
+                        CHIP_FONT_SIZE,
+                        green,
+                        false,
+                    ))
+                    .with_margin_right(6.)
+                    .finish(),
+                )
+                .with_child(self.label_text(
+                    appearance,
+                    format!("−{removed}"),
+                    CHIP_FONT_SIZE,
+                    red,
+                    false,
+                ))
+                .finish();
+            EventHandler::new(
+                Container::new(row)
+                    .with_horizontal_padding(8.)
+                    .with_vertical_padding(6.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .with_background(theme.surface_2())
+                    .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LocalAiChatAction::ToggleCollapse(index));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        } else {
+            let title = format!("{icon} {path}{suffix}");
+            self.step_header(appearance, index, title, color, entry.collapsed)
+        };
 
         let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.step_header(appearance, index, title, color, entry.collapsed));
+            .with_child(header);
 
         if !entry.collapsed && !entry.text.trim().is_empty() {
             let body = Container::new(self.mono_text(
@@ -1852,6 +2055,7 @@ impl TypedActionView for LocalAiChatView {
                 self.messages.clear();
                 self.error = None;
                 self.pending_tool = None;
+                self.pending_edits.clear();
                 ctx.notify();
             }
             LocalAiChatAction::ToggleAttachContext => {
@@ -1906,6 +2110,32 @@ impl TypedActionView for LocalAiChatView {
                 self.refresh_models(ctx);
                 ctx.notify();
             }
+            LocalAiChatAction::KeepEdits => {
+                self.pending_edits.clear();
+                ctx.notify();
+            }
+            LocalAiChatAction::UndoEdits => {
+                // Restore each captured original (or delete a file the agent
+                // created), inside the project root only.
+                let edits = std::mem::take(&mut self.pending_edits);
+                if let Some(root) = self.agent_root.clone() {
+                    for edit in edits {
+                        let Some(path) = local_agent::resolve_in_project(&root, &edit.path) else {
+                            continue;
+                        };
+                        match edit.original {
+                            Some(content) => {
+                                let _ = std::fs::write(&path, content);
+                            }
+                            None => {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+                self.error = None;
+                ctx.notify();
+            }
             LocalAiChatAction::ApproveTool => {
                 if let Some(tool) = self.pending_tool.take() {
                     self.start_tool(tool, ctx);
@@ -1929,6 +2159,7 @@ impl TypedActionView for LocalAiChatView {
                         },
                         collapsed: false,
                         status: StepStatus::Denied,
+                        diff_stat: None,
                     };
                     self.messages.push(denied);
                     // Tell the model the user declined so it can adapt or answer.
@@ -1997,6 +2228,12 @@ impl View for LocalAiChatView {
         // A pending command waits for the user's Allow/Deny above the input.
         if let Some(tool) = &self.pending_tool {
             root.add_child(self.render_approval(appearance, tool));
+        }
+
+        // Review bar: a summary of the agent's file changes with Undo all / Keep,
+        // sitting just above the compose box (the reference's "N files need review").
+        if let Some(bar) = self.render_review_bar(appearance) {
+            root.add_child(bar);
         }
 
         // AI model picker popup — opens ABOVE the compose box (IDE-style): the

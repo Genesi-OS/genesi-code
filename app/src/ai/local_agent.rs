@@ -551,6 +551,14 @@ fn format_command_output(output: &std::process::Output) -> String {
 /// Resolve a project-relative path inside `root`, refusing to escape it (no
 /// `..` traversal out of the project). Purely lexical so it works for paths that
 /// don't exist yet.
+/// Public, safety-preserving path resolver for callers outside this module (the
+/// chat panel snapshots a file before an edit and restores it on Undo, and must
+/// never read or write outside the project root). Thin wrapper over
+/// [`safe_resolve`].
+pub fn resolve_in_project(root: &Path, rel: &str) -> Option<PathBuf> {
+    safe_resolve(root, rel)
+}
+
 fn safe_resolve(root: &Path, rel: &str) -> Option<PathBuf> {
     let rel = rel.trim().trim_start_matches(['/', '\\']);
     let joined = root.join(rel);
