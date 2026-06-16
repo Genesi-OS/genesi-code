@@ -69,6 +69,14 @@ fn genesi_panel_surface() -> ColorU {
     ColorU::new(20, 21, 23, 245)
 }
 
+fn genesi_card_surface() -> ColorU {
+    ColorU::new(31, 32, 35, 245)
+}
+
+fn genesi_subtle_border() -> ColorU {
+    ColorU::new(255, 255, 255, 24)
+}
+
 fn truncate_middle(value: &str, max_chars: usize) -> String {
     let len = value.chars().count();
     if len <= max_chars {
@@ -193,6 +201,8 @@ fn count_lines(s: &str) -> u32 {
 pub enum LocalAiChatEvent {
     /// Close the panel.
     ClosePanel,
+    /// Open the app's native code review / diff panel for the active repo.
+    OpenDiff,
     /// The user submitted a prompt; the workspace attaches fresh file context
     /// and calls back into [`LocalAiChatView::send_with_context`]. Routing this
     /// through the workspace is what gives the panel workspace awareness.
@@ -229,6 +239,8 @@ pub enum LocalAiChatAction {
     KeepEdits,
     /// Undo the agent's file changes (restore each captured original).
     UndoEdits,
+    /// Open the native diff / code review panel.
+    OpenDiff,
     /// Approve the pending side-effecting tool and run it.
     ApproveTool,
     /// Deny the pending side-effecting tool.
@@ -1309,9 +1321,9 @@ impl LocalAiChatView {
         let text_color: ColorU = theme.active_ui_text_color().into();
         let mut label = label;
         if open {
-            label.push_str(" ^");
+            label.push_str("  ^");
         } else {
-            label.push_str(" v");
+            label.push_str("  v");
         }
         let container =
             Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
@@ -1466,10 +1478,7 @@ impl LocalAiChatView {
         let n = self.pending_edits.len();
         let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
         let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
-        let label = format!(
-            "{n} file{} need review   +{added} -{removed}",
-            if n == 1 { "" } else { "s" }
-        );
+        let label = format!("{n} file{} need review", if n == 1 { "" } else { "s" });
 
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1479,6 +1488,25 @@ impl LocalAiChatView {
                 label,
                 CHIP_FONT_SIZE,
                 theme.main_text_color(theme.background()).into(),
+                false,
+            ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    format!("+{added}"),
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
+                .with_margin_left(10.)
+                .with_margin_right(4.)
+                .finish(),
+            )
+            .with_child(self.label_text(
+                appearance,
+                format!("-{removed}"),
+                CHIP_FONT_SIZE,
+                theme.ui_error_color().into(),
                 false,
             ))
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
@@ -1499,7 +1527,7 @@ impl LocalAiChatView {
         let bar = Container::new(row)
             .with_uniform_padding(8.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
             .with_background_color(genesi_panel_surface())
             .finish();
         Some(
@@ -1595,7 +1623,7 @@ impl LocalAiChatView {
         color: ColorU,
         collapsed: bool,
     ) -> Box<dyn Element> {
-        let caret = if collapsed { "▸" } else { "▾" };
+        let caret = if collapsed { ">" } else { "v" };
         let row = Container::new(self.label_text(
             appearance,
             format!("{caret} {title}"),
@@ -1613,28 +1641,27 @@ impl LocalAiChatView {
             })
             .finish()
     }
-
     /// A user or assistant message bubble (assistant text rendered as markdown).
     fn render_bubble(&self, appearance: &Appearance, entry: &ChatEntry) -> Box<dyn Element> {
         let theme = appearance.theme();
         let is_user = entry.role == ChatRole::User;
-        // A small "●" dot before the name reads as a tiny avatar — green for the
-        // user, neutral for the assistant.
         let (prefix, role_color): (&str, ColorU) = if is_user {
-            ("●  You", genesi_green())
+            ("You", theme.disabled_text_color(theme.background()).into())
         } else {
-            ("●  Genesi AI", theme.active_ui_text_color().into())
+            (
+                "Genesi AI",
+                theme.disabled_text_color(theme.background()).into(),
+            )
         };
 
         let mut inner = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(self.label_text(appearance, prefix, CHIP_FONT_SIZE, role_color, false));
 
-        // Show the attached file context (if any) as a small left-aligned pill.
         if let Some(label) = &entry.context_label {
             let pill = Container::new(self.label_text(
                 appearance,
-                format!("📎 {label}"),
+                format!("Attach: {label}"),
                 CHIP_FONT_SIZE,
                 theme.disabled_text_color(theme.background()).into(),
                 false,
@@ -1642,7 +1669,7 @@ impl LocalAiChatView {
             .with_horizontal_padding(6.)
             .with_vertical_padding(2.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
             .with_background_color(ColorU::new(0, 0, 0, 0))
             .finish();
 
@@ -1661,8 +1688,7 @@ impl LocalAiChatView {
 
         let body_color = theme.main_text_color(theme.background()).into();
         let body_el: Box<dyn Element> = if entry.text.trim().is_empty() {
-            // Streaming placeholder before the first token lands.
-            let dots = if self.in_flight { "…" } else { "" };
+            let dots = if self.in_flight { "..." } else { "" };
             self.label_text(appearance, dots, BODY_FONT_SIZE, body_color, true)
         } else if entry.role == ChatRole::Assistant {
             self.markdown_text(appearance, &entry.text, body_color)
@@ -1681,23 +1707,19 @@ impl LocalAiChatView {
             .finish();
 
         let bubble = Container::new(inner)
-            .with_uniform_padding(11.)
-            .with_margin_bottom(9.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)));
-        // The user's turns read as a soft Genesi-green card with a green left
-        // accent; the assistant's sit on the calmer surface.
+            .with_margin_bottom(10.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)));
         let bubble = if is_user {
             bubble
-                .with_background_color(green_tint())
-                .with_border(Border::left(3.).with_border_color(genesi_green()))
+                .with_uniform_padding(10.)
+                .with_background_color(genesi_card_surface())
+                .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
         } else {
-            bubble.with_background(theme.surface_1())
+            bubble.with_vertical_padding(2.)
         };
         bubble.finish()
     }
-
-    /// A collapsible "💭 Thought" — the model's reasoning for a step, kept out of
-    /// the way so the transcript stays clean.
+    /// A collapsible thought, kept out of the way so the transcript stays clean.
     fn render_thought(
         &self,
         appearance: &Appearance,
@@ -1707,9 +1729,9 @@ impl LocalAiChatView {
         let theme = appearance.theme();
         let muted: ColorU = theme.disabled_text_color(theme.background()).into();
         let title = if entry.status == StepStatus::Running {
-            "💭 Thinking…".to_string()
+            "Thinking...".to_string()
         } else {
-            "💭 Thought".to_string()
+            "Thought".to_string()
         };
 
         let mut column = Flex::column()
@@ -1735,7 +1757,6 @@ impl LocalAiChatView {
             .with_margin_bottom(6.)
             .finish()
     }
-
     /// A collapsible read-tool step: a one-line summary with the (previewed)
     /// result one click away.
     fn render_tool_step(
@@ -1747,23 +1768,20 @@ impl LocalAiChatView {
         let theme = appearance.theme();
         let muted: ColorU = theme.disabled_text_color(theme.background()).into();
         let (icon, color): (&str, ColorU) = match entry.status {
-            StepStatus::Running => ("📄", muted),
-            StepStatus::Ok => ("📄", genesi_green()),
-            StepStatus::Error => ("⚠", theme.ui_error_color().into()),
-            StepStatus::Denied => ("🚫", muted),
+            StepStatus::Running => ("file", muted),
+            StepStatus::Ok => ("file", theme.main_text_color(theme.background()).into()),
+            StepStatus::Error => ("error", theme.ui_error_color().into()),
+            StepStatus::Denied => ("denied", muted),
         };
         let suffix = match entry.status {
-            StepStatus::Running => " · running…",
-            StepStatus::Error => " · error",
-            StepStatus::Denied => " · denied",
+            StepStatus::Running => " - running...",
+            StepStatus::Error => " - error",
+            StepStatus::Denied => " - denied",
             StepStatus::Ok => "",
         };
         let path = entry.tool_title.clone().unwrap_or_default();
         let header: Box<dyn Element> = if let Some((added, removed)) = entry.diff_stat {
-            // A file write/edit renders as an IDE-style diff card: `✏ path  +A −R`
-            // with the count of added (green) and removed (red) lines, clickable
-            // to expand the result. Mirrors the reference "file.name +N -0".
-            let caret = if entry.collapsed { "▸" } else { "▾" };
+            let caret = if entry.collapsed { ">" } else { "v" };
             let green: ColorU = genesi_green();
             let red: ColorU = theme.ui_error_color().into();
             let row = Flex::row()
@@ -1771,7 +1789,7 @@ impl LocalAiChatView {
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_child(self.label_text(
                     appearance,
-                    format!("{caret} ✏ {path}{suffix}"),
+                    format!("{caret} {path}{suffix}"),
                     CHIP_FONT_SIZE,
                     color,
                     false,
@@ -1790,19 +1808,29 @@ impl LocalAiChatView {
                 )
                 .with_child(self.label_text(
                     appearance,
-                    format!("−{removed}"),
+                    format!("-{removed}"),
                     CHIP_FONT_SIZE,
                     red,
                     false,
                 ))
+                .with_child(
+                    Container::new(self.chip(
+                        appearance,
+                        "Open Diff".to_string(),
+                        LocalAiChatAction::OpenDiff,
+                        false,
+                    ))
+                    .with_margin_left(8.)
+                    .finish(),
+                )
                 .finish();
             EventHandler::new(
                 Container::new(row)
                     .with_horizontal_padding(8.)
                     .with_vertical_padding(6.)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
-                    .with_background_color(ColorU::new(0, 0, 0, 0))
+                    .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+                    .with_background_color(genesi_card_surface())
                     .finish(),
             )
             .on_left_mouse_down(move |ctx, _, _| {
@@ -1811,7 +1839,7 @@ impl LocalAiChatView {
             })
             .finish()
         } else {
-            let title = format!("{icon} {path}{suffix}");
+            let title = format!("{icon}: {path}{suffix}");
             self.step_header(appearance, index, title, color, entry.collapsed)
         };
 
@@ -1830,8 +1858,8 @@ impl LocalAiChatView {
             .with_uniform_padding(8.)
             .with_margin_top(2.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_1())
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_background_color(genesi_card_surface())
             .finish();
             column.add_child(body);
         }
@@ -1840,7 +1868,6 @@ impl LocalAiChatView {
             .with_margin_bottom(6.)
             .finish()
     }
-
     /// A `run_command` step, rendered like the app's integrated terminal: a dark
     /// block with a green `$ command` prompt and the captured output beneath.
     fn render_command_step(
@@ -2175,6 +2202,9 @@ impl TypedActionView for LocalAiChatView {
                 }
                 self.error = None;
                 ctx.notify();
+            }
+            LocalAiChatAction::OpenDiff => {
+                ctx.emit(LocalAiChatEvent::OpenDiff);
             }
             LocalAiChatAction::ApproveTool => {
                 if let Some(tool) = self.pending_tool.take() {

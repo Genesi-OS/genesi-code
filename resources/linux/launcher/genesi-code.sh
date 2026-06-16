@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-~/.config}
+set -e
 
-# Allow users to override command-line options
-if [[ -f $XDG_CONFIG_HOME/warp-terminal@@CHANNEL_SUFFIX@@-flags.conf ]]; then
-    WARP_USER_FLAGS="$(grep -v '^#' $XDG_CONFIG_HOME/warp-terminal@@CHANNEL_SUFFIX@@-flags.conf)"
-fi
+resolve_self() {
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "$0" 2>/dev/null && return
+    fi
+    realpath "$0"
+}
 
 is_virtual_machine() {
     if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; then
@@ -24,10 +26,20 @@ is_virtual_machine() {
     return 1
 }
 
+APP_PATH="$(resolve_self)"
+APP_DIR="$(dirname "$APP_PATH")"
+APP_NAME="$(basename "$APP_PATH")"
+BIN_PATH="${APP_DIR}/${APP_NAME}.bin"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+USER_FLAGS=""
+
+if [[ -f "$XDG_CONFIG_HOME/${APP_NAME}-flags.conf" ]]; then
+    USER_FLAGS="$(grep -v '^#' "$XDG_CONFIG_HOME/${APP_NAME}-flags.conf" || true)"
+fi
+
 if [[ -z "${GENESI_CODE_DISABLE_VM_GL_FALLBACK:-}" ]] && is_virtual_machine; then
     export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
     export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 fi
 
-# Launch
-exec /opt/warpdotdev/warp-terminal@@CHANNEL_SUFFIX@@/@@BINARY_NAME@@ $WARP_USER_FLAGS "$@"
+exec "$BIN_PATH" $USER_FLAGS "$@"

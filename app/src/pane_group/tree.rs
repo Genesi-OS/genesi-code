@@ -1,14 +1,15 @@
 use std::collections::HashSet;
 use std::{fmt, iter, mem};
 
+use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use warp_core::features::FeatureFlag;
 use warpui::elements::{
-    ChildAnchor, ConstrainedBox, Container, DispatchEventResult, Element, Empty, EventHandler,
-    Flex, Hoverable, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Rect, SavePosition,
-    Shrinkable, Stack,
+    Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, DispatchEventResult, Element,
+    Empty, EventHandler, Flex, Hoverable, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
+    Radius, Rect, SavePosition, Shrinkable, Stack,
 };
 use warpui::platform::Cursor;
 use warpui::{AppContext, EntityId, ViewContext};
@@ -31,6 +32,18 @@ pub fn get_divider_thickness() -> f32 {
     } else {
         8.0
     }
+}
+
+fn genesi_pane_surface() -> ColorU {
+    ColorU::new(22, 23, 25, 255)
+}
+
+fn wrap_leaf_pane(contents: Box<dyn Element>, theme: &WarpTheme) -> Box<dyn Element> {
+    Container::new(contents)
+        .with_background_color(genesi_pane_surface())
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
 }
 
 // Extra padding for the divider to make it easier to resize.
@@ -1087,9 +1100,15 @@ impl PaneBranch {
                 }
             }
 
-            parent.add_child(
-                Shrinkable::new(flex_value, node.render(theme, hidden_panes, app)).finish(),
-            );
+            let rendered = node.render(theme, hidden_panes, app);
+            let rendered = match node {
+                PaneNode::Leaf(id) if !pane_hidden_for_move(hidden_panes, id) => {
+                    wrap_leaf_pane(rendered, theme)
+                }
+                _ => rendered,
+            };
+
+            parent.add_child(Shrinkable::new(flex_value, rendered).finish());
             if let Some(divider) = dividers.next() {
                 if matches!(node, PaneNode::Leaf(id) if pane_hidden_for_move(hidden_panes, id)) {
                     continue;

@@ -29,9 +29,11 @@ if [[ ! -z "$(ls -A "$TARGET_DIR")" ]]; then
   exit 1
 fi
 
-# Copy files to the desired output locations within the target dir, stripping
-# debugging symbols from the installed binaries.
-install -D "$EXECUTABLE_PATH" "${TARGET_DIR}${OPT_DIR}/$BINARY_NAME"
+# Copy files to the desired output locations within the target dir. The app
+# entrypoint is a tiny launcher so VMs can fall back to GL/software rendering
+# before wgpu starts.
+install -D "$EXECUTABLE_PATH" "${TARGET_DIR}${OPT_DIR}/$BINARY_NAME.bin"
+install -Dm755 "$WORKSPACE_ROOT_DIR/resources/linux/launcher/genesi-code.sh" "${TARGET_DIR}${OPT_DIR}/$BINARY_NAME"
 # Only install desktop file and icons if the artifact is "app"
 if [[ "$ARTIFACT" == "app" ]]; then
   install -Dm644 "$WORKSPACE_ROOT_DIR/app/channels/$RELEASE_CHANNEL/$BUNDLE_ID.desktop" "${TARGET_DIR}/usr/share/applications/$BUNDLE_ID.desktop"

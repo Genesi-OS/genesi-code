@@ -85,12 +85,12 @@ use warpui::clipboard::ClipboardContent;
 use warpui::elements::Percentage;
 use warpui::elements::{
     Align, Border, CacheOption, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, DragAxis, Draggable,
-    DraggableState, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill, Flex,
-    Highlight, Hoverable, Icon as WarpUiIcon, Image, MainAxisAlignment, MainAxisSize,
-    MouseInBehavior, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Rect,
-    SavePosition, Shrinkable, Stack, Text,
+    CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, DragAxis, DragBarSide,
+    Draggable, DraggableState, DropTarget, Element, Empty, EventHandler, Expanded,
+    Fill as ElementFill, Flex, Highlight, Hoverable, Icon as WarpUiIcon, Image, MainAxisAlignment,
+    MainAxisSize, MouseInBehavior, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
+    Radius, Rect, Resizable, SavePosition, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::{vec2f, Vector2F};
@@ -675,7 +675,7 @@ fn genesi_shell_panel_surface() -> ColorU {
 }
 
 fn genesi_shell_editor_surface() -> ColorU {
-    ColorU::new(18, 19, 21, 255)
+    ColorU::new(22, 23, 25, 255)
 }
 
 fn genesi_shell_panel_border() -> ColorU {
@@ -4703,6 +4703,16 @@ impl Workspace {
             LocalAiChatEvent::ClosePanel => {
                 self.current_workspace_state.is_local_ai_panel_open = false;
                 self.focus_active_tab(ctx);
+                ctx.notify();
+            }
+            #[cfg(feature = "local_fs")]
+            LocalAiChatEvent::OpenDiff => {
+                self.current_workspace_state.is_local_ai_panel_open = false;
+                self.setup_code_review_panel(None, ctx);
+                ctx.notify();
+            }
+            #[cfg(not(feature = "local_fs"))]
+            LocalAiChatEvent::OpenDiff => {
                 ctx.notify();
             }
             LocalAiChatEvent::SubmitPrompt(text) => {
@@ -21901,8 +21911,31 @@ impl Workspace {
         Container::new(contents)
             .with_background_color(genesi_shell_editor_surface())
             .with_corner_radius(genesi_shell_panel_radius())
-            .with_uniform_padding(4.)
+            .with_uniform_padding(5.)
             .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
+            .finish()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn render_resizable_local_ai_panel(
+        &self,
+        app: &AppContext,
+        panel: Box<dyn Element>,
+    ) -> Box<dyn Element> {
+        let resizable_data = ResizableData::handle(app);
+        let Some(handle) = resizable_data
+            .as_ref(app)
+            .get_handle(self.window_id, ModalType::RightPanelWidth)
+        else {
+            return panel;
+        };
+
+        Resizable::new(handle, panel)
+            .with_dragbar_side(DragBarSide::Left)
+            .with_bounds_callback(Box::new(|_| {
+                (LOCAL_AI_PANEL_MIN_WIDTH, LOCAL_AI_PANEL_MAX_WIDTH)
+            }))
+            .on_resize(|ctx, _| ctx.notify())
             .finish()
     }
 
@@ -22048,16 +22081,12 @@ impl Workspace {
                     &PanelPosition::Right,
                 ))
             } else if self.current_workspace_state.is_local_ai_panel_open {
-                Some(
-                    self.render_panel(
-                        app,
-                        ConstrainedBox::new(ChildView::new(&self.local_ai_panel).finish())
-                            .with_min_width(LOCAL_AI_PANEL_MIN_WIDTH)
-                            .with_max_width(LOCAL_AI_PANEL_MAX_WIDTH)
-                            .finish(),
-                        &PanelPosition::Right,
-                    ),
-                )
+                let panel = self.render_panel(
+                    app,
+                    ChildView::new(&self.local_ai_panel).finish(),
+                    &PanelPosition::Right,
+                );
+                Some(self.render_resizable_local_ai_panel(app, panel))
             } else {
                 log::warn!(
                     "is_right_panel_open() returned true, but neither the resource center nor AI \
