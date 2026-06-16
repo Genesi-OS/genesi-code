@@ -554,6 +554,8 @@ const LOCAL_AI_PANEL_WIDTH: f32 = 380.;
 
 // Ratio of terminal : theme chooser when theme chooser is active
 const THEME_CHOOSER_RATIO: f32 = 3.5;
+const GENESI_SHELL_PANEL_GAP: f32 = 6.0;
+const GENESI_SHELL_PANEL_RADIUS: f32 = 8.0;
 
 /// Save position for the tab bar.
 pub(crate) const TAB_BAR_POSITION_ID: &str = "workspace_view:tab_bar";
@@ -664,6 +666,18 @@ lazy_static! {
     static ref PANEL_CORNER_RADIUS: CornerRadius = CornerRadius::with_all(Radius::Pixels(8.));
     static ref PANEL_HEADER_CORNER_RADIUS: CornerRadius =
         CornerRadius::with_top(Radius::Pixels(8.));
+}
+
+fn genesi_shell_panel_radius() -> CornerRadius {
+    CornerRadius::with_all(Radius::Pixels(GENESI_SHELL_PANEL_RADIUS))
+}
+
+fn genesi_shell_panel_surface() -> ColorU {
+    ColorU::new(18, 19, 21, 255)
+}
+
+fn genesi_shell_panel_border() -> ColorU {
+    ColorU::new(255, 255, 255, 34)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21853,32 +21867,46 @@ impl Workspace {
         }
         col.add_child(Shrinkable::new(1.0, contents).finish());
 
-        self.wrap_in_panel_surface(appearance, side, col.finish(), *PANEL_CORNER_RADIUS)
+        self.wrap_in_panel_surface(appearance, side, col.finish(), genesi_shell_panel_radius())
     }
 
     fn wrap_in_panel_surface(
         &self,
-        appearance: &Appearance,
+        _appearance: &Appearance,
         side: &PanelPosition,
         contents: Box<dyn Element>,
         corner_radius: CornerRadius,
     ) -> Box<dyn Element> {
         let mut container = Container::new(contents)
-            .with_background_color(ColorU::new(19, 20, 22, 245))
+            .with_background_color(genesi_shell_panel_surface())
             .with_corner_radius(corner_radius)
-            .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()));
+            .with_uniform_padding(1.)
+            .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()));
 
         match side {
-            PanelPosition::Left => container = container.with_margin_right(6.0),
-            PanelPosition::Right => container = container.with_margin_left(6.0),
+            PanelPosition::Left => container = container.with_margin_right(GENESI_SHELL_PANEL_GAP),
+            PanelPosition::Right => container = container.with_margin_left(GENESI_SHELL_PANEL_GAP),
         };
 
         container.finish()
     }
 
+    fn wrap_in_main_surface(
+        &self,
+        _appearance: &Appearance,
+        contents: Box<dyn Element>,
+    ) -> Box<dyn Element> {
+        Container::new(contents)
+            .with_background_color(ColorU::new(5, 6, 7, 255))
+            .with_corner_radius(genesi_shell_panel_radius())
+            .with_uniform_padding(1.)
+            .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
+            .finish()
+    }
+
     fn render_panel_separator(_app: &AppContext) -> Box<dyn Element> {
         ConstrainedBox::new(Empty::new().finish())
-            .with_width(6.0)
+            .with_width(GENESI_SHELL_PANEL_GAP)
             .finish()
     }
 
@@ -21903,6 +21931,7 @@ impl Workspace {
         terminal_view: Box<dyn Element>,
         hide_vertical_tabs: bool,
     ) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
         let mut panels_view = Flex::row();
         let mut prev_panel_added = false;
 
@@ -21952,7 +21981,9 @@ impl Workspace {
         }
         // The outer workspace container in `render` already paints the terminal
         // background fill, so don't paint it again here (see APP-4328).
-        panels_view = panels_view.with_child(Shrinkable::new(1.0, terminal_view).finish());
+        panels_view = panels_view.with_child(
+            Shrinkable::new(1.0, self.wrap_in_main_surface(appearance, terminal_view)).finish(),
+        );
         prev_panel_added = true;
 
         if vertical_tabs_active {
@@ -22070,24 +22101,31 @@ impl Workspace {
         if !item.is_supported(app) || !item.is_panel() {
             return None;
         }
-        match item {
+        let appearance = Appearance::as_ref(app);
+        let side = match item {
+            HeaderToolbarItemKind::TabsPanel => Self::tabs_panel_side(config),
+            HeaderToolbarItemKind::ToolsPanel => PanelPosition::Left,
+            HeaderToolbarItemKind::CodeReview => PanelPosition::Right,
+            HeaderToolbarItemKind::AgentManagement
+            | HeaderToolbarItemKind::NotificationsMailbox => PanelPosition::Left,
+        };
+
+        let contents = match item {
             HeaderToolbarItemKind::TabsPanel => {
                 if !self.vertical_tabs_panel_open {
                     return None;
                 }
-                Some(
-                    SavePosition::new(
-                        self.render_vertical_tabs_panel(Self::tabs_panel_side(config), app),
-                        VERTICAL_TABS_PANEL_POSITION_ID,
-                    )
-                    .finish(),
+                SavePosition::new(
+                    self.render_vertical_tabs_panel(Self::tabs_panel_side(config), app),
+                    VERTICAL_TABS_PANEL_POSITION_ID,
                 )
+                .finish()
             }
             HeaderToolbarItemKind::ToolsPanel => {
                 if !pane_group.left_panel_open || warpui::platform::is_mobile_device() {
                     return None;
                 }
-                Some(ChildView::new(&self.left_panel_view).finish())
+                ChildView::new(&self.left_panel_view).finish()
             }
             HeaderToolbarItemKind::CodeReview => {
                 if !pane_group.right_panel_open {
@@ -22096,11 +22134,13 @@ impl Workspace {
                 if pane_group.is_right_panel_maximized {
                     return None;
                 }
-                Some(ChildView::new(&self.right_panel_view).finish())
+                ChildView::new(&self.right_panel_view).finish()
             }
             HeaderToolbarItemKind::AgentManagement
-            | HeaderToolbarItemKind::NotificationsMailbox => None,
-        }
+            | HeaderToolbarItemKind::NotificationsMailbox => return None,
+        };
+
+        Some(self.wrap_in_panel_surface(appearance, &side, contents, genesi_shell_panel_radius()))
     }
 
     /// Renders the maximized code review panel if it is configured and maximized.
