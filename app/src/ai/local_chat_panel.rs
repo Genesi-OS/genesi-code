@@ -14,7 +14,7 @@ use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, Form
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, Container, CornerRadius,
-    CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Fill, Flex,
+    CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
     FormattedTextElement, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
 };
 use warpui::presenter::ChildView;
@@ -67,10 +67,6 @@ fn green_soft() -> ColorU {
 
 fn genesi_panel_surface() -> ColorU {
     ColorU::new(20, 21, 23, 245)
-}
-
-fn genesi_control_surface() -> ColorU {
-    ColorU::new(255, 255, 255, 10)
 }
 
 fn truncate_middle(value: &str, max_chars: usize) -> String {
@@ -1159,30 +1155,18 @@ impl LocalAiChatView {
         active: bool,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        // Active / highlighted chips wear the Genesi green (a soft tinted fill +
-        // green border + green text); the rest stay quiet so the panel reads as a
-        // calm, on-brand control strip instead of a wall of grey buttons.
         let text_color: ColorU = if active {
-            genesi_green()
+            theme.active_ui_text_color().into()
         } else {
             theme.disabled_text_color(theme.background()).into()
         };
-        let mut container =
+        let container =
             Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false))
-                .with_horizontal_padding(8.)
+                .with_horizontal_padding(7.)
                 .with_vertical_padding(4.)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
                 .with_margin_right(4.)
                 .with_margin_top(2.);
-        container = if active {
-            container
-                .with_background_color(green_tint())
-                .with_border(Border::all(1.).with_border_color(green_soft()))
-        } else {
-            container
-                .with_background_color(ColorU::new(0, 0, 0, 0))
-                .with_border(Border::all(1.).with_border_fill(theme.outline()))
-        };
         let content = container.finish();
 
         EventHandler::new(content)
@@ -1193,56 +1177,14 @@ impl LocalAiChatView {
             .finish()
     }
 
-    /// The top bar: brand mark + AI Mode status badge, and the utility chips
-    /// (Stop while generating, Refresh, Clear). The model/Turbo/agent controls
-    /// live in the bottom control strip (next to the compose box) instead, so
-    /// the panel reads top-down like a real IDE assistant.
+    /// The panel header keeps only the assistant title and utility controls.
+    /// The global Vibe/IDE switch belongs to the app title bar.
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
-
-        let mode_switch = Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(
-                    Container::new(self.label_text(
-                        appearance,
-                        "Vibe",
-                        CHIP_FONT_SIZE,
-                        theme.disabled_text_color(theme.background()).into(),
-                        false,
-                    ))
-                    .with_horizontal_padding(9.)
-                    .with_vertical_padding(5.)
-                    .finish(),
-                )
-                .with_child(
-                    Container::new(self.label_text(
-                        appearance,
-                        "IDE",
-                        CHIP_FONT_SIZE,
-                        theme.active_ui_text_color().into(),
-                        false,
-                    ))
-                    .with_horizontal_padding(9.)
-                    .with_vertical_padding(5.)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
-                    .with_background_color(genesi_control_surface())
-                    .with_border(Border::all(1.).with_border_color(green_soft()))
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_uniform_padding(2.)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
-        .with_background_color(genesi_panel_surface())
-        .with_border(Border::all(1.).with_border_fill(theme.outline()))
-        .with_margin_right(8.)
-        .finish();
 
         let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(mode_switch)
             .with_child(self.label_text(
                 appearance,
                 "Genesi Code",
@@ -1354,8 +1296,8 @@ impl LocalAiChatView {
             .finish()
     }
 
-    /// A dropdown-style button (surface fill + border + caret) used as the AI
-    /// selector. Highlights green while its popup is open.
+    /// A quiet dropdown-style label used as the AI selector. It intentionally
+    /// avoids the old bordered pill style so long model names do not dominate.
     fn selector_button(
         &self,
         appearance: &Appearance,
@@ -1365,22 +1307,18 @@ impl LocalAiChatView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let text_color: ColorU = theme.active_ui_text_color().into();
-        let mut container =
+        let mut label = label;
+        if open {
+            label.push_str(" ^");
+        } else {
+            label.push_str(" v");
+        }
+        let container =
             Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
-                .with_horizontal_padding(10.)
-                .with_vertical_padding(6.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_horizontal_padding(2.)
+                .with_vertical_padding(4.)
                 .with_margin_right(4.)
                 .with_margin_top(2.);
-        container = if open {
-            container
-                .with_background_color(green_tint())
-                .with_border(Border::all(1.).with_border_color(green_soft()))
-        } else {
-            container
-                .with_background_color(ColorU::new(0, 0, 0, 0))
-                .with_border(Border::all(1.).with_border_fill(theme.outline()))
-        };
 
         EventHandler::new(container.finish())
             .on_left_mouse_down(move |ctx, _, _| {
@@ -2310,7 +2248,7 @@ impl View for LocalAiChatView {
                 .finish(),
         );
 
-        root.add_child(Shrinkable::new(1., self.render_transcript(appearance)).finish());
+        root.add_child(Expanded::new(1., self.render_transcript(appearance)).finish());
 
         if let Some(error) = &self.error {
             root.add_child(

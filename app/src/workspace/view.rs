@@ -19832,6 +19832,97 @@ impl Workspace {
         .finish()
     }
 
+    fn render_genesi_app_switcher(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted = theme.disabled_text_color(theme.background());
+        let active = theme.active_ui_text_color();
+
+        let logo = Container::new(
+            ConstrainedBox::new(icons::Icon::Grid.to_warpui_icon(active).finish())
+                .with_width(18.)
+                .with_height(18.)
+                .finish(),
+        )
+        .with_margin_right(8.)
+        .finish();
+
+        let vibe = Container::new(
+            Text::new_inline("Vibe", appearance.ui_font_family(), 12.)
+                .with_color(muted.into())
+                .finish(),
+        )
+        .with_horizontal_padding(9.)
+        .with_vertical_padding(5.)
+        .finish();
+
+        let ide = Container::new(
+            Text::new_inline("IDE", appearance.ui_font_family(), 12.)
+                .with_color(active.into())
+                .finish(),
+        )
+        .with_horizontal_padding(9.)
+        .with_vertical_padding(5.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .with_background(internal_colors::fg_overlay_2(theme))
+        .finish();
+
+        let mode_switch = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(vibe)
+                .with_child(ide)
+                .finish(),
+        )
+        .with_uniform_padding(2.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_background(internal_colors::fg_overlay_1(theme))
+        .with_border(Border::all(1.).with_border_fill(internal_colors::fg_overlay_1(theme)))
+        .finish();
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(logo)
+            .with_child(mode_switch)
+            .finish()
+    }
+
+    fn render_genesi_project_chip(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color = theme.active_ui_text_color();
+
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new_inline("Project name", appearance.ui_font_family(), 12.)
+                        .with_color(text_color.into())
+                        .with_clip(ClipConfig::ellipsis())
+                        .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            icons::Icon::ChevronDown
+                                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                                .finish(),
+                        )
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                    )
+                    .with_margin_left(5.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_horizontal_padding(10.)
+        .with_vertical_padding(6.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_background(internal_colors::fg_overlay_1(theme))
+        .with_border(Border::all(1.).with_border_fill(internal_colors::fg_overlay_1(theme)))
+        .finish()
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -19939,6 +20030,16 @@ impl Workspace {
         let config = TabSettings::as_ref(ctx)
             .header_toolbar_chip_selection
             .clone();
+        tab_bar.add_child(
+            Container::new(self.render_genesi_app_switcher(appearance))
+                .with_margin_right(8.)
+                .finish(),
+        );
+        tab_bar.add_child(
+            Container::new(self.render_genesi_project_chip(appearance))
+                .with_margin_right(8.)
+                .finish(),
+        );
         if knowledge_center_closed && !self.is_theme_chooser_open() {
             let left_toolbar_buttons = config
                 .left_items()
@@ -21056,25 +21157,26 @@ impl Workspace {
         let mut button = icon_button_with_color(
             appearance,
             icon_type,
-            is_active,
+            false,
             mouse_state_handle.clone(),
             icon_color,
         );
         button = button
             .with_hovered_styles(UiComponentStyles {
                 font_color: Some(icon_color.into()),
-                background: Some(theme.surface_2().into()),
+                background: Some(internal_colors::fg_overlay_1(theme).into()),
                 ..UiComponentStyles::default()
             })
             .with_clicked_styles(UiComponentStyles {
                 font_color: Some(icon_color.into()),
-                background: Some(theme.background().into()),
+                background: Some(internal_colors::fg_overlay_2(theme).into()),
                 ..UiComponentStyles::default()
             });
 
         if is_active {
             button = button.with_active_styles(UiComponentStyles {
-                background: Some(internal_colors::fg_overlay_3(theme).into()),
+                font_color: Some(icon_color.into()),
+                background: Some(ElementFill::None),
                 ..UiComponentStyles::default()
             });
         }
@@ -21762,26 +21864,22 @@ impl Workspace {
         corner_radius: CornerRadius,
     ) -> Box<dyn Element> {
         let mut container = Container::new(contents)
-            .with_background(appearance.theme().surface_1().with_opacity(90))
-            .with_corner_radius(corner_radius);
+            .with_background_color(ColorU::new(19, 20, 22, 245))
+            .with_corner_radius(corner_radius)
+            .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()));
 
         match side {
-            PanelPosition::Left => container = container.with_margin_right(2.0),
-            PanelPosition::Right => container = container.with_margin_left(2.0),
+            PanelPosition::Left => container = container.with_margin_right(6.0),
+            PanelPosition::Right => container = container.with_margin_left(6.0),
         };
 
         container.finish()
     }
 
-    fn render_panel_separator(app: &AppContext) -> Box<dyn Element> {
-        let appearance = Appearance::as_ref(app);
-        ConstrainedBox::new(
-            Rect::new()
-                .with_background_color(appearance.theme().outline().into_solid())
-                .finish(),
-        )
-        .with_width(1.0)
-        .finish()
+    fn render_panel_separator(_app: &AppContext) -> Box<dyn Element> {
+        ConstrainedBox::new(Empty::new().finish())
+            .with_width(6.0)
+            .finish()
     }
 
     fn add_panel_with_separator(

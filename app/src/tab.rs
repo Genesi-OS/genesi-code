@@ -1414,7 +1414,9 @@ impl<'a> TabComponent<'a> {
         let is_active = self.is_active_tab();
         let is_in_multi_tab_selection = self.is_in_multi_tab_selection;
 
-        let (background_color, border_fill) = if FeatureFlag::NewTabStyling.is_enabled() {
+        let (background_color, border_fill): (Fill, Fill) = if FeatureFlag::NewTabStyling
+            .is_enabled()
+        {
             // If there is a custom tab background, we overlay it with varying opacities.
             let bg = if let Some(custom_background) = self.styles.background {
                 let base_opacity = if is_active || is_in_multi_tab_selection {
@@ -1435,21 +1437,23 @@ impl<'a> TabComponent<'a> {
                     }
                 }
             } else if is_active {
-                internal_colors::fg_overlay_2(theme).into()
+                ColorU::new(255, 255, 255, 18).into()
             } else if is_in_multi_tab_selection && is_hovered {
                 // Hovering a multi-selected tab steps one shade darker so the
                 // hover stays distinguishable from the in-selection highlight.
-                internal_colors::fg_overlay_2(theme).into()
+                ColorU::new(255, 255, 255, 14).into()
             } else if is_in_multi_tab_selection || is_hovered {
-                internal_colors::fg_overlay_1(theme).into()
+                ColorU::new(255, 255, 255, 10).into()
             } else {
-                Fill::None
+                ColorU::new(255, 255, 255, 0).into()
             };
 
             let border = if is_active {
-                internal_colors::fg_overlay_2(theme)
+                ColorU::new(255, 255, 255, 34).into()
+            } else if is_hovered || is_in_multi_tab_selection {
+                ColorU::new(255, 255, 255, 22).into()
             } else {
-                internal_colors::fg_overlay_1(theme)
+                ColorU::new(255, 255, 255, 0).into()
             };
 
             (bg, border)
@@ -1480,7 +1484,7 @@ impl<'a> TabComponent<'a> {
                 internal_colors::fg_overlay_1(theme)
             };
 
-            (bg, border)
+            (bg, border.into())
         };
 
         let full_tab_content = {
@@ -1659,13 +1663,10 @@ impl<'a> TabComponent<'a> {
             .with_vertical_padding(2.)
             .with_background(background_color);
         if FeatureFlag::NewTabStyling.is_enabled() {
-            let is_first_tab = self.tab_index == 0;
-            tab = tab.with_border(
-                Border::all(1.)
-                    // We only include a left border on the very first tab to avoid double borders.
-                    .with_sides(false, is_first_tab, false, true)
-                    .with_border_fill(border_fill),
-            );
+            tab = tab
+                .with_border(Border::all(1.).with_border_fill(border_fill))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                .with_margin_right(4.);
         } else {
             tab = tab
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))

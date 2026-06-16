@@ -27,9 +27,9 @@ pub(in crate::pane_group) const DEFAULT_FLEX_SIZE: PaneFlex = PaneFlex(DEFAULT_F
 
 pub fn get_divider_thickness() -> f32 {
     if FeatureFlag::MinimalistUI.is_enabled() {
-        1.0
+        8.0
     } else {
-        2.0
+        8.0
     }
 }
 
@@ -1422,11 +1422,7 @@ fn create_divider(
     item: &Divider,
     theme: &WarpTheme,
 ) -> Box<dyn Element> {
-    let divider = ConstrainedBox::new(
-        Rect::new()
-            .with_background(theme.split_pane_border_color())
-            .finish(),
-    );
+    let divider = ConstrainedBox::new(Rect::new().with_background(theme.background()).finish());
 
     let cursor_shape = match direction {
         SplitDirection::Horizontal => Cursor::ResizeLeftRight,
@@ -1458,11 +1454,7 @@ fn create_minimalist_divider(
     item: &Divider,
     theme: &WarpTheme,
 ) -> Box<dyn Element> {
-    let divider = ConstrainedBox::new(
-        Rect::new()
-            .with_background(theme.split_pane_border_color())
-            .finish(),
-    );
+    let divider = ConstrainedBox::new(Rect::new().with_background(theme.background()).finish());
 
     let cursor_shape = match direction {
         SplitDirection::Horizontal => Cursor::ResizeLeftRight,
