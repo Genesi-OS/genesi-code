@@ -334,6 +334,7 @@ pub struct LocalAiChatView {
     input: ViewHandle<SubmittableTextInput>,
     messages: Vec<ChatEntry>,
     transcript_scroll: ClippedScrollStateHandle,
+    vibe_mode: bool,
 
     endpoint: LocalEndpoint,
     turbo_available: bool,
@@ -413,6 +414,7 @@ impl LocalAiChatView {
             input,
             messages: Vec::new(),
             transcript_scroll: ClippedScrollStateHandle::default(),
+            vibe_mode: false,
             endpoint: LocalEndpoint::Ollama,
             turbo_available: false,
             endpoint_user_chosen: false,
@@ -1312,6 +1314,11 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    pub fn set_vibe_mode(&mut self, enabled: bool, ctx: &mut ViewContext<Self>) {
+        self.vibe_mode = enabled;
+        ctx.notify();
+    }
+
     fn reset_current_chat(&mut self) {
         self.messages.clear();
         self.error = None;
@@ -1334,6 +1341,20 @@ impl LocalAiChatView {
             .as_ref()
             .and_then(|path| self.pending_edits.iter().find(|edit| &edit.path == path))
             .or_else(|| self.pending_edits.first())
+    }
+
+    fn collapse_other_diffs(&mut self, keep_index: usize) {
+        for (index, entry) in self.messages.iter_mut().enumerate() {
+            if index != keep_index
+                && entry.role == ChatRole::Tool
+                && entry
+                    .diff_preview
+                    .as_ref()
+                    .is_some_and(|lines| !lines.is_empty())
+            {
+                entry.collapsed = true;
+            }
+        }
     }
 
     fn render_diff_preview(
@@ -2319,6 +2340,11 @@ impl LocalAiChatView {
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
         if self.messages.is_empty() {
+            if self.vibe_mode {
+                return Container::new(Empty::new().finish())
+                    .with_horizontal_padding(PANEL_PADDING)
+                    .finish();
+            }
             let (title, hint) = match self.current_model() {
                 Some(model) => (
                     "Ask your local model".to_string(),
@@ -2559,6 +2585,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::OpenDiff(index) => {
+                self.collapse_other_diffs(*index);
                 if let Some(entry) = self.messages.get_mut(*index) {
                     entry.collapsed = false;
                 }
@@ -2617,6 +2644,13 @@ impl TypedActionView for LocalAiChatView {
                 self.stop_turn(ctx);
             }
             LocalAiChatAction::ToggleCollapse(index) => {
+                let expanding = self
+                    .messages
+                    .get(*index)
+                    .is_some_and(|entry| entry.collapsed);
+                if expanding {
+                    self.collapse_other_diffs(*index);
+                }
                 if let Some(entry) = self.messages.get_mut(*index) {
                     entry.collapsed = !entry.collapsed;
                 }
@@ -2647,12 +2681,14 @@ impl View for LocalAiChatView {
 
         let mut root = Flex::column().with_main_axis_size(MainAxisSize::Max);
 
-        root.add_child(
-            Container::new(self.render_header(appearance))
-                .with_uniform_padding(PANEL_PADDING)
-                .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
-                .finish(),
-        );
+        if !self.vibe_mode {
+            root.add_child(
+                Container::new(self.render_header(appearance))
+                    .with_uniform_padding(PANEL_PADDING)
+                    .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+                    .finish(),
+            );
+        }
 
         root.add_child(Expanded::new(1., self.render_transcript(appearance)).finish());
 
@@ -2714,13 +2750,20 @@ impl View for LocalAiChatView {
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
             .with_background_color(genesi_panel_surface())
             .finish();
-        root.add_child(
+        let compose_container = if self.vibe_mode {
+            Container::new(ConstrainedBox::new(compose_box).with_width(760.).finish())
+                .with_horizontal_padding(PANEL_PADDING)
+                .with_padding_top(4.)
+                .with_padding_bottom(PANEL_PADDING + 8.)
+                .finish()
+        } else {
             Container::new(compose_box)
                 .with_horizontal_padding(PANEL_PADDING)
                 .with_padding_top(4.)
                 .with_padding_bottom(PANEL_PADDING)
-                .finish(),
-        );
+                .finish()
+        };
+        root.add_child(compose_container);
 
         root.finish()
     }

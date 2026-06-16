@@ -24226,6 +24226,8 @@ impl TypedActionView for Workspace {
             }
             ToggleLocalAi => {
                 self.genesi_vibe_mode = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
                 self.toggle_local_ai_panel(ctx);
             }
             SetGenesiModeVibe => {
@@ -24233,18 +24235,24 @@ impl TypedActionView for Workspace {
                 self.current_workspace_state.is_local_ai_panel_open = false;
                 self.current_workspace_state.is_ai_assistant_panel_open = false;
                 self.current_workspace_state.is_resource_center_open = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_vibe_mode(true, ctx));
                 ctx.focus(&self.local_ai_panel);
                 ctx.notify();
             }
             SetGenesiModeIde => {
                 self.genesi_vibe_mode = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
                 ctx.notify();
             }
             StartNewLocalChat => {
                 self.genesi_vibe_mode = true;
                 self.current_workspace_state.is_local_ai_panel_open = false;
-                self.local_ai_panel
-                    .update(ctx, |panel, ctx| panel.start_new_chat(ctx));
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.set_vibe_mode(true, ctx);
+                    panel.start_new_chat(ctx);
+                });
                 ctx.focus(&self.local_ai_panel);
                 ctx.notify();
             }
