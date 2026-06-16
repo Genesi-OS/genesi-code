@@ -120,9 +120,7 @@ impl AgentTool {
     pub fn requires_approval(&self) -> bool {
         matches!(
             self,
-            AgentTool::RunCommand { .. }
-                | AgentTool::EditFile { .. }
-                | AgentTool::WriteFile { .. }
+            AgentTool::RunCommand { .. } | AgentTool::EditFile { .. } | AgentTool::WriteFile { .. }
         )
     }
 }

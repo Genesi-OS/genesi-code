@@ -925,9 +925,7 @@ impl LocalCodeEditorView {
             .compute_card_positioning(before, COMPLETION_POPUP_MAX_HEIGHT, app)
             .or_else(|| self.compute_card_positioning(anchor, COMPLETION_POPUP_MAX_HEIGHT, app));
         if positioning.is_none() {
-            log::warn!(
-                "completion popup: could not compute positioning (anchor={anchor:?})"
-            );
+            log::warn!("completion popup: could not compute positioning (anchor={anchor:?})");
         }
         positioning
     }

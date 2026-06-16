@@ -219,7 +219,9 @@ impl WorkspaceState {
     }
 
     pub fn is_right_panel_open(&self) -> bool {
-        self.is_resource_center_open || self.is_ai_assistant_panel_open || self.is_local_ai_panel_open
+        self.is_resource_center_open
+            || self.is_ai_assistant_panel_open
+            || self.is_local_ai_panel_open
     }
 
     pub fn is_left_panel_open(&self) -> bool {

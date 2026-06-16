@@ -433,17 +433,17 @@ impl LocalCodeEditorView {
             .as_ref(ctx)
             .offset_to_lsp_position(request_offset, ctx);
 
-        let future = match lsp_server.as_ref(ctx).completion(
-            file_path.to_path_buf(),
-            lsp_position,
-            trigger,
-        ) {
-            Ok(future) => future,
-            Err(e) => {
-                log::warn!("Failed to call lsp.completion: {e}");
-                return;
-            }
-        };
+        let future =
+            match lsp_server
+                .as_ref(ctx)
+                .completion(file_path.to_path_buf(), lsp_position, trigger)
+            {
+                Ok(future) => future,
+                Err(e) => {
+                    log::warn!("Failed to call lsp.completion: {e}");
+                    return;
+                }
+            };
 
         let abort_handle = ctx
             .spawn(future, move |me, result, ctx| match result {

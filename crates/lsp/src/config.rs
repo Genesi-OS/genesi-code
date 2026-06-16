@@ -421,10 +421,7 @@ fn default_client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
                 completion_item: Some(CompletionItemCapability {
                     snippet_support: Some(false),
-                    documentation_format: Some(vec![
-                        MarkupKind::Markdown,
-                        MarkupKind::PlainText,
-                    ]),
+                    documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                     ..Default::default()
                 }),
                 context_support: Some(true),

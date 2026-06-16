@@ -150,7 +150,6 @@ use super::util::{
 };
 use super::{util, ActiveSession, TabBarDropTargetData, TabBarLocation, WorkspaceRegistry};
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
-use crate::ai::local_chat_panel::{LocalAiChatEvent, LocalAiChatView};
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
@@ -204,6 +203,7 @@ use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientPr
 use crate::ai::facts::view::AIFactPage;
 use crate::ai::facts::{AIFactManager, AIFactView, AIFactViewEvent};
 use crate::ai::llms::LLMPreferences;
+use crate::ai::local_chat_panel::{LocalAiChatEvent, LocalAiChatView};
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::ai::{conversation_utils, AIRequestUsageModel};
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
@@ -21917,13 +21917,15 @@ impl Workspace {
                     &PanelPosition::Right,
                 ))
             } else if self.current_workspace_state.is_local_ai_panel_open {
-                Some(self.render_panel(
-                    app,
-                    ConstrainedBox::new(ChildView::new(&self.local_ai_panel).finish())
-                        .with_width(LOCAL_AI_PANEL_WIDTH)
-                        .finish(),
-                    &PanelPosition::Right,
-                ))
+                Some(
+                    self.render_panel(
+                        app,
+                        ConstrainedBox::new(ChildView::new(&self.local_ai_panel).finish())
+                            .with_width(LOCAL_AI_PANEL_WIDTH)
+                            .finish(),
+                        &PanelPosition::Right,
+                    ),
+                )
             } else {
                 log::warn!(
                     "is_right_panel_open() returned true, but neither the resource center nor AI \

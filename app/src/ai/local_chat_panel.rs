@@ -40,6 +40,7 @@ const BODY_FONT_SIZE: f32 = 13.;
 /// Slightly smaller monospace size for tool output / terminal blocks.
 const MONO_FONT_SIZE: f32 = 12.;
 const PANEL_PADDING: f32 = 8.;
+const MODEL_LABEL_MAX_CHARS: usize = 34;
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
 const SCROLL_TO_BOTTOM: f32 = 1.0e7;
@@ -62,6 +63,41 @@ fn green_tint() -> ColorU {
 /// user-message accent.
 fn green_soft() -> ColorU {
     ColorU::new(15, 143, 106, 130)
+}
+
+fn genesi_panel_surface() -> ColorU {
+    ColorU::new(20, 21, 23, 245)
+}
+
+fn genesi_control_surface() -> ColorU {
+    ColorU::new(255, 255, 255, 10)
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+
+    let head_len = (max_chars.saturating_sub(3) + 1) / 2;
+    let tail_len = max_chars.saturating_sub(3 + head_len);
+    let head: String = value.chars().take(head_len).collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
+fn ai_mode_short_label(state: Option<&AiModeState>) -> String {
+    match state {
+        Some(state) => format!("Mode {}", state.force_mode),
+        None => "Mode n/a".to_string(),
+    }
 }
 
 /// What the compose box is currently capturing: a chat prompt, or a one-shot
@@ -786,7 +822,8 @@ impl LocalAiChatView {
     fn capture_edit(&self, tool: &AgentTool) -> Option<(String, u32, u32, Option<String>)> {
         let root = self.agent_root.as_ref()?;
         let read_original = |path: &str| {
-            local_agent::resolve_in_project(root, path).and_then(|p| std::fs::read_to_string(p).ok())
+            local_agent::resolve_in_project(root, path)
+                .and_then(|p| std::fs::read_to_string(p).ok())
         };
         match tool {
             AgentTool::WriteFile { path, content } => {
@@ -800,7 +837,12 @@ impl LocalAiChatView {
                 replace,
             } => {
                 let original = read_original(path);
-                Some((path.clone(), count_lines(replace), count_lines(search), original))
+                Some((
+                    path.clone(),
+                    count_lines(replace),
+                    count_lines(search),
+                    original,
+                ))
             }
             _ => None,
         }
@@ -864,9 +906,7 @@ impl LocalAiChatView {
                 // `+N −N` diff card and later undo it. Reads return None here.
                 let edit_meta = self.capture_edit(&tool);
                 let (title, diff_stat) = match &edit_meta {
-                    Some((path, added, removed, _)) => {
-                        (path.clone(), Some((*added, *removed)))
-                    }
+                    Some((path, added, removed, _)) => (path.clone(), Some((*added, *removed))),
                     None => (self.agent_tool_summary.clone(), None),
                 };
                 // A read tool: collapsed by default, showing just its one-line
@@ -1129,10 +1169,10 @@ impl LocalAiChatView {
         };
         let mut container =
             Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false))
-                .with_horizontal_padding(10.)
+                .with_horizontal_padding(8.)
                 .with_vertical_padding(4.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
-                .with_margin_right(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_margin_right(4.)
                 .with_margin_top(2.);
         container = if active {
             container
@@ -1140,7 +1180,7 @@ impl LocalAiChatView {
                 .with_border(Border::all(1.).with_border_color(green_soft()))
         } else {
             container
-                .with_background(theme.surface_2())
+                .with_background_color(ColorU::new(0, 0, 0, 0))
                 .with_border(Border::all(1.).with_border_fill(theme.outline()))
         };
         let content = container.finish();
@@ -1160,17 +1200,52 @@ impl LocalAiChatView {
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
 
-        let ai_mode_label = match &self.ai_mode {
-            Some(state) => state.badge_text(),
-            None => "AI Mode: n/a".to_string(),
-        };
+        let mode_switch = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        "Vibe",
+                        CHIP_FONT_SIZE,
+                        theme.disabled_text_color(theme.background()).into(),
+                        false,
+                    ))
+                    .with_horizontal_padding(9.)
+                    .with_vertical_padding(5.)
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        "IDE",
+                        CHIP_FONT_SIZE,
+                        theme.active_ui_text_color().into(),
+                        false,
+                    ))
+                    .with_horizontal_padding(9.)
+                    .with_vertical_padding(5.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+                    .with_background_color(genesi_control_surface())
+                    .with_border(Border::all(1.).with_border_color(green_soft()))
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(2.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_background_color(genesi_panel_surface())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_margin_right(8.)
+        .finish();
 
         let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
+            .with_child(mode_switch)
             .with_child(self.label_text(
                 appearance,
-                "✦ Genesi AI",
+                "Genesi Code",
                 TITLE_FONT_SIZE,
                 theme.active_ui_text_color().into(),
                 false,
@@ -1178,19 +1253,18 @@ impl LocalAiChatView {
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             .with_child(self.chip(
                 appearance,
-                ai_mode_label,
-                LocalAiChatAction::CycleAiMode,
-                self.ai_mode.is_some(),
+                "Refresh".to_string(),
+                LocalAiChatAction::Refresh,
+                true,
             ));
         if self.in_flight {
             row.add_child(self.chip(
                 appearance,
-                "⏹ Stop".to_string(),
+                "Stop".to_string(),
                 LocalAiChatAction::Stop,
                 true,
             ));
         }
-        row.add_child(self.chip(appearance, "Refresh".to_string(), LocalAiChatAction::Refresh, true));
         row.add_child(self.chip(
             appearance,
             "Clear".to_string(),
@@ -1205,50 +1279,79 @@ impl LocalAiChatView {
     /// agent toggles. The model picker itself is a popup (see
     /// [`Self::render_model_picker`]) so the user clicks once and chooses.
     fn render_control_strip(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let model_name = self.current_model().unwrap_or_else(|| "no model".to_string());
+        let model_name = self
+            .current_model()
+            .unwrap_or_else(|| "no model".to_string());
+        let model_name = truncate_middle(&model_name, MODEL_LABEL_MAX_CHARS);
         let selector_label = if self.endpoint == LocalEndpoint::Turbo {
-            format!("⚡ {model_name}  ⌄")
+            format!("Turbo: {model_name}")
         } else {
-            format!("✦ {model_name}  ⌄")
+            format!("AI: {model_name}")
         };
 
-        let mut row = Flex::row()
+        let selector_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.selector_button(
-                appearance,
-                selector_label,
-                LocalAiChatAction::ToggleModelPicker,
-                self.model_picker_open,
-            ))
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    self.selector_button(
+                        appearance,
+                        selector_label,
+                        LocalAiChatAction::ToggleModelPicker,
+                        self.model_picker_open,
+                    ),
+                )
+                .finish(),
+            )
             .with_child(self.chip(
                 appearance,
-                "⚡ Turbo".to_string(),
+                "Turbo".to_string(),
                 LocalAiChatAction::ToggleTurbo,
                 self.endpoint == LocalEndpoint::Turbo,
             ))
+            .finish();
+
+        let mut toggles_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip(
                 appearance,
-                "🤖 Agent".to_string(),
+                "Agent".to_string(),
                 LocalAiChatAction::ToggleAgent,
                 self.agent_mode,
             ));
-        // AUTO only matters in agent mode (approve-less commands/edits).
         if self.agent_mode {
-            row.add_child(self.chip(
+            toggles_row.add_child(self.chip(
                 appearance,
                 format!("AUTO {}", if self.auto_approve { "on" } else { "off" }),
                 LocalAiChatAction::ToggleAuto,
                 self.auto_approve,
             ));
         }
-        row.add_child(self.chip(
+        toggles_row.add_child(self.chip(
             appearance,
-            "📎".to_string(),
+            "Attach".to_string(),
             LocalAiChatAction::ToggleAttachContext,
             self.attach_context,
         ));
-        row.finish()
+        toggles_row.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
+        toggles_row.add_child(self.chip(
+            appearance,
+            ai_mode_short_label(self.ai_mode.as_ref()),
+            LocalAiChatAction::CycleAiMode,
+            self.ai_mode.is_some(),
+        ));
+
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(selector_row)
+            .with_child(
+                Container::new(toggles_row.finish())
+                    .with_margin_top(5.)
+                    .finish(),
+            )
+            .finish()
     }
 
     /// A dropdown-style button (surface fill + border + caret) used as the AI
@@ -1267,7 +1370,7 @@ impl LocalAiChatView {
                 .with_horizontal_padding(10.)
                 .with_vertical_padding(6.)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                .with_margin_right(6.)
+                .with_margin_right(4.)
                 .with_margin_top(2.);
         container = if open {
             container
@@ -1275,7 +1378,7 @@ impl LocalAiChatView {
                 .with_border(Border::all(1.).with_border_color(green_soft()))
         } else {
             container
-                .with_background(theme.surface_2())
+                .with_background_color(ColorU::new(0, 0, 0, 0))
                 .with_border(Border::all(1.).with_border_fill(theme.outline()))
         };
 
@@ -1397,10 +1500,11 @@ impl LocalAiChatView {
         } else {
             theme.main_text_color(theme.background()).into()
         };
-        let mut row = Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, color, false))
-            .with_horizontal_padding(8.)
-            .with_vertical_padding(6.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
+        let mut row =
+            Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, color, false))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
         if active {
             row = row.with_background_color(green_tint());
         }
@@ -1425,7 +1529,7 @@ impl LocalAiChatView {
         let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
         let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
         let label = format!(
-            "✎ {n} file{} changed   +{added} −{removed}",
+            "{n} file{} need review   +{added} -{removed}",
             if n == 1 { "" } else { "s" }
         );
 
@@ -1442,13 +1546,13 @@ impl LocalAiChatView {
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             .with_child(self.chip(
                 appearance,
-                "Undo all".to_string(),
+                "Undo".to_string(),
                 LocalAiChatAction::UndoEdits,
                 false,
             ))
             .with_child(self.chip(
                 appearance,
-                "Keep".to_string(),
+                "Keep All".to_string(),
                 LocalAiChatAction::KeepEdits,
                 true,
             ))
@@ -1458,7 +1562,7 @@ impl LocalAiChatView {
             .with_uniform_padding(8.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_2())
+            .with_background_color(genesi_panel_surface())
             .finish();
         Some(
             Container::new(bar)
@@ -1490,9 +1594,7 @@ impl LocalAiChatView {
                 format!("✏ Apply this edit to {path}?"),
                 format!("- {}\n+ {}", clip(search), clip(replace)),
             ),
-            AgentTool::WriteFile { path, content } => {
-                (format!("✏ Write {path}?"), clip(content))
-            }
+            AgentTool::WriteFile { path, content } => (format!("✏ Write {path}?"), clip(content)),
             other => ("⚠ Allow this action?".to_string(), other.summary()),
         };
 
@@ -1603,7 +1705,7 @@ impl LocalAiChatView {
             .with_vertical_padding(2.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_2())
+            .with_background_color(ColorU::new(0, 0, 0, 0))
             .finish();
 
             inner.add_child(
@@ -1745,7 +1847,7 @@ impl LocalAiChatView {
                         green,
                         false,
                     ))
-                    .with_margin_right(6.)
+                    .with_margin_right(4.)
                     .finish(),
                 )
                 .with_child(self.label_text(
@@ -1762,7 +1864,7 @@ impl LocalAiChatView {
                     .with_vertical_padding(6.)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
                     .with_border(Border::all(1.).with_border_fill(theme.outline()))
-                    .with_background(theme.surface_2())
+                    .with_background_color(ColorU::new(0, 0, 0, 0))
                     .finish(),
             )
             .on_left_mouse_down(move |ctx, _, _| {
@@ -2266,7 +2368,7 @@ impl View for LocalAiChatView {
             .with_vertical_padding(8.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_1())
+            .with_background_color(genesi_panel_surface())
             .finish();
         root.add_child(
             Container::new(compose_box)
