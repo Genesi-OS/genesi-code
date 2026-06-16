@@ -547,10 +547,8 @@ const TAB_BAR_OVERFLOW_MENU_WIDTH: f32 = 300.;
 
 #[cfg(not(target_family = "wasm"))]
 const RESOURCE_CENTER_WIDTH: f32 = 361.;
-/// Genesi: fixed width for the login-free local AI chat panel. A bounded width
-/// is required — the right dock lays panels out with an infinite-width
-/// constraint, and the panel's flex/buffer children can't expand into it.
-const LOCAL_AI_PANEL_WIDTH: f32 = 380.;
+const LOCAL_AI_PANEL_MIN_WIDTH: f32 = 320.;
+const LOCAL_AI_PANEL_MAX_WIDTH: f32 = 720.;
 
 // Ratio of terminal : theme chooser when theme chooser is active
 const THEME_CHOOSER_RATIO: f32 = 3.5;
@@ -673,6 +671,10 @@ fn genesi_shell_panel_radius() -> CornerRadius {
 }
 
 fn genesi_shell_panel_surface() -> ColorU {
+    ColorU::new(22, 23, 25, 255)
+}
+
+fn genesi_shell_editor_surface() -> ColorU {
     ColorU::new(18, 19, 21, 255)
 }
 
@@ -21897,9 +21899,9 @@ impl Workspace {
         contents: Box<dyn Element>,
     ) -> Box<dyn Element> {
         Container::new(contents)
-            .with_background_color(ColorU::new(5, 6, 7, 255))
+            .with_background_color(genesi_shell_editor_surface())
             .with_corner_radius(genesi_shell_panel_radius())
-            .with_uniform_padding(1.)
+            .with_uniform_padding(4.)
             .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
             .finish()
     }
@@ -22050,7 +22052,8 @@ impl Workspace {
                     self.render_panel(
                         app,
                         ConstrainedBox::new(ChildView::new(&self.local_ai_panel).finish())
-                            .with_width(LOCAL_AI_PANEL_WIDTH)
+                            .with_min_width(LOCAL_AI_PANEL_MIN_WIDTH)
+                            .with_max_width(LOCAL_AI_PANEL_MAX_WIDTH)
                             .finish(),
                         &PanelPosition::Right,
                     ),
