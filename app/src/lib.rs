@@ -186,6 +186,8 @@ pub mod workspace;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::ops::Deref;
 #[cfg(feature = "local_fs")]
 use std::path::PathBuf;
@@ -580,8 +582,79 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_genesi_code_binary() -> bool {
+    warp_cli::binary_name()
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("genesi-code"))
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_virtualized_environment() -> bool {
+    if std::env::var_os("GENESI_CODE_DISABLE_VM_GL_FALLBACK").is_some() {
+        return false;
+    }
+
+    if std::env::var_os("GENESI_CODE_FORCE_VM_GL_FALLBACK").is_some() {
+        return true;
+    }
+
+    if let Ok(status) = command::blocking::Command::new("systemd-detect-virt")
+        .arg("--quiet")
+        .status()
+    {
+        if status.success() {
+            return true;
+        }
+    }
+
+    [
+        "/sys/class/dmi/id/product_name",
+        "/sys/class/dmi/id/sys_vendor",
+        "/sys/class/dmi/id/board_vendor",
+    ]
+    .iter()
+    .filter_map(|path| fs::read_to_string(path).ok())
+    .any(|value| {
+        let value = value.to_ascii_lowercase();
+        [
+            "virtualbox",
+            "vmware",
+            "qemu",
+            "kvm",
+            "hyper-v",
+            "microsoft corporation",
+            "parallels",
+            "bhyve",
+        ]
+        .iter()
+        .any(|needle| value.contains(needle))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_vm_gl_fallback() {
+    let is_vm = is_linux_virtualized_environment();
+    let should_force_gl = is_vm || is_genesi_code_binary();
+
+    if should_force_gl && std::env::var_os("WGPU_BACKEND").is_none() {
+        unsafe {
+            std::env::set_var("WGPU_BACKEND", "gl");
+        }
+    }
+
+    if is_vm && std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
+        unsafe {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+    }
+}
+
 /// Runs the app. If a subcommand was requested, it'll be run instead of the main application.
 pub fn run() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    apply_linux_vm_gl_fallback();
+
     // Perform any necessary platform-specific initialization.
     platform::init();
 
