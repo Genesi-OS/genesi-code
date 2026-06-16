@@ -61,11 +61,22 @@ jobs:
         run: |
           set -x
           sysctl -w vm.overcommit_memory=1 || echo "::warning::could not set overcommit"
+          # Best-effort swap backstop — must NEVER fail the build. On 2026-06-16
+          # (run #46) a 16G swapfile didn't fit the runner's disk: fallocate failed
+          # and the dd fallback filled the disk ("No space left on device"), and
+          # since the step shell runs with -e that killed the build before cargo
+          # even started. Use a smaller 8G file, and if it still can't be written,
+          # drop the partial file and rely on overcommit instead of erroring out.
           if [ ! -e /ci-swapfile ]; then
-            fallocate -l 16G /ci-swapfile 2>/dev/null || dd if=/dev/zero of=/ci-swapfile bs=1M count=16384
-            chmod 600 /ci-swapfile
-            mkswap /ci-swapfile
-            swapon /ci-swapfile || echo "::warning::swapon failed — relying on overcommit"
+            if fallocate -l 8G /ci-swapfile 2>/dev/null \
+               || dd if=/dev/zero of=/ci-swapfile bs=1M count=8192 2>/dev/null; then
+              chmod 600 /ci-swapfile
+              mkswap /ci-swapfile
+              swapon /ci-swapfile || echo "::warning::swapon failed — relying on overcommit"
+            else
+              echo "::warning::could not create swapfile (no disk space); relying on overcommit"
+              rm -f /ci-swapfile
+            fi
           fi
           swapon --show || true
           free -h || true
