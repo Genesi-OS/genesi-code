@@ -2680,6 +2680,13 @@ impl View for LocalAiChatView {
         let theme = appearance.theme();
 
         let mut root = Flex::column().with_main_axis_size(MainAxisSize::Max);
+        if self.vibe_mode {
+            // Center the chat column on the X axis (Claude-style) instead of
+            // letting it hug the left edge of the wide vibe main area. The
+            // transcript and the compose box below are both width-capped at 760
+            // so this reads as a centered conversation column.
+            root = root.with_cross_axis_alignment(CrossAxisAlignment::Center);
+        }
 
         if !self.vibe_mode {
             root.add_child(
@@ -2690,7 +2697,16 @@ impl View for LocalAiChatView {
             );
         }
 
-        root.add_child(Expanded::new(1., self.render_transcript(appearance)).finish());
+        let transcript: Box<dyn Element> = if self.vibe_mode {
+            // Cap the transcript width to match the 760px compose box so the
+            // centered column reads like a chat instead of stretching full-width.
+            ConstrainedBox::new(self.render_transcript(appearance))
+                .with_max_width(760.)
+                .finish()
+        } else {
+            self.render_transcript(appearance)
+        };
+        root.add_child(Expanded::new(1., transcript).finish());
 
         if let Some(error) = &self.error {
             root.add_child(

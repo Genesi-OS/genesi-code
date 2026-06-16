@@ -1061,6 +1061,15 @@ pub struct Workspace {
     ai_assistant_panel: ViewHandle<AIAssistantPanelView>,
     local_ai_panel: ViewHandle<LocalAiChatView>,
     genesi_vibe_mode: bool,
+    // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
+    // sidebar's "New Chat" button. These MUST live in the view (not be
+    // `MouseStateHandle::default()` rebuilt each render): a button tracks the
+    // press across the mouse-down → mouse-up frames via this handle, and a
+    // re-render in between (very common) would otherwise drop a fresh handle and
+    // swallow the click — which made the Vibe/IDE toggle only work by luck.
+    genesi_vibe_button_mouse_state: MouseStateHandle,
+    genesi_ide_button_mouse_state: MouseStateHandle,
+    genesi_new_chat_button_mouse_state: MouseStateHandle,
     should_show_ai_assistant_warm_welcome: bool,
     ai_assistant_close_warm_welcome_mouse_state_handle: MouseStateHandle,
     auth_override_warning_modal: ViewHandle<AuthOverrideWarningModal>,
@@ -3339,6 +3348,9 @@ impl Workspace {
             right_panel_view,
             working_directories_model,
             genesi_vibe_mode: false,
+            genesi_vibe_button_mouse_state: Default::default(),
+            genesi_ide_button_mouse_state: Default::default(),
+            genesi_new_chat_button_mouse_state: Default::default(),
             shown_staging_banner_count: 0,
 
             #[cfg(target_family = "wasm")]
@@ -19863,6 +19875,7 @@ impl Workspace {
             "Vibe",
             self.genesi_vibe_mode,
             WorkspaceAction::SetGenesiModeVibe,
+            &self.genesi_vibe_button_mouse_state,
         );
 
         let ide = self.render_genesi_mode_button(
@@ -19870,6 +19883,7 @@ impl Workspace {
             "IDE",
             !self.genesi_vibe_mode,
             WorkspaceAction::SetGenesiModeIde,
+            &self.genesi_ide_button_mouse_state,
         );
 
         let mode_switch = Container::new(
@@ -19898,6 +19912,7 @@ impl Workspace {
         label: &'static str,
         is_active: bool,
         action: WorkspaceAction,
+        mouse_state: &MouseStateHandle,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let text_color = if is_active {
@@ -19913,7 +19928,7 @@ impl Workspace {
 
         appearance
             .ui_builder()
-            .button(ButtonVariant::Text, MouseStateHandle::default())
+            .button(ButtonVariant::Text, mouse_state.clone())
             .with_custom_label(
                 Container::new(
                     Text::new_inline(label, appearance.ui_font_family(), 12.)
@@ -19941,7 +19956,10 @@ impl Workspace {
 
         let new_chat_button = appearance
             .ui_builder()
-            .button(ButtonVariant::Secondary, MouseStateHandle::default())
+            .button(
+                ButtonVariant::Secondary,
+                self.genesi_new_chat_button_mouse_state.clone(),
+            )
             .with_custom_label(
                 Text::new_inline("New Chat", appearance.ui_font_family(), 12.)
                     .with_color(theme.active_ui_text_color().into())
