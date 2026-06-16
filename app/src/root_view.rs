@@ -1669,33 +1669,14 @@ impl RootView {
                 if #[cfg(target_family = "wasm")] {
                     AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
                 } else {
-                    // When OpenWarpNewSettingsModes is enabled, show onboarding before login for
-                    // users who haven't completed it yet (tracked via a local UserPreferences key).
-                    let has_completed_local_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-                        && has_completed_local_onboarding(ctx);
-                    let should_show_pre_login_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-                        && FeatureFlag::AgentOnboarding.is_enabled()
-                        && !has_completed_local_onboarding;
-                    if FeatureFlag::ForceLogin.is_enabled() {
-                        // ForceLogin is true for Preview
-                        AuthOnboardingState::Auth(workspace_args.into())
-                    } else if should_show_pre_login_onboarding {
-                        let workspace_args_box: Box<WorkspaceArgs> = workspace_args.into();
-                        let onboarding_view = Self::create_agent_onboarding_view(ctx);
-                        onboarding_view.update(ctx, |view, ctx| {
-                            view.start_onboarding(ctx);
-                        });
-                        AuthOnboardingState::Onboarding {
-                            onboarding_view,
-                            target: AuthOnboardingTarget::Workspace(workspace_args_box),
-                        }
-                    } else if FeatureFlag::SkipFirebaseAnonymousUser.is_enabled() {
-                        // When SkipFirebaseAnonymousUser is enabled, skip the login screen
-                        // entirely and go directly into the workspace.
-                        AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
-                    } else {
-                        AuthOnboardingState::Auth(workspace_args.into())
-                    }
+                    // Genesi Code runs fully logged-out: never show Warp's pre-login
+                    // onboarding slides or the sign-in / subscribe screen. Land directly
+                    // in the workspace with default settings, exactly like upstream's
+                    // SkipFirebaseAnonymousUser path. The first launch must open straight
+                    // into the editor, not the "Welcome to Genesi Code" account flow.
+                    // (Sign-in / BYOK can still be offered later from settings.)
+                    let _ = has_completed_local_onboarding(ctx);
+                    AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
                 }
             }
         };
