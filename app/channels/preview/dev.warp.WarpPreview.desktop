@@ -4,10 +4,10 @@ Version=1.0
 
 Type=Application
 
-Name=WarpPreview
+Name=Genesi Code Preview
 GenericName=TerminalEmulator
 
-Exec=warp-terminal-preview %U
+Exec=genesi-code %U
 StartupWMClass=dev.warp.WarpPreview
 
 Keywords=shell;prompt;command;commandline;cmd;

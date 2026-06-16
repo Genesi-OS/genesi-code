@@ -11,9 +11,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
+use similar::{Algorithm, ChangeTag, TextDiff};
 use warpui::color::ColorU;
 use warpui::elements::{
-    Border, ClippedScrollStateHandle, ClippedScrollable, Container, CornerRadius,
+    Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
     FormattedTextElement, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
 };
@@ -157,6 +158,7 @@ struct ChatEntry {
     /// For a file write/edit Tool step: `(added, removed)` line counts, rendered
     /// as a `+N −N` diff card. `None` for every other step.
     diff_stat: Option<(u32, u32)>,
+    diff_preview: Option<Vec<DiffPreviewLine>>,
 }
 
 impl ChatEntry {
@@ -171,8 +173,24 @@ impl ChatEntry {
             collapsed: false,
             status: StepStatus::Ok,
             diff_stat: None,
+            diff_preview: None,
         }
     }
+}
+
+#[derive(Clone)]
+enum DiffPreviewLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone)]
+struct DiffPreviewLine {
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    text: String,
+    kind: DiffPreviewLineKind,
 }
 
 /// A file the agent created or edited this turn, tracked so the review bar can
@@ -185,6 +203,7 @@ struct PendingEdit {
     removed: u32,
     /// The file's content before the edit, or `None` if the file was created.
     original: Option<String>,
+    diff_preview: Vec<DiffPreviewLine>,
 }
 
 /// Count lines for a diff stat: 0 for empty, else the number of lines (a
@@ -195,6 +214,54 @@ fn count_lines(s: &str) -> u32 {
     } else {
         s.lines().count() as u32
     }
+}
+
+fn build_diff_preview(original: &str, current: &str) -> Vec<DiffPreviewLine> {
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_lines(original, current);
+
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
+    let mut lines = Vec::new();
+
+    for change in diff.iter_all_changes() {
+        let kind = match change.tag() {
+            ChangeTag::Equal => DiffPreviewLineKind::Context,
+            ChangeTag::Delete => DiffPreviewLineKind::Removed,
+            ChangeTag::Insert => DiffPreviewLineKind::Added,
+        };
+
+        for raw_line in change.value().lines() {
+            let (old_number, new_number) = match kind {
+                DiffPreviewLineKind::Context => {
+                    let nums = (Some(old_line), Some(new_line));
+                    old_line += 1;
+                    new_line += 1;
+                    nums
+                }
+                DiffPreviewLineKind::Removed => {
+                    let nums = (Some(old_line), None);
+                    old_line += 1;
+                    nums
+                }
+                DiffPreviewLineKind::Added => {
+                    let nums = (None, Some(new_line));
+                    new_line += 1;
+                    nums
+                }
+            };
+
+            lines.push(DiffPreviewLine {
+                old_line: old_number,
+                new_line: new_number,
+                text: raw_line.to_string(),
+                kind: kind.clone(),
+            });
+        }
+    }
+
+    lines
 }
 
 /// Events emitted to the workspace.
@@ -239,8 +306,12 @@ pub enum LocalAiChatAction {
     KeepEdits,
     /// Undo the agent's file changes (restore each captured original).
     UndoEdits,
-    /// Open the native diff / code review panel.
-    OpenDiff,
+    /// Expand the detailed diff preview for a transcript file card.
+    OpenDiff(usize),
+    /// Expand/collapse the modified-files review browser.
+    ToggleReviewExpanded,
+    /// Focus a single file inside the expanded review browser.
+    SelectReviewFile(String),
     /// Approve the pending side-effecting tool and run it.
     ApproveTool,
     /// Deny the pending side-effecting tool.
@@ -255,6 +326,8 @@ pub enum LocalAiChatAction {
     SetKey,
     /// Capture the cloud provider's model id in the compose box.
     SetModel,
+    /// Clear the active conversation and start a fresh one.
+    NewChat,
 }
 
 pub struct LocalAiChatView {
@@ -322,6 +395,8 @@ pub struct LocalAiChatView {
     /// Files the agent created/edited this turn, for the review bar (Undo all /
     /// Keep) — each carries its captured pre-edit original so Undo can restore it.
     pending_edits: Vec<PendingEdit>,
+    review_expanded: bool,
+    selected_review_path: Option<String>,
 }
 
 impl LocalAiChatView {
@@ -362,6 +437,8 @@ impl LocalAiChatView {
             input_mode: InputMode::Chat,
             model_picker_open: false,
             pending_edits: Vec::new(),
+            review_expanded: false,
+            selected_review_path: None,
         };
         view.refresh_ai_mode();
         view.refresh_models(ctx);
@@ -693,6 +770,7 @@ impl LocalAiChatView {
             collapsed: false,
             status: StepStatus::Running,
             diff_stat: None,
+            diff_preview: None,
         });
         let turn = self.current_turn;
         let stream = self.build_stream(&self.agent_model, self.agent_messages.clone());
@@ -856,20 +934,38 @@ impl LocalAiChatView {
         }
     }
 
+    fn read_project_file_after_edit(&self, path: &str) -> Option<String> {
+        let root = self.agent_root.as_ref()?;
+        local_agent::resolve_in_project(root, path).and_then(|p| std::fs::read_to_string(p).ok())
+    }
+
     /// Record a successful edit for the review bar. Re-editing the same file keeps
     /// the EARLIEST original (so Undo restores the pre-turn state) and refreshes
     /// the displayed stats.
-    fn record_edit(&mut self, path: String, added: u32, removed: u32, original: Option<String>) {
+    fn record_edit(
+        &mut self,
+        path: String,
+        added: u32,
+        removed: u32,
+        original: Option<String>,
+        diff_preview: Vec<DiffPreviewLine>,
+    ) {
         if let Some(existing) = self.pending_edits.iter_mut().find(|e| e.path == path) {
             existing.added = added;
             existing.removed = removed;
+            existing.diff_preview = diff_preview;
         } else {
             self.pending_edits.push(PendingEdit {
                 path,
                 added,
                 removed,
                 original,
+                diff_preview,
             });
+        }
+
+        if self.selected_review_path.is_none() {
+            self.selected_review_path = self.pending_edits.first().map(|edit| edit.path.clone());
         }
     }
 
@@ -893,6 +989,7 @@ impl LocalAiChatView {
                     collapsed: false,
                     status: StepStatus::Running,
                     diff_stat: None,
+                    diff_preview: None,
                 });
                 self.scroll_to_bottom();
                 ctx.notify();
@@ -928,6 +1025,7 @@ impl LocalAiChatView {
                     collapsed: true,
                     status: StepStatus::Running,
                     diff_stat,
+                    diff_preview: None,
                 });
                 let result = match self.agent_root.clone() {
                     Some(root) => local_agent::run_local_tool(&root, &tool),
@@ -936,7 +1034,19 @@ impl LocalAiChatView {
                 // Record a successful edit for the review bar (Undo all / Keep).
                 if let Some((path, added, removed, original)) = edit_meta {
                     if !result.trim_start().starts_with("error") {
-                        self.record_edit(path, added, removed, original);
+                        let current = self.read_project_file_after_edit(&path).unwrap_or_default();
+                        let diff_preview =
+                            build_diff_preview(original.as_deref().unwrap_or(""), &current);
+                        self.record_edit(
+                            path.clone(),
+                            added,
+                            removed,
+                            original,
+                            diff_preview.clone(),
+                        );
+                        if let Some(last) = self.messages.last_mut() {
+                            last.diff_preview = Some(diff_preview);
+                        }
                     }
                 }
                 self.finish_tool(turn, tool.name(), result, ctx);
@@ -1186,6 +1296,146 @@ impl LocalAiChatView {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
+            .finish()
+    }
+
+    pub fn current_chat_title(&self) -> String {
+        self.messages
+            .iter()
+            .find(|entry| entry.role == ChatRole::User && !entry.text.trim().is_empty())
+            .map(|entry| truncate_middle(entry.text.trim(), 28))
+            .unwrap_or_else(|| "New Chat".to_string())
+    }
+
+    pub fn start_new_chat(&mut self, ctx: &mut ViewContext<Self>) {
+        self.reset_current_chat();
+        ctx.notify();
+    }
+
+    fn reset_current_chat(&mut self) {
+        self.messages.clear();
+        self.error = None;
+        self.pending_tool = None;
+        self.pending_edits.clear();
+        self.review_expanded = false;
+        self.selected_review_path = None;
+        self.agent_messages.clear();
+        self.agent_root = None;
+        self.agent_model.clear();
+        self.agent_step = 0;
+        self.agent_step_buffer.clear();
+        self.agent_tool_summary.clear();
+        self.in_flight = false;
+        self.current_turn += 1;
+    }
+
+    fn selected_review_edit(&self) -> Option<&PendingEdit> {
+        self.selected_review_path
+            .as_ref()
+            .and_then(|path| self.pending_edits.iter().find(|edit| &edit.path == path))
+            .or_else(|| self.pending_edits.first())
+    }
+
+    fn render_diff_preview(
+        &self,
+        appearance: &Appearance,
+        lines: &[DiffPreviewLine],
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        for line in lines {
+            let (prefix, bg, fg) = match line.kind {
+                DiffPreviewLineKind::Context => (
+                    " ",
+                    ColorU::new(0, 0, 0, 0),
+                    theme.disabled_text_color(theme.background()).into(),
+                ),
+                DiffPreviewLineKind::Added => ("+", ColorU::new(15, 143, 106, 36), genesi_green()),
+                DiffPreviewLineKind::Removed => (
+                    "-",
+                    ColorU::new(181, 68, 68, 36),
+                    theme.ui_error_color().into(),
+                ),
+            };
+
+            let old_line = line
+                .old_line
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let new_line = line
+                .new_line
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+
+            let row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(self.mono_text(
+                            appearance,
+                            format!("{old_line:>4}"),
+                            MONO_FONT_SIZE,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                    )
+                    .with_width(34.)
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(self.mono_text(
+                            appearance,
+                            format!("{new_line:>4}"),
+                            MONO_FONT_SIZE,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                    )
+                    .with_width(34.)
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(self.mono_text(
+                            appearance,
+                            prefix.to_string(),
+                            MONO_FONT_SIZE,
+                            fg,
+                            false,
+                        ))
+                        .finish(),
+                    )
+                    .with_width(12.)
+                    .finish(),
+                )
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.mono_text(appearance, line.text.clone(), MONO_FONT_SIZE, fg, true),
+                    )
+                    .finish(),
+                )
+                .finish();
+
+            column.add_child(
+                Container::new(row)
+                    .with_horizontal_padding(8.)
+                    .with_vertical_padding(2.)
+                    .with_background_color(bg)
+                    .finish(),
+            );
+        }
+
+        Container::new(column.finish())
+            .with_uniform_padding(6.)
+            .with_margin_top(4.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_background_color(genesi_card_surface())
             .finish()
     }
 
@@ -1478,7 +1728,11 @@ impl LocalAiChatView {
         let n = self.pending_edits.len();
         let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
         let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
-        let label = format!("{n} file{} need review", if n == 1 { "" } else { "s" });
+        let caret = if self.review_expanded { "v" } else { ">" };
+        let label = format!(
+            "{caret} {n} file{} need review",
+            if n == 1 { "" } else { "s" }
+        );
 
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1524,14 +1778,110 @@ impl LocalAiChatView {
             ))
             .finish();
 
-        let bar = Container::new(row)
-            .with_uniform_padding(8.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-            .with_background_color(genesi_panel_surface())
-            .finish();
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                EventHandler::new(
+                    Container::new(row)
+                        .with_uniform_padding(8.)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+                        .with_background_color(genesi_panel_surface())
+                        .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(LocalAiChatAction::ToggleReviewExpanded);
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+            );
+
+        if self.review_expanded {
+            let selected_path = self
+                .selected_review_edit()
+                .map(|edit| edit.path.clone())
+                .unwrap_or_default();
+
+            let mut file_list =
+                Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+            for edit in &self.pending_edits {
+                let is_selected = edit.path == selected_path;
+                let file_row = Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                self.label_text(
+                                    appearance,
+                                    edit.path.clone(),
+                                    CHIP_FONT_SIZE,
+                                    theme.main_text_color(theme.background()).into(),
+                                    false,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(self.label_text(
+                            appearance,
+                            format!("+{}", edit.added),
+                            CHIP_FONT_SIZE,
+                            genesi_green(),
+                            false,
+                        ))
+                        .with_child(
+                            Container::new(self.label_text(
+                                appearance,
+                                format!("-{}", edit.removed),
+                                CHIP_FONT_SIZE,
+                                theme.ui_error_color().into(),
+                                false,
+                            ))
+                            .with_margin_left(6.)
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_background_color(if is_selected {
+                    ColorU::new(255, 255, 255, 20)
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                })
+                .finish();
+
+                let path = edit.path.clone();
+                file_list.add_child(
+                    EventHandler::new(file_row)
+                        .on_left_mouse_down(move |ctx, _, _| {
+                            ctx.dispatch_typed_action(LocalAiChatAction::SelectReviewFile(
+                                path.clone(),
+                            ));
+                            DispatchEventResult::StopPropagation
+                        })
+                        .finish(),
+                );
+            }
+
+            column.add_child(
+                Container::new(file_list.finish())
+                    .with_margin_top(6.)
+                    .with_uniform_padding(6.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+                    .with_background_color(genesi_panel_surface())
+                    .finish(),
+            );
+
+            if let Some(edit) = self.selected_review_edit() {
+                column.add_child(self.render_diff_preview(appearance, &edit.diff_preview));
+            }
+        }
+
         Some(
-            Container::new(bar)
+            Container::new(column.finish())
                 .with_horizontal_padding(PANEL_PADDING)
                 .with_padding_bottom(4.)
                 .finish(),
@@ -1817,7 +2167,7 @@ impl LocalAiChatView {
                     Container::new(self.chip(
                         appearance,
                         "Open Diff".to_string(),
-                        LocalAiChatAction::OpenDiff,
+                        LocalAiChatAction::OpenDiff(index),
                         false,
                     ))
                     .with_margin_left(8.)
@@ -1847,21 +2197,27 @@ impl LocalAiChatView {
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(header);
 
-        if !entry.collapsed && !entry.text.trim().is_empty() {
-            let body = Container::new(self.mono_text(
-                appearance,
-                entry.text.clone(),
-                MONO_FONT_SIZE,
-                theme.main_text_color(theme.background()).into(),
-                true,
-            ))
-            .with_uniform_padding(8.)
-            .with_margin_top(2.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-            .with_background_color(genesi_card_surface())
-            .finish();
-            column.add_child(body);
+        if !entry.collapsed {
+            if let Some(lines) = &entry.diff_preview {
+                if !lines.is_empty() {
+                    column.add_child(self.render_diff_preview(appearance, lines));
+                }
+            } else if !entry.text.trim().is_empty() {
+                let body = Container::new(self.mono_text(
+                    appearance,
+                    entry.text.clone(),
+                    MONO_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_uniform_padding(8.)
+                .with_margin_top(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+                .with_background_color(genesi_card_surface())
+                .finish();
+                column.add_child(body);
+            }
         }
 
         Container::new(column.finish())
@@ -2119,10 +2475,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::Clear => {
-                self.messages.clear();
-                self.error = None;
-                self.pending_tool = None;
-                self.pending_edits.clear();
+                self.reset_current_chat();
                 ctx.notify();
             }
             LocalAiChatAction::ToggleAttachContext => {
@@ -2201,10 +2554,28 @@ impl TypedActionView for LocalAiChatView {
                     }
                 }
                 self.error = None;
+                self.review_expanded = false;
+                self.selected_review_path = None;
                 ctx.notify();
             }
-            LocalAiChatAction::OpenDiff => {
-                ctx.emit(LocalAiChatEvent::OpenDiff);
+            LocalAiChatAction::OpenDiff(index) => {
+                if let Some(entry) = self.messages.get_mut(*index) {
+                    entry.collapsed = false;
+                }
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleReviewExpanded => {
+                self.review_expanded = !self.review_expanded;
+                if self.review_expanded && self.selected_review_path.is_none() {
+                    self.selected_review_path =
+                        self.pending_edits.first().map(|edit| edit.path.clone());
+                }
+                ctx.notify();
+            }
+            LocalAiChatAction::SelectReviewFile(path) => {
+                self.review_expanded = true;
+                self.selected_review_path = Some(path.clone());
+                ctx.notify();
             }
             LocalAiChatAction::ApproveTool => {
                 if let Some(tool) = self.pending_tool.take() {
@@ -2230,6 +2601,7 @@ impl TypedActionView for LocalAiChatView {
                         collapsed: false,
                         status: StepStatus::Denied,
                         diff_stat: None,
+                        diff_preview: None,
                     };
                     self.messages.push(denied);
                     // Tell the model the user declined so it can adapt or answer.
@@ -2248,6 +2620,10 @@ impl TypedActionView for LocalAiChatView {
                 if let Some(entry) = self.messages.get_mut(*index) {
                     entry.collapsed = !entry.collapsed;
                 }
+                ctx.notify();
+            }
+            LocalAiChatAction::NewChat => {
+                self.reset_current_chat();
                 ctx.notify();
             }
         }

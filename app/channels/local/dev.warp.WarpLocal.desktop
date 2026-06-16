@@ -4,10 +4,10 @@ Version=1.0
 
 Type=Application
 
-Name=WarpLocal
+Name=Genesi Code Local
 GenericName=TerminalEmulator
 
-Exec=warp-terminal-local %U
+Exec=genesi-code %U
 StartupWMClass=dev.warp.WarpLocal
 
 Keywords=shell;prompt;command;commandline;cmd;

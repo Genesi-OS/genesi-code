@@ -308,6 +308,9 @@ pub enum WorkspaceAction {
     ToggleAIAssistant,
     ClickedAIAssistantIcon,
     ToggleLocalAi,
+    SetGenesiModeVibe,
+    SetGenesiModeIde,
+    StartNewLocalChat,
     ToggleKeybindingsPage,
     ShowCommandSearch(CommandSearchOptions),
     CreatePersonalNotebook,
@@ -946,6 +949,9 @@ impl WorkspaceAction {
             | ClickedAIAssistantIcon
             | ToggleAIAssistant
             | ToggleLocalAi
+            | SetGenesiModeVibe
+            | SetGenesiModeIde
+            | StartNewLocalChat
             | OpenCloudAgentSetupGuide
             | ToggleKeybindingsPage
             | ShowCommandSearch(_)

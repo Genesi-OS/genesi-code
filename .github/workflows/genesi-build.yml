@@ -140,11 +140,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/warp dist/genesi-code
-          chmod +x dist/genesi-code
+          install -m755 target/release/warp dist/genesi-code.bin
+          install -m755 resources/linux/launcher/genesi-code.sh dist/genesi-code
           # zstd-compressed tarball for the Release asset (consistent name so the
           # latest-release download URL is stable for the package installer).
-          tar -C dist -caf dist/genesi-code-linux-x86_64.tar.zst genesi-code
+          tar -C dist -caf dist/genesi-code-linux-x86_64.tar.zst genesi-code genesi-code.bin
           ls -lh dist/
 
       - name: Upload build artifact (login-only fallback)
@@ -171,7 +171,7 @@ jobs:
             ```bash
             tar xaf genesi-code-linux-x86_64.tar.zst
             chmod +x genesi-code
-            ./genesi-code            # or: WGPU_BACKEND=gl ./genesi-code on a GPU-less VM
+            ./genesi-code
             ```
             Release build (optimized, self-contained — assets embedded). Latest
             asset is always at the

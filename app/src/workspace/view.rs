@@ -230,7 +230,7 @@ use crate::billing::shared_objects_creation_denied_modal::{
     SharedObjectsCreationDeniedModal, SharedObjectsCreationDeniedModalEvent,
 };
 use crate::changelog_model::{ChangelogModel, ChangelogRequestType, Event as ChangelogEvent};
-use crate::channel::{Channel, ChannelState};
+use crate::channel::ChannelState;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::toast_message::CloudObjectToastMessage;
 use crate::cloud_object::{
@@ -1060,6 +1060,7 @@ pub struct Workspace {
     settings_error_banner_dismissed: bool,
     ai_assistant_panel: ViewHandle<AIAssistantPanelView>,
     local_ai_panel: ViewHandle<LocalAiChatView>,
+    genesi_vibe_mode: bool,
     should_show_ai_assistant_warm_welcome: bool,
     ai_assistant_close_warm_welcome_mouse_state_handle: MouseStateHandle,
     auth_override_warning_modal: ViewHandle<AuthOverrideWarningModal>,
@@ -1676,14 +1677,8 @@ impl Workspace {
         ctx.subscribe_to_view(&welcome_tips_view, move |me, _, event, ctx| {
             me.handle_welcome_tips_event(event, ctx);
         });
-        let show_welcome_tips = !tips_completed.as_ref(ctx).skipped_or_completed;
-        let welcome_tips_view_state = if show_welcome_tips {
-            WelcomeTipsViewState::Available {
-                is_popup_open: false,
-            }
-        } else {
-            WelcomeTipsViewState::Unavailable
-        };
+        let _ = tips_completed;
+        let welcome_tips_view_state = WelcomeTipsViewState::Unavailable;
         (welcome_tips_view, welcome_tips_view_state)
     }
 
@@ -3056,16 +3051,7 @@ impl Workspace {
 
         // Show the Warp AI warm welcome iff the user hasn't dismissed it nor interacted with Warp AI before.
         // Also, avoid showing it in integration tests to prevent interaction with other tests.
-        let mut should_show_ai_assistant_warm_welcome: bool = !FeatureFlag::AgentMode.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
-            && !matches!(ChannelState::channel(), Channel::Integration)
-            && ctx
-                .private_user_preferences()
-                .read_value(settings::DISMISSED_AI_ASSISTANT_WELCOME_KEY)
-                .unwrap_or_default()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .map(|dismissed: bool| !dismissed)
-                .unwrap_or(true);
+        let mut should_show_ai_assistant_warm_welcome = false;
 
         // Don't automatically show the Warp AI welcome during onboarding if the block onboarding flow is being used.
         // This way, we can delay the reveal until the end of the onboarding flow so as not to overwhelm the user.
@@ -3345,13 +3331,14 @@ impl Workspace {
             shared_objects_creation_denied_modal,
             file_upload_sessions: Default::default(),
             ai_fact_view,
-            left_panel_open: false,
+            left_panel_open: true,
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
             left_panel_view,
             left_panel_views,
             right_panel_view,
             working_directories_model,
+            genesi_vibe_mode: false,
             shown_staging_banner_count: 0,
 
             #[cfg(target_family = "wasm")]
@@ -19860,7 +19847,6 @@ impl Workspace {
 
     fn render_genesi_app_switcher(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let muted = theme.disabled_text_color(theme.background());
         let active = theme.active_ui_text_color();
 
         let logo = Container::new(
@@ -19872,25 +19858,19 @@ impl Workspace {
         .with_margin_right(8.)
         .finish();
 
-        let vibe = Container::new(
-            Text::new_inline("Vibe", appearance.ui_font_family(), 12.)
-                .with_color(muted.into())
-                .finish(),
-        )
-        .with_horizontal_padding(9.)
-        .with_vertical_padding(5.)
-        .finish();
+        let vibe = self.render_genesi_mode_button(
+            appearance,
+            "Vibe",
+            self.genesi_vibe_mode,
+            WorkspaceAction::SetGenesiModeVibe,
+        );
 
-        let ide = Container::new(
-            Text::new_inline("IDE", appearance.ui_font_family(), 12.)
-                .with_color(active.into())
-                .finish(),
-        )
-        .with_horizontal_padding(9.)
-        .with_vertical_padding(5.)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
-        .with_background(internal_colors::fg_overlay_2(theme))
-        .finish();
+        let ide = self.render_genesi_mode_button(
+            appearance,
+            "IDE",
+            !self.genesi_vibe_mode,
+            WorkspaceAction::SetGenesiModeIde,
+        );
 
         let mode_switch = Container::new(
             Flex::row()
@@ -19909,6 +19889,132 @@ impl Workspace {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(logo)
             .with_child(mode_switch)
+            .finish()
+    }
+
+    fn render_genesi_mode_button(
+        &self,
+        appearance: &Appearance,
+        label: &'static str,
+        is_active: bool,
+        action: WorkspaceAction,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color = if is_active {
+            theme.active_ui_text_color()
+        } else {
+            theme.disabled_text_color(theme.background())
+        };
+        let background = if is_active {
+            internal_colors::fg_overlay_2(theme)
+        } else {
+            Fill::Solid(ColorU::new(0, 0, 0, 0))
+        };
+
+        appearance
+            .ui_builder()
+            .button(ButtonVariant::Text, MouseStateHandle::default())
+            .with_custom_label(
+                Container::new(
+                    Text::new_inline(label, appearance.ui_font_family(), 12.)
+                        .with_color(text_color.into())
+                        .finish(),
+                )
+                .with_horizontal_padding(9.)
+                .with_vertical_padding(5.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+                .with_background(background)
+                .finish(),
+            )
+            .build()
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish()
+    }
+
+    fn render_genesi_vibe_sidebar(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let chat_title = self.local_ai_panel.as_ref(app).current_chat_title();
+
+        let new_chat_button = appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, MouseStateHandle::default())
+            .with_custom_label(
+                Text::new_inline("New Chat", appearance.ui_font_family(), 12.)
+                    .with_color(theme.active_ui_text_color().into())
+                    .finish(),
+            )
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::StartNewLocalChat))
+            .finish();
+
+        let current_chat = Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(
+                    Text::new_inline("Chats", appearance.ui_font_family(), 11.)
+                        .with_color(theme.disabled_text_color(theme.background()).into())
+                        .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        Text::new_inline(chat_title, appearance.ui_font_family(), 12.)
+                            .with_color(theme.active_ui_text_color().into())
+                            .with_clip(ClipConfig::ellipsis())
+                            .finish(),
+                    )
+                    .with_margin_top(10.)
+                    .with_horizontal_padding(10.)
+                    .with_vertical_padding(10.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_background(internal_colors::fg_overlay_1(theme))
+                    .with_border(Border::all(1.).with_border_fill(genesi_shell_panel_border()))
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_margin_top(14.)
+        .finish();
+
+        self.wrap_in_panel_surface(
+            appearance,
+            &PanelPosition::Left,
+            Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(new_chat_button)
+                    .with_child(current_chat)
+                    .finish(),
+            )
+            .with_uniform_padding(14.)
+            .finish(),
+            genesi_shell_panel_radius(),
+        )
+    }
+
+    fn render_genesi_vibe_layout(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+
+        Flex::row()
+            .with_child(
+                ConstrainedBox::new(self.render_genesi_vibe_sidebar(appearance, app))
+                    .with_width(248.)
+                    .finish(),
+            )
+            .with_child(Self::render_panel_separator(app))
+            .with_child(
+                Expanded::new(
+                    1.,
+                    self.wrap_in_main_surface(
+                        appearance,
+                        ChildView::new(&self.local_ai_panel).finish(),
+                    ),
+                )
+                .finish(),
+            )
             .finish()
     }
 
@@ -21966,6 +22072,10 @@ impl Workspace {
         terminal_view: Box<dyn Element>,
         hide_vertical_tabs: bool,
     ) -> Box<dyn Element> {
+        if self.genesi_vibe_mode {
+            return self.render_genesi_vibe_layout(app);
+        }
+
         let appearance = Appearance::as_ref(app);
         let mut panels_view = Flex::row();
         let mut prev_panel_added = false;
@@ -24114,7 +24224,30 @@ impl TypedActionView for Workspace {
                     ctx
                 );
             }
-            ToggleLocalAi => self.toggle_local_ai_panel(ctx),
+            ToggleLocalAi => {
+                self.genesi_vibe_mode = false;
+                self.toggle_local_ai_panel(ctx);
+            }
+            SetGenesiModeVibe => {
+                self.genesi_vibe_mode = true;
+                self.current_workspace_state.is_local_ai_panel_open = false;
+                self.current_workspace_state.is_ai_assistant_panel_open = false;
+                self.current_workspace_state.is_resource_center_open = false;
+                ctx.focus(&self.local_ai_panel);
+                ctx.notify();
+            }
+            SetGenesiModeIde => {
+                self.genesi_vibe_mode = false;
+                ctx.notify();
+            }
+            StartNewLocalChat => {
+                self.genesi_vibe_mode = true;
+                self.current_workspace_state.is_local_ai_panel_open = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.start_new_chat(ctx));
+                ctx.focus(&self.local_ai_panel);
+                ctx.notify();
+            }
             ClickedAIAssistantIcon => {
                 if !FeatureFlag::AgentMode.is_enabled() {
                     self.toggle_ai_assistant_panel(ctx);
