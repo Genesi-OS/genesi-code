@@ -4714,6 +4714,9 @@ impl Workspace {
             LocalAiChatEvent::OpenDiff => {
                 ctx.notify();
             }
+            LocalAiChatEvent::StateChanged => {
+                ctx.notify();
+            }
             LocalAiChatEvent::SubmitPrompt(text) => {
                 // Gather the focused file's context and the project root now
                 // (fresh) and hand them to the panel, which decides whether to
@@ -19952,7 +19955,7 @@ impl Workspace {
         app: &AppContext,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let chat_title = self.local_ai_panel.as_ref(app).current_chat_title();
+        let chats = self.local_ai_panel.as_ref(app).chat_summaries();
 
         let new_chat_button = appearance
             .ui_builder()
@@ -19969,33 +19972,49 @@ impl Workspace {
             .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::StartNewLocalChat))
             .finish();
 
-        let current_chat = Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(
-                    Text::new_inline("Chats", appearance.ui_font_family(), 11.)
-                        .with_color(theme.disabled_text_color(theme.background()).into())
-                        .finish(),
-                )
-                .with_child(
-                    Container::new(
-                        Text::new_inline(chat_title, appearance.ui_font_family(), 12.)
-                            .with_color(theme.active_ui_text_color().into())
-                            .with_clip(ClipConfig::ellipsis())
-                            .finish(),
-                    )
-                    .with_margin_top(10.)
-                    .with_horizontal_padding(10.)
-                    .with_vertical_padding(10.)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .with_background(internal_colors::fg_overlay_1(theme))
-                    .with_border(Border::all(1.).with_border_fill(genesi_shell_panel_border()))
-                    .finish(),
-                )
+        let mut chat_column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        chat_column.add_child(
+            Text::new_inline("Chats", appearance.ui_font_family(), 11.)
+                .with_color(theme.disabled_text_color(theme.background()).into())
                 .finish(),
-        )
-        .with_margin_top(14.)
-        .finish();
+        );
+        for chat in chats {
+            let chat_id = chat.id.clone();
+            let row = Container::new(
+                Text::new_inline(chat.title, appearance.ui_font_family(), 12.)
+                    .with_color(theme.active_ui_text_color().into())
+                    .with_clip(ClipConfig::ellipsis())
+                    .finish(),
+            )
+            .with_margin_top(10.)
+            .with_horizontal_padding(10.)
+            .with_vertical_padding(10.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_background(if chat.is_active {
+                internal_colors::fg_overlay_1(theme)
+            } else {
+                Fill::Solid(ColorU::new(0, 0, 0, 0))
+            })
+            .with_border(Border::all(1.).with_border_fill(if chat.is_active {
+                Fill::Solid(genesi_shell_panel_border())
+            } else {
+                theme.outline()
+            }))
+            .finish();
+            chat_column.add_child(
+                EventHandler::new(row)
+                    .on_left_mouse_down(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(WorkspaceAction::OpenLocalChatSession(
+                            chat_id.clone(),
+                        ));
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish(),
+            );
+        }
+        let current_chat = Container::new(chat_column.finish())
+            .with_margin_top(14.)
+            .finish();
 
         self.wrap_in_panel_surface(
             appearance,
@@ -24270,6 +24289,17 @@ impl TypedActionView for Workspace {
                 self.local_ai_panel.update(ctx, |panel, ctx| {
                     panel.set_vibe_mode(true, ctx);
                     panel.start_new_chat(ctx);
+                });
+                ctx.focus(&self.local_ai_panel);
+                ctx.notify();
+            }
+            OpenLocalChatSession(chat_id) => {
+                self.genesi_vibe_mode = true;
+                self.current_workspace_state.is_local_ai_panel_open = false;
+                let chat_id = chat_id.clone();
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.set_vibe_mode(true, ctx);
+                    panel.open_chat(&chat_id, ctx);
                 });
                 ctx.focus(&self.local_ai_panel);
                 ctx.notify();

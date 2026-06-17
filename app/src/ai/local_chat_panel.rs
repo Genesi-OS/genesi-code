@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -47,6 +48,7 @@ const PANEL_PADDING: f32 = 8.;
 const MODEL_LABEL_MAX_CHARS: usize = 34;
 const VIBE_COLUMN_WIDTH: f32 = 760.;
 const CLOUD_KEYS_STORAGE_KEY: &str = "GenesiCodeCloudApiKeys";
+const MEMPALACE_STORAGE_KEY: &str = "GenesiCodeMempalaceV1";
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
 const SCROLL_TO_BOTTOM: f32 = 1.0e7;
@@ -152,7 +154,7 @@ impl CloudKeyStore {
 }
 
 /// Who authored a transcript entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ChatRole {
     User,
     /// The model's final, human-facing answer — rendered as markdown.
@@ -169,7 +171,7 @@ enum ChatRole {
 }
 
 /// How an agent step (Tool / Command / Thought) is doing, for its status icon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum StepStatus {
     Running,
     Ok,
@@ -178,6 +180,7 @@ enum StepStatus {
 }
 
 /// One line in the transcript. The assistant's text grows as tokens stream in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatEntry {
     role: ChatRole,
     text: String,
@@ -215,14 +218,14 @@ impl ChatEntry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum DiffPreviewLineKind {
     Context,
     Added,
     Removed,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiffPreviewLine {
     old_line: Option<usize>,
     new_line: Option<usize>,
@@ -241,6 +244,25 @@ struct PendingEdit {
     /// The file's content before the edit, or `None` if the file was created.
     original: Option<String>,
     diff_preview: Vec<DiffPreviewLine>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedLocalChat {
+    id: String,
+    #[serde(default)]
+    messages: Vec<ChatEntry>,
+    #[serde(default)]
+    agent_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MempalaceState {
+    #[serde(default)]
+    active_chat_id: String,
+    #[serde(default)]
+    chats: Vec<PersistedLocalChat>,
 }
 
 /// Count lines for a diff stat: 0 for empty, else the number of lines (a
@@ -311,6 +333,15 @@ pub enum LocalAiChatEvent {
     /// and calls back into [`LocalAiChatView::send_with_context`]. Routing this
     /// through the workspace is what gives the panel workspace awareness.
     SubmitPrompt(String),
+    /// The persisted chat list or active chat changed.
+    StateChanged,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalChatSummary {
+    pub id: String,
+    pub title: String,
+    pub is_active: bool,
 }
 
 /// Click actions dispatched by the header chips.
@@ -376,6 +407,8 @@ pub enum LocalAiChatAction {
 pub struct LocalAiChatView {
     input: ViewHandle<SubmittableTextInput>,
     messages: Vec<ChatEntry>,
+    active_chat_id: String,
+    chats: Vec<PersistedLocalChat>,
     transcript_scroll: ClippedScrollStateHandle,
     vibe_mode: bool,
 
@@ -460,6 +493,8 @@ impl LocalAiChatView {
         let mut view = Self {
             input,
             messages: Vec::new(),
+            active_chat_id: String::new(),
+            chats: Vec::new(),
             transcript_scroll: ClippedScrollStateHandle::default(),
             vibe_mode: false,
             endpoint: LocalEndpoint::Ollama,
@@ -491,6 +526,7 @@ impl LocalAiChatView {
             selected_review_path: None,
         };
         view.load_cloud_keys(ctx);
+        view.load_mempalace(ctx);
         view.refresh_ai_mode();
         view.refresh_models(ctx);
         view
@@ -815,6 +851,7 @@ impl LocalAiChatView {
 
         self.messages
             .push(ChatEntry::prose(ChatRole::User, prompt, context_label));
+        self.persist_mempalace(ctx, true);
 
         // System prompt: the agent variant (with tool instructions) in agent
         // mode, otherwise the plain chat prompt. Then the attached file context,
@@ -976,6 +1013,7 @@ impl LocalAiChatView {
                 self.in_flight = false;
                 self.refresh_ai_mode();
                 self.scroll_to_bottom();
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
         }
@@ -1027,6 +1065,7 @@ impl LocalAiChatView {
             }
         }
         self.error = Some(message);
+        self.persist_mempalace(ctx, false);
         ctx.notify();
     }
 
@@ -1212,6 +1251,7 @@ impl LocalAiChatView {
             "TOOL RESULT ({tool_name}):\n{result}"
         )));
         self.scroll_to_bottom();
+        self.persist_mempalace(ctx, false);
         ctx.notify();
         self.run_agent_step(ctx);
     }
@@ -1253,6 +1293,7 @@ impl LocalAiChatView {
         }
         self.error = None;
         self.refresh_ai_mode();
+        self.persist_mempalace(ctx, false);
         ctx.notify();
     }
 
@@ -1299,6 +1340,7 @@ impl LocalAiChatView {
                 // tokens/s and activity likely changed — refresh the badge.
                 self.refresh_ai_mode();
                 self.scroll_to_bottom();
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
             Err(e) => {
@@ -1310,6 +1352,7 @@ impl LocalAiChatView {
                     }
                 }
                 self.error = Some(format!("{}: {e}", self.active_backend_error_label()));
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
         }
@@ -1487,15 +1530,19 @@ impl LocalAiChatView {
     }
 
     pub fn current_chat_title(&self) -> String {
-        self.messages
-            .iter()
-            .find(|entry| entry.role == ChatRole::User && !entry.text.trim().is_empty())
-            .map(|entry| truncate_middle(entry.text.trim(), 28))
-            .unwrap_or_else(|| "New Chat".to_string())
+        Self::chat_title_from_entries(&self.messages)
     }
 
     pub fn start_new_chat(&mut self, ctx: &mut ViewContext<Self>) {
-        self.reset_current_chat();
+        self.stop_turn(ctx);
+        self.persist_mempalace(ctx, false);
+        if self.messages.is_empty() {
+            self.reset_current_chat();
+        } else {
+            self.active_chat_id = Self::new_chat_id();
+            self.reset_current_chat();
+        }
+        self.persist_mempalace(ctx, true);
         ctx.notify();
     }
 
@@ -2901,6 +2948,7 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::Clear => {
                 self.reset_current_chat();
+                self.persist_mempalace(ctx, true);
                 ctx.notify();
             }
             LocalAiChatAction::ToggleAttachContext => {
@@ -2957,6 +3005,9 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::KeepEdits => {
                 self.pending_edits.clear();
+                self.review_expanded = false;
+                self.selected_review_path = None;
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
             LocalAiChatAction::UndoEdits => {
@@ -2978,9 +3029,10 @@ impl TypedActionView for LocalAiChatView {
                         }
                     }
                 }
-                self.error = None;
+                self.pending_edits.clear();
                 self.review_expanded = false;
                 self.selected_review_path = None;
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
             LocalAiChatAction::OpenDiff(index) => {
@@ -3030,11 +3082,11 @@ impl TypedActionView for LocalAiChatView {
                         diff_preview: None,
                     };
                     self.messages.push(denied);
-                    // Tell the model the user declined so it can adapt or answer.
                     self.agent_messages.push(ChatMessage::user(format!(
                         "TOOL RESULT ({name}):\nThe user denied this action."
                     )));
                     self.agent_step += 1;
+                    self.persist_mempalace(ctx, false);
                     self.run_agent_step(ctx);
                 }
                 ctx.notify();
@@ -3056,12 +3108,187 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::NewChat => {
-                self.reset_current_chat();
-                ctx.notify();
+                self.start_new_chat(ctx);
             }
             LocalAiChatAction::SubmitPromptInput => {
                 self.input.update(ctx, |input, ctx| input.submit(ctx));
             }
+        }
+    }
+}
+
+impl LocalAiChatView {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default()
+    }
+
+    fn new_chat_id() -> String {
+        format!("chat-{}", Self::now_ms())
+    }
+
+    fn chat_title_from_entries(entries: &[ChatEntry]) -> String {
+        entries
+            .iter()
+            .find(|entry| entry.role == ChatRole::User && !entry.text.trim().is_empty())
+            .map(|entry| truncate_middle(entry.text.trim(), 28))
+            .unwrap_or_else(|| "New Chat".to_string())
+    }
+
+    fn prune_chats(&mut self) {
+        let active_chat_id = self.active_chat_id.clone();
+        self.chats.retain(|chat| {
+            if chat.id == active_chat_id {
+                return true;
+            }
+            !chat.messages.is_empty()
+        });
+        self.chats
+            .sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    }
+
+    fn snapshot_current_chat(&self) -> PersistedLocalChat {
+        PersistedLocalChat {
+            id: self.active_chat_id.clone(),
+            messages: self.messages.clone(),
+            agent_messages: self.agent_messages.clone(),
+            updated_at_ms: Self::now_ms(),
+        }
+    }
+
+    fn persist_mempalace(&mut self, ctx: &mut ViewContext<Self>, emit_state_changed: bool) {
+        if self.active_chat_id.is_empty() {
+            self.active_chat_id = Self::new_chat_id();
+        }
+
+        let snapshot = self.snapshot_current_chat();
+        if let Some(existing) = self.chats.iter_mut().find(|chat| chat.id == snapshot.id) {
+            *existing = snapshot;
+        } else {
+            self.chats.push(snapshot);
+        }
+        self.prune_chats();
+
+        let state = MempalaceState {
+            active_chat_id: self.active_chat_id.clone(),
+            chats: self.chats.clone(),
+        };
+        match serde_json::to_string(&state) {
+            Ok(json) => {
+                if let Err(err) = ctx
+                    .secure_storage()
+                    .write_value_with_owner_only_fallback(MEMPALACE_STORAGE_KEY, &json)
+                {
+                    log::warn!("Failed to persist Genesi chat mempalace: {err:#}");
+                }
+            }
+            Err(err) => {
+                log::warn!("Failed to serialize Genesi chat mempalace: {err:#}");
+            }
+        }
+
+        if emit_state_changed {
+            ctx.emit(LocalAiChatEvent::StateChanged);
+        }
+    }
+
+    fn restore_chat(&mut self, chat: &PersistedLocalChat) {
+        self.messages = chat.messages.clone();
+        self.agent_messages = chat.agent_messages.clone();
+        self.error = None;
+        self.pending_tool = None;
+        self.pending_edits.clear();
+        self.review_expanded = false;
+        self.selected_review_path = None;
+        self.agent_root = None;
+        self.agent_model.clear();
+        self.agent_step = 0;
+        self.agent_step_buffer.clear();
+        self.agent_tool_summary.clear();
+        self.in_flight = false;
+        self.current_turn += 1;
+    }
+
+    fn load_mempalace(&mut self, ctx: &mut ViewContext<Self>) {
+        match ctx.secure_storage().read_value(MEMPALACE_STORAGE_KEY) {
+            Ok(json) => match serde_json::from_str::<MempalaceState>(&json) {
+                Ok(state) => {
+                    self.active_chat_id = state.active_chat_id;
+                    self.chats = state.chats;
+                    self.prune_chats();
+                    if self.active_chat_id.is_empty() {
+                        self.active_chat_id = self
+                            .chats
+                            .first()
+                            .map(|chat| chat.id.clone())
+                            .unwrap_or_else(Self::new_chat_id);
+                    }
+                    if let Some(chat) = self
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == self.active_chat_id)
+                        .cloned()
+                    {
+                        self.restore_chat(&chat);
+                    } else {
+                        self.messages.clear();
+                        self.agent_messages.clear();
+                        self.persist_mempalace(ctx, false);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Failed to deserialize Genesi chat mempalace: {err:#}");
+                    self.active_chat_id = Self::new_chat_id();
+                    self.persist_mempalace(ctx, false);
+                }
+            },
+            Err(err) => {
+                if !matches!(err, warpui_extras::secure_storage::Error::NotFound) {
+                    log::warn!("Failed to read Genesi chat mempalace: {err:#}");
+                }
+                self.active_chat_id = Self::new_chat_id();
+                self.persist_mempalace(ctx, false);
+            }
+        }
+    }
+
+    pub fn chat_summaries(&self) -> Vec<LocalChatSummary> {
+        let mut chats = self.chats.clone();
+        if !self.active_chat_id.is_empty() {
+            let snapshot = self.snapshot_current_chat();
+            if let Some(existing) = chats.iter_mut().find(|chat| chat.id == snapshot.id) {
+                *existing = snapshot;
+            } else {
+                chats.push(snapshot);
+            }
+        }
+        chats.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        chats
+            .into_iter()
+            .map(|chat| LocalChatSummary {
+                id: chat.id.clone(),
+                title: Self::chat_title_from_entries(&chat.messages),
+                is_active: chat.id == self.active_chat_id,
+            })
+            .collect()
+    }
+
+    pub fn open_chat(&mut self, chat_id: &str, ctx: &mut ViewContext<Self>) {
+        if chat_id == self.active_chat_id {
+            return;
+        }
+
+        self.stop_turn(ctx);
+        self.persist_mempalace(ctx, false);
+
+        if let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id).cloned() {
+            self.active_chat_id = chat.id.clone();
+            self.restore_chat(&chat);
+            self.scroll_to_bottom();
+            ctx.emit(LocalAiChatEvent::StateChanged);
+            ctx.notify();
         }
     }
 }

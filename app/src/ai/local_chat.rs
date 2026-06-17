@@ -28,7 +28,7 @@ const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// A single chat message in the OpenAI `chat/completions` shape.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
