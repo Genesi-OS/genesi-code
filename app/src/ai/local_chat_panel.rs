@@ -638,6 +638,14 @@ impl LocalAiChatView {
         self.cloud.is_ready(self.active_cloud_key())
     }
 
+    fn active_backend_error_label(&self) -> String {
+        if self.cloud_active {
+            format!("{} error", self.cloud.provider.label())
+        } else {
+            "Local model error".to_string()
+        }
+    }
+
     fn save_cloud_keys(&self, ctx: &mut ViewContext<Self>) -> Result<()> {
         let json = serde_json::to_string(&self.cloud_keys)?;
         ctx.secure_storage()
@@ -922,7 +930,11 @@ impl LocalAiChatView {
             }
             // The step is settled in `on_agent_step_end`.
             Ok(ChatStreamItem::Done) => {}
-            Err(e) => self.finish_agent_with_error(turn, format!("Local model error: {e}"), ctx),
+            Err(e) => self.finish_agent_with_error(
+                turn,
+                format!("{}: {e}", self.active_backend_error_label()),
+                ctx,
+            ),
         }
     }
 
@@ -1297,7 +1309,7 @@ impl LocalAiChatView {
                         self.messages.pop();
                     }
                 }
-                self.error = Some(format!("Local model error: {e}"));
+                self.error = Some(format!("{}: {e}", self.active_backend_error_label()));
                 ctx.notify();
             }
         }

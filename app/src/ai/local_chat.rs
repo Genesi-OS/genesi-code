@@ -270,6 +270,11 @@ pub fn stream_chat_cloud(
     }
 }
 
+fn cloud_http_client() -> http_client::Client {
+    http_client::Client::from_client_builder(reqwest::Client::builder().no_proxy())
+        .unwrap_or_else(|_| http_client::Client::new())
+}
+
 /// ollama's native `/api/chat` with `stream: true`: parse the NDJSON token
 /// stream and yield tokens as they arrive. The OpenAI-compat endpoint hangs on
 /// some ollama versions, so we use the native API the AI Mode monitor uses.
@@ -385,7 +390,7 @@ fn stream_chat_openai_sse(
     // timeout arms a Tokio timer at construction → "there is no reactor running"
     // panic. The ollama path can use a timeout because it's polled lazily under
     // spawn_stream_local (which has a Tokio context); the SSE path cannot.
-    let client = http_client::Client::new();
+    let client = cloud_http_client();
     let mut request = client.post(url);
     // BYOK: cloud providers (OpenAI / OpenRouter / Groq / HuggingFace …) need the
     // user's key as a bearer token. The local Turbo server ignores auth, so it's
@@ -489,7 +494,7 @@ fn stream_chat_anthropic_sse(
         system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
     };
 
-    let client = http_client::Client::new();
+    let client = cloud_http_client();
     let event_source = client
         .post(format!(
             "{}/v1/messages",
