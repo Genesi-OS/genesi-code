@@ -158,6 +158,22 @@ struct ChatRequest<'a> {
     stream: bool,
 }
 
+#[derive(Serialize)]
+struct AnthropicChatRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    messages: &'a [AnthropicInputMessage],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicInputMessage {
+    role: String,
+    content: String,
+}
+
 #[derive(Deserialize)]
 struct ChatChunk {
     #[serde(default)]
@@ -243,12 +259,15 @@ pub fn stream_chat(
 /// user's own API key sent as a bearer token. Local stays the default; this is
 /// purely opt-in for a bigger/faster model than the machine can run.
 pub fn stream_chat_cloud(
-    base_url: &str,
+    provider: CloudProviderKind,
     model: &str,
     api_key: String,
     messages: Vec<ChatMessage>,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
-    stream_chat_openai_sse(base_url, model, messages, Some(api_key)).boxed()
+    match provider {
+        CloudProviderKind::Anthropic => stream_chat_anthropic_sse(model, messages, api_key).boxed(),
+        _ => stream_chat_openai_sse(provider.base_url(), model, messages, Some(api_key)).boxed(),
+    }
 }
 
 /// ollama's native `/api/chat` with `stream: true`: parse the NDJSON token
@@ -417,6 +436,106 @@ fn stream_chat_openai_sse(
                     source = cause.source();
                 }
                 Some(Err(anyhow!("local chat stream error: {err}{detail}")))
+            }
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    delta: Option<AnthropicStreamDelta>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamDelta {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+fn stream_chat_anthropic_sse(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    api_key: String,
+) -> impl Stream<Item = Result<ChatStreamItem>> {
+    const ANTHROPIC_VERSION: &str = "2023-06-01";
+    const ANTHROPIC_MAX_TOKENS: u32 = 2048;
+
+    let mut system_parts = Vec::new();
+    let mut anthropic_messages = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => system_parts.push(message.content),
+            "user" | "assistant" => anthropic_messages.push(AnthropicInputMessage {
+                role: message.role,
+                content: message.content,
+            }),
+            _ => anthropic_messages.push(AnthropicInputMessage {
+                role: "user".to_string(),
+                content: message.content,
+            }),
+        }
+    }
+
+    let body = AnthropicChatRequest {
+        model,
+        max_tokens: ANTHROPIC_MAX_TOKENS,
+        messages: &anthropic_messages,
+        stream: true,
+        system: (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
+    };
+
+    let client = http_client::Client::new();
+    let event_source = client
+        .post(format!(
+            "{}/v1/messages",
+            CloudProviderKind::Anthropic.base_url()
+        ))
+        .header("content-type", "application/json")
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("x-api-key", api_key.trim())
+        .json(&body)
+        .eventsource();
+
+    event_source.filter_map(|event| async move {
+        match event {
+            Ok(Event::Open) => None,
+            Ok(Event::Message(message)) => {
+                let data = message.data.trim();
+                if data == "[DONE]" {
+                    return Some(Ok(ChatStreamItem::Done));
+                }
+                match serde_json::from_str::<AnthropicStreamEvent>(data) {
+                    Ok(parsed) => match parsed.kind.as_str() {
+                        "content_block_delta" => parsed
+                            .delta
+                            .filter(|delta| delta.kind == "text_delta")
+                            .and_then(|delta| delta.text)
+                            .filter(|text| !text.is_empty())
+                            .map(ChatStreamItem::Token)
+                            .map(Ok),
+                        "message_stop" => Some(Ok(ChatStreamItem::Done)),
+                        _ => None,
+                    },
+                    Err(err) => {
+                        log::warn!("anthropic chat: skipping malformed chunk: {err}");
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                use std::error::Error as _;
+                let mut detail = String::new();
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    detail.push_str(&format!(": {cause}"));
+                    source = cause.source();
+                }
+                Some(Err(anyhow!("cloud chat stream error: {err}{detail}")))
             }
         }
     })
@@ -597,61 +716,115 @@ pub fn set_ai_mode_force(value: &str) -> Result<()> {
 /// endpoint works. Persisted to `~/.config/genesi-code/cloud.json`. Local stays
 /// the default — this is purely opt-in, for a bigger/faster model than the
 /// machine can run (or a frontier model for hard tasks). Stored on-device only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudProviderKind {
+    HuggingFace,
+    OpenAI,
+    Anthropic,
+    Gemini,
+}
+
+impl Default for CloudProviderKind {
+    fn default() -> Self {
+        Self::HuggingFace
+    }
+}
+
+impl CloudProviderKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "Hugging Face",
+            Self::OpenAI => "OpenAI",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Google Gemini",
+        }
+    }
+
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "https://router.huggingface.co/v1",
+            Self::OpenAI => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "openai/gpt-oss-120b:cerebras",
+            Self::OpenAI => "gpt-4o-mini",
+            Self::Anthropic => "claude-sonnet-4-6",
+            Self::Gemini => "gemini-3.5-flash",
+        }
+    }
+
+    pub fn suggested_models(self) -> &'static [&'static str] {
+        match self {
+            Self::HuggingFace => &[
+                "openai/gpt-oss-120b:cerebras",
+                "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+                "Qwen/Qwen2.5-Coder-32B-Instruct",
+                "meta-llama/Llama-3.1-8B-Instruct",
+            ],
+            Self::OpenAI => &["gpt-5.4", "gpt-4o-mini"],
+            Self::Anthropic => &[
+                "claude-fable-5",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5",
+            ],
+            Self::Gemini => &["gemini-3.5-flash"],
+        }
+    }
+
+    pub fn from_legacy(label: &str, base_url: &str) -> Self {
+        let normalized = format!("{label}\n{base_url}").to_ascii_lowercase();
+        if normalized.contains("anthropic") || normalized.contains("claude") {
+            Self::Anthropic
+        } else if normalized.contains("gemini")
+            || normalized.contains("generativelanguage.googleapis.com")
+        {
+            Self::Gemini
+        } else if normalized.contains("openai") || normalized.contains("api.openai.com") {
+            Self::OpenAI
+        } else {
+            Self::HuggingFace
+        }
+    }
+}
+
+pub fn cloud_presets() -> &'static [CloudProviderKind] {
+    &[
+        CloudProviderKind::HuggingFace,
+        CloudProviderKind::OpenAI,
+        CloudProviderKind::Anthropic,
+        CloudProviderKind::Gemini,
+    ]
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudConfig {
-    /// Display label, e.g. "HuggingFace" or "OpenAI".
+    /// Selected cloud provider.
     #[serde(default)]
-    pub label: String,
-    /// OpenAI-compatible base URL (usually ending in `/v1`).
-    #[serde(default)]
-    pub base_url: String,
-    /// The user's API key, sent as a bearer token.
-    #[serde(default)]
-    pub api_key: String,
+    pub provider: CloudProviderKind,
     /// The model id to request, e.g. `gpt-4o-mini` or a Hugging Face repo id.
     #[serde(default)]
     pub model: String,
 }
 
 impl CloudConfig {
-    /// Whether this config can actually be used (has an endpoint + key).
-    pub fn is_ready(&self) -> bool {
-        !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
+    pub fn with_defaults(mut self) -> Self {
+        if self.model.trim().is_empty() {
+            self.model = self.provider.default_model().to_string();
+        }
+        self
     }
-}
 
-/// Provider presets: `(label, base_url, default_model)`. Picking one fills in the
-/// endpoint + a sensible default model so the user only has to paste their key.
-/// Hugging Face's router exposes many models' free inference API behind one key.
-pub fn cloud_presets() -> &'static [(&'static str, &'static str, &'static str)] {
-    &[
-        (
-            "HuggingFace",
-            "https://router.huggingface.co/v1",
-            "meta-llama/Llama-3.1-8B-Instruct",
-        ),
-        ("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
-        (
-            "OpenRouter",
-            "https://openrouter.ai/api/v1",
-            "meta-llama/llama-3.1-8b-instruct",
-        ),
-        (
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            "llama-3.1-8b-instant",
-        ),
-        (
-            "Together",
-            "https://api.together.xyz/v1",
-            "meta-llama/Llama-3.1-8B-Instruct-Turbo",
-        ),
-        (
-            "Google Gemini",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-1.5-flash",
-        ),
-    ]
+    /// Whether this config can actually be used (has a key + model).
+    pub fn is_ready(&self, api_key: &str) -> bool {
+        !self.model.trim().is_empty() && !api_key.trim().is_empty()
+    }
 }
 
 /// Path to the on-device BYOK config (`$XDG_CONFIG_HOME` or `~/.config`).
@@ -667,16 +840,59 @@ pub fn cloud_config_path() -> Option<PathBuf> {
 pub fn load_cloud_config() -> Option<CloudConfig> {
     let path = cloud_config_path()?;
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    serde_json::from_str::<CloudConfig>(&raw)
+        .map(CloudConfig::with_defaults)
+        .or_else(|_| {
+            serde_json::from_str::<LegacyCloudConfig>(&raw).map(|legacy| CloudConfig {
+                provider: CloudProviderKind::from_legacy(&legacy.label, &legacy.base_url),
+                model: if legacy.model.trim().is_empty() {
+                    CloudProviderKind::from_legacy(&legacy.label, &legacy.base_url)
+                        .default_model()
+                        .to_string()
+                } else {
+                    legacy.model
+                },
+            })
+        })
+        .ok()
 }
 
-/// Persist the cloud provider to disk (creating the config directory).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LegacyCloudConfig {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    model: String,
+}
+
+/// Pull a plaintext key from the legacy config file so the UI can migrate it to
+/// secure storage on first launch after upgrading.
+pub fn load_legacy_cloud_key() -> Option<(CloudProviderKind, String)> {
+    let path = cloud_config_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let legacy = serde_json::from_str::<LegacyCloudConfig>(&raw).ok()?;
+    let key = legacy.api_key.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    Some((
+        CloudProviderKind::from_legacy(&legacy.label, &legacy.base_url),
+        key,
+    ))
+}
+
+/// Persist the cloud metadata to disk (creating the config directory). API
+/// keys are deliberately not stored here; they live in secure storage.
 pub fn save_cloud_config(cfg: &CloudConfig) -> Result<()> {
     let path = cloud_config_path().ok_or_else(|| anyhow!("no config directory (HOME unset)"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| anyhow!("failed to create config dir: {e}"))?;
     }
-    let json = serde_json::to_string_pretty(cfg)
+    let json = serde_json::to_string_pretty(&cfg.clone().with_defaults())
         .map_err(|e| anyhow!("failed to serialize config: {e}"))?;
     std::fs::write(&path, json).map_err(|e| anyhow!("failed to write cloud config: {e}"))?;
     Ok(())

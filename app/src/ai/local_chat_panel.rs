@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
+use serde::{Deserialize, Serialize};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use warpui::color::ColorU;
 use warpui::elements::{
@@ -25,12 +26,14 @@ use warpui::{
     AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
+use warpui_extras::secure_storage::AppContextExt as _;
 
 use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
-    cloud_presets, list_models, load_cloud_config, read_ai_mode_state, save_cloud_config,
-    set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok, AiModeState, ChatMessage,
-    ChatStreamItem, CloudConfig, CodeContext, LocalEndpoint,
+    cloud_presets, list_models, load_cloud_config, load_legacy_cloud_key, read_ai_mode_state,
+    save_cloud_config, set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok,
+    AiModeState, ChatMessage, ChatStreamItem, CloudConfig, CloudProviderKind, CodeContext,
+    LocalEndpoint,
 };
 use crate::appearance::Appearance;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
@@ -42,6 +45,8 @@ const BODY_FONT_SIZE: f32 = 13.;
 const MONO_FONT_SIZE: f32 = 12.;
 const PANEL_PADDING: f32 = 8.;
 const MODEL_LABEL_MAX_CHARS: usize = 34;
+const VIBE_COLUMN_WIDTH: f32 = 760.;
+const CLOUD_KEYS_STORAGE_KEY: &str = "GenesiCodeCloudApiKeys";
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
 const SCROLL_TO_BOTTOM: f32 = 1.0e7;
@@ -112,6 +117,38 @@ enum InputMode {
     Chat,
     CloudKey,
     CloudModel,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CloudKeyStore {
+    #[serde(default)]
+    hugging_face: String,
+    #[serde(default)]
+    openai: String,
+    #[serde(default)]
+    anthropic: String,
+    #[serde(default)]
+    gemini: String,
+}
+
+impl CloudKeyStore {
+    fn get(&self, provider: CloudProviderKind) -> &str {
+        match provider {
+            CloudProviderKind::HuggingFace => &self.hugging_face,
+            CloudProviderKind::OpenAI => &self.openai,
+            CloudProviderKind::Anthropic => &self.anthropic,
+            CloudProviderKind::Gemini => &self.gemini,
+        }
+    }
+
+    fn set(&mut self, provider: CloudProviderKind, value: String) {
+        match provider {
+            CloudProviderKind::HuggingFace => self.hugging_face = value,
+            CloudProviderKind::OpenAI => self.openai = value,
+            CloudProviderKind::Anthropic => self.anthropic = value,
+            CloudProviderKind::Gemini => self.gemini = value,
+        }
+    }
 }
 
 /// Who authored a transcript entry.
@@ -322,6 +359,10 @@ pub enum LocalAiChatAction {
     ToggleCollapse(usize),
     /// Cycle the BYOK cloud provider preset (HuggingFace / OpenAI / …).
     CycleProvider,
+    /// Select a specific cloud provider from the picker.
+    SelectCloudProvider(CloudProviderKind),
+    /// Pick a suggested cloud model for the active provider.
+    PickCloudModel(String),
     /// Capture the cloud provider's API key in the compose box.
     SetKey,
     /// Capture the cloud provider's model id in the compose box.
@@ -384,8 +425,10 @@ pub struct LocalAiChatView {
     pending_tool: Option<AgentTool>,
 
     // ── BYOK: optional cloud provider (off by default; local stays the default) ──
-    /// The user's saved cloud provider (endpoint + key + model). Empty until set.
+    /// The user's saved cloud provider (metadata only; keys live in secure storage).
     cloud: CloudConfig,
+    /// Per-provider API keys stored in platform secure storage and mirrored in memory.
+    cloud_keys: CloudKeyStore,
     /// When on, prompts go to the cloud provider instead of Local/Turbo.
     cloud_active: bool,
     /// What the compose box's next submit means (a prompt, or a key/model value).
@@ -438,7 +481,8 @@ impl LocalAiChatView {
             agent_tool_summary: String::new(),
             auto_approve: false,
             pending_tool: None,
-            cloud: load_cloud_config().unwrap_or_default(),
+            cloud: load_cloud_config().unwrap_or_default().with_defaults(),
+            cloud_keys: CloudKeyStore::default(),
             cloud_active: false,
             input_mode: InputMode::Chat,
             model_picker_open: false,
@@ -446,6 +490,7 @@ impl LocalAiChatView {
             review_expanded: false,
             selected_review_path: None,
         };
+        view.load_cloud_keys(ctx);
         view.refresh_ai_mode();
         view.refresh_models(ctx);
         view
@@ -472,11 +517,11 @@ impl LocalAiChatView {
         model: &str,
         messages: Vec<ChatMessage>,
     ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
-        if self.cloud_active && self.cloud.is_ready() {
+        if self.cloud_active && self.cloud_ready() {
             stream_chat_cloud(
-                &self.cloud.base_url,
+                self.cloud.provider,
                 model,
-                self.cloud.api_key.clone(),
+                self.active_cloud_key().to_string(),
                 messages,
             )
         } else {
@@ -582,10 +627,79 @@ impl LocalAiChatView {
 
     /// A friendly name for the configured cloud provider (or "cloud").
     fn cloud_label(&self) -> String {
-        if self.cloud.label.trim().is_empty() {
-            "cloud".to_string()
+        self.cloud.provider.label().to_string()
+    }
+
+    fn active_cloud_key(&self) -> &str {
+        self.cloud_keys.get(self.cloud.provider)
+    }
+
+    fn cloud_ready(&self) -> bool {
+        self.cloud.is_ready(self.active_cloud_key())
+    }
+
+    fn save_cloud_keys(&self, ctx: &mut ViewContext<Self>) -> Result<()> {
+        let json = serde_json::to_string(&self.cloud_keys)?;
+        ctx.secure_storage()
+            .write_value_with_owner_only_fallback(CLOUD_KEYS_STORAGE_KEY, &json)
+            .map_err(|e| anyhow::anyhow!("failed to write cloud keys: {e}"))
+    }
+
+    fn load_cloud_keys(&mut self, ctx: &mut ViewContext<Self>) {
+        match ctx.secure_storage().read_value(CLOUD_KEYS_STORAGE_KEY) {
+            Ok(json) => match serde_json::from_str::<CloudKeyStore>(&json) {
+                Ok(keys) => self.cloud_keys = keys,
+                Err(err) => {
+                    log::warn!("Failed to deserialize cloud keys from secure storage: {err:#}");
+                }
+            },
+            Err(err) => {
+                if !matches!(err, warpui_extras::secure_storage::Error::NotFound) {
+                    log::warn!("Failed to read cloud keys from secure storage: {err:#}");
+                }
+            }
+        }
+
+        if let Some((provider, key)) = load_legacy_cloud_key() {
+            let existing = self.cloud_keys.get(provider).trim();
+            if existing.is_empty() && !key.trim().is_empty() {
+                self.cloud_keys.set(provider, key);
+                if let Err(err) = self.save_cloud_keys(ctx) {
+                    log::warn!("Failed to migrate legacy cloud key to secure storage: {err:#}");
+                }
+                let _ = save_cloud_config(&self.cloud);
+            }
+        }
+    }
+
+    fn select_cloud_provider(
+        &mut self,
+        provider: CloudProviderKind,
+        close_picker: bool,
+        _ctx: &mut ViewContext<Self>,
+    ) {
+        self.endpoint_user_chosen = true;
+        self.cloud_active = true;
+        self.endpoint = LocalEndpoint::Ollama;
+        let old_provider = self.cloud.provider;
+        let old_default = old_provider.default_model();
+        self.cloud.provider = provider;
+        if self.cloud.model.trim().is_empty() || self.cloud.model == old_default {
+            self.cloud.model = provider.default_model().to_string();
+        }
+        if close_picker {
+            self.model_picker_open = false;
+        }
+        if let Err(err) = save_cloud_config(&self.cloud) {
+            self.error = Some(format!("Couldn't save cloud config: {err}"));
+        } else if !self.cloud_ready() {
+            self.error = Some(format!(
+                "Add your {} API key to use {}.",
+                self.cloud.provider.label(),
+                self.cloud.model
+            ));
         } else {
-            self.cloud.label.clone()
+            self.error = None;
         }
     }
 
@@ -604,7 +718,7 @@ impl LocalAiChatView {
                     {
                         let m = self.cloud.model.trim();
                         if m.is_empty() {
-                            "gpt-4o-mini"
+                            self.cloud.provider.default_model()
                         } else {
                             m
                         }
@@ -622,24 +736,16 @@ impl LocalAiChatView {
     fn save_cloud_field(&mut self, which: InputMode, value: String, ctx: &mut ViewContext<Self>) {
         let value = value.trim().to_string();
         match which {
-            InputMode::CloudKey => self.cloud.api_key = value,
+            InputMode::CloudKey => self.cloud_keys.set(self.cloud.provider, value),
             InputMode::CloudModel => self.cloud.model = value,
             InputMode::Chat => {}
         }
-        // Seed sensible defaults from the first preset if the user jumped straight
-        // to pasting a key without picking a provider.
-        if self.cloud.label.trim().is_empty() {
-            if let Some((label, base, model)) = cloud_presets().first() {
-                self.cloud.label = label.to_string();
-                if self.cloud.base_url.trim().is_empty() {
-                    self.cloud.base_url = base.to_string();
-                }
-                if self.cloud.model.trim().is_empty() {
-                    self.cloud.model = model.to_string();
-                }
-            }
-        }
-        match save_cloud_config(&self.cloud) {
+        let save_result = match which {
+            InputMode::CloudKey => self.save_cloud_keys(ctx),
+            InputMode::CloudModel => save_cloud_config(&self.cloud),
+            InputMode::Chat => Ok(()),
+        };
+        match save_result {
             Ok(()) => self.error = None,
             Err(e) => self.error = Some(format!("Couldn't save cloud config: {e}")),
         }
@@ -661,7 +767,11 @@ impl LocalAiChatView {
             return;
         }
         // BYOK: a selected cloud provider needs its key before it can be used.
-        if self.cloud_active && !self.cloud.is_ready() {
+        if self.cloud_active && !self.cloud_ready() {
+            self.error = Some(format!(
+                "Add your {} API key first (Set key).",
+                self.cloud.provider.label()
+            ));
             self.error =
                 Some("Add your API key for the cloud provider first (🔑 Set key).".to_string());
             ctx.notify();
@@ -1567,7 +1677,9 @@ impl LocalAiChatView {
             .current_model()
             .unwrap_or_else(|| "no model".to_string());
         let model_name = truncate_middle(&model_name, MODEL_LABEL_MAX_CHARS);
-        let selector_label = if self.endpoint == LocalEndpoint::Turbo {
+        let selector_label = if self.cloud_active {
+            format!("{}: {model_name}", self.cloud.provider.label())
+        } else if self.endpoint == LocalEndpoint::Turbo {
             format!("Turbo: {model_name}")
         } else {
             format!("AI: {model_name}")
@@ -1812,21 +1924,106 @@ impl LocalAiChatView {
             turbo_selected,
         ));
 
-        // Cloud (BYOK) is deferred to the roadmap; show the slot disabled so it's
-        // discoverable without being wired up yet.
+        list.add_child(section(self, "Cloud providers"));
+        for provider in cloud_presets() {
+            let selected = self.cloud.provider == *provider;
+            let mark = if self.cloud_active && selected {
+                "●  "
+            } else {
+                "○  "
+            };
+            list.add_child(self.picker_row(
+                appearance,
+                format!("{mark}{}", provider.label()),
+                LocalAiChatAction::SelectCloudProvider(*provider),
+                selected,
+            ));
+        }
+
+        let key_saved = !self.active_cloud_key().trim().is_empty();
+        let key_status = if key_saved {
+            format!("Key stored securely for {}", self.cloud.provider.label())
+        } else {
+            format!("No API key saved for {}", self.cloud.provider.label())
+        };
+        list.add_child(
+            Container::new(self.label_text(appearance, key_status, BODY_FONT_SIZE, muted, false))
+                .with_horizontal_padding(8.)
+                .with_padding_top(6.)
+                .finish(),
+        );
+        list.add_child(self.picker_row(
+            appearance,
+            if key_saved {
+                "Update API key".to_string()
+            } else {
+                "Add API key".to_string()
+            },
+            LocalAiChatAction::SetKey,
+            key_saved,
+        ));
+        list.add_child(section(self, "Suggested cloud models"));
+        for model in self.cloud.provider.suggested_models() {
+            let selected = self.cloud.model == *model;
+            let mark = if selected { "●  " } else { "○  " };
+            list.add_child(self.picker_row(
+                appearance,
+                format!("{mark}{model}"),
+                LocalAiChatAction::PickCloudModel((*model).to_string()),
+                selected,
+            ));
+        }
+        list.add_child(self.picker_row(
+            appearance,
+            format!(
+                "Custom model: {}",
+                truncate_middle(self.cloud.model.trim(), MODEL_LABEL_MAX_CHARS)
+            ),
+            LocalAiChatAction::SetModel,
+            false,
+        ));
         list.add_child(
             Container::new(self.label_text(
                 appearance,
-                "☁  Cloud providers — coming soon",
-                BODY_FONT_SIZE,
+                match self.cloud.provider {
+                    CloudProviderKind::Anthropic => {
+                        "Anthropic uses its native Messages API; the key is sent with x-api-key."
+                    }
+                    CloudProviderKind::Gemini => {
+                        "Gemini uses Google's official OpenAI-compatible endpoint."
+                    }
+                    CloudProviderKind::OpenAI => {
+                        "OpenAI uses /v1/chat/completions with your own bearer token."
+                    }
+                    CloudProviderKind::HuggingFace => {
+                        "Hugging Face uses the official router and an HF token with Inference Providers permission."
+                    }
+                },
+                CHIP_FONT_SIZE,
                 muted,
-                false,
+                true,
             ))
             .with_horizontal_padding(8.)
-            .with_vertical_padding(6.)
+            .with_padding_top(6.)
+            .with_padding_bottom(4.)
             .finish(),
         );
-
+        if false {
+            // Cloud (BYOK) is deferred to the roadmap; show the slot disabled so it's
+            // discoverable without being wired up yet.
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "☁  Cloud providers — coming soon",
+                    BODY_FONT_SIZE,
+                    muted,
+                    false,
+                ))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .finish(),
+            );
+        }
         let card = Container::new(list.finish())
             .with_uniform_padding(6.)
             .with_margin_bottom(6.)
@@ -1834,8 +2031,15 @@ impl LocalAiChatView {
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
             .with_background(theme.surface_1())
             .finish();
+        let wrapped = if self.vibe_mode {
+            ConstrainedBox::new(card)
+                .with_width(VIBE_COLUMN_WIDTH)
+                .finish()
+        } else {
+            card
+        };
         Some(
-            Container::new(card)
+            Container::new(wrapped)
                 .with_horizontal_padding(PANEL_PADDING)
                 .finish(),
         )
@@ -2036,8 +2240,15 @@ impl LocalAiChatView {
             }
         }
 
+        let wrapped = if self.vibe_mode {
+            ConstrainedBox::new(column.finish())
+                .with_width(VIBE_COLUMN_WIDTH)
+                .finish()
+        } else {
+            column.finish()
+        };
         Some(
-            Container::new(column.finish())
+            Container::new(wrapped)
                 .with_horizontal_padding(PANEL_PADDING)
                 .with_padding_bottom(4.)
                 .finish(),
@@ -2101,23 +2312,23 @@ impl LocalAiChatView {
             ))
             .finish();
 
-        Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.label_text(
-                    appearance,
-                    title,
-                    CHIP_FONT_SIZE,
-                    genesi_green(),
-                    false,
-                ))
-                .with_child(detail_box)
-                .with_child(Container::new(buttons).with_margin_top(6.).finish())
-                .finish(),
-        )
-        .with_horizontal_padding(PANEL_PADDING)
-        .with_padding_bottom(6.)
-        .finish()
+        let content = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.label_text(appearance, title, CHIP_FONT_SIZE, genesi_green(), false))
+            .with_child(detail_box)
+            .with_child(Container::new(buttons).with_margin_top(6.).finish())
+            .finish();
+        let wrapped = if self.vibe_mode {
+            ConstrainedBox::new(content)
+                .with_width(VIBE_COLUMN_WIDTH)
+                .finish()
+        } else {
+            content
+        };
+        Container::new(wrapped)
+            .with_horizontal_padding(PANEL_PADDING)
+            .with_padding_bottom(6.)
+            .finish()
     }
 
     /// A clickable, collapse/expand header for the thought/tool/command steps.
@@ -2480,19 +2691,38 @@ impl LocalAiChatView {
                     .with_horizontal_padding(PANEL_PADDING)
                     .finish();
             }
-            let (title, hint) = match self.current_model() {
-                Some(model) => (
-                    "Ask your local model".to_string(),
-                    format!(
-                        "Running {model} on-device — no account, no cloud. With 📎 on, \
-                         the file you're editing is sent as context."
+            let (title, hint) = if self.cloud_active {
+                match self.current_model() {
+                    Some(model) => (
+                        format!("Ask {}", self.cloud.provider.label()),
+                        format!(
+                            "Using {model} via {}. Your API key stays on this device in secure storage. With Attach on, the file you're editing is sent as context.",
+                            self.cloud.provider.label()
+                        ),
                     ),
-                ),
-                None => (
-                    "No local model yet".to_string(),
-                    "Start ollama and pull a model (e.g. `ollama pull llama3.2`), then hit Refresh."
-                        .to_string(),
-                ),
+                    None => (
+                        format!("Set up {}", self.cloud.provider.label()),
+                        format!(
+                            "Pick a model and save an API key for {} to start chatting.",
+                            self.cloud.provider.label()
+                        ),
+                    ),
+                }
+            } else {
+                match self.current_model() {
+                    Some(model) => (
+                        "Ask your local model".to_string(),
+                        format!(
+                            "Running {model} on-device — no account, no cloud. With 📎 on, \
+                             the file you're editing is sent as context."
+                        ),
+                    ),
+                    None => (
+                        "No local model yet".to_string(),
+                        "Start ollama and pull a model (e.g. `ollama pull llama3.2`), then hit Refresh."
+                            .to_string(),
+                    ),
+                }
             };
             column.add_child(
                 Container::new(
@@ -2569,7 +2799,7 @@ impl TypedActionView for LocalAiChatView {
                     // Reset the local endpoint so leaving cloud returns to Local.
                     self.endpoint = LocalEndpoint::Ollama;
                     self.cloud_active = true;
-                    if !self.cloud.is_ready() {
+                    if !self.cloud_ready() {
                         self.error = Some(format!(
                             "Pick a provider and add your key (🔑 Set key) to use {}.",
                             self.cloud_label()
@@ -2582,20 +2812,42 @@ impl TypedActionView for LocalAiChatView {
                 let presets = cloud_presets();
                 let current = presets
                     .iter()
-                    .position(|(label, _, _)| *label == self.cloud.label);
-                let next = current.map(|i| (i + 1) % presets.len()).unwrap_or(0);
-                let (label, base_url, default_model) = presets[next];
+                    .position(|provider| *provider == self.cloud.provider)
+                    .unwrap_or(0);
+                let next = (current + 1) % presets.len();
                 // Replace the model only if it was empty or still the old preset's
                 // default — never clobber a model the user typed by hand.
+                let previous_provider = presets[current];
                 let replace_model = self.cloud.model.trim().is_empty()
-                    || current.is_some_and(|i| self.cloud.model == presets[i].2);
-                self.cloud.label = label.to_string();
-                self.cloud.base_url = base_url.to_string();
+                    || self.cloud.model == previous_provider.default_model();
+                self.cloud.provider = presets[next];
                 if replace_model {
-                    self.cloud.model = default_model.to_string();
+                    self.cloud.model = self.cloud.provider.default_model().to_string();
                 }
-                let _ = save_cloud_config(&self.cloud);
-                self.error = None;
+                if let Err(err) = save_cloud_config(&self.cloud) {
+                    self.error = Some(format!("Couldn't save cloud config: {err}"));
+                } else if !self.cloud_ready() {
+                    self.error = Some(format!(
+                        "Add your {} API key to use {}.",
+                        self.cloud.provider.label(),
+                        self.cloud.model
+                    ));
+                } else {
+                    self.error = None;
+                }
+                ctx.notify();
+            }
+            LocalAiChatAction::SelectCloudProvider(provider) => {
+                self.select_cloud_provider(*provider, false, ctx);
+                ctx.notify();
+            }
+            LocalAiChatAction::PickCloudModel(model) => {
+                self.cloud_active = true;
+                self.cloud.model = model.clone();
+                match save_cloud_config(&self.cloud) {
+                    Ok(()) => self.error = None,
+                    Err(err) => self.error = Some(format!("Couldn't save cloud config: {err}")),
+                }
                 ctx.notify();
             }
             LocalAiChatAction::SetKey => self.set_input_mode(InputMode::CloudKey, ctx),
@@ -2829,7 +3081,7 @@ impl View for LocalAiChatView {
         let header = if self.vibe_mode {
             Container::new(
                 ConstrainedBox::new(self.render_header(appearance))
-                    .with_width(760.)
+                    .with_width(VIBE_COLUMN_WIDTH)
                     .finish(),
             )
             .with_horizontal_padding(PANEL_PADDING)
@@ -2848,7 +3100,7 @@ impl View for LocalAiChatView {
             // Cap the transcript width to match the 760px compose box so the
             // centered column reads like a chat instead of stretching full-width.
             ConstrainedBox::new(self.render_transcript(appearance))
-                .with_max_width(760.)
+                .with_max_width(VIBE_COLUMN_WIDTH)
                 .finish()
         } else {
             self.render_transcript(appearance)
@@ -2926,11 +3178,15 @@ impl View for LocalAiChatView {
             .with_background_color(genesi_panel_surface())
             .finish();
         let compose_container = if self.vibe_mode {
-            Container::new(ConstrainedBox::new(compose_box).with_width(760.).finish())
-                .with_horizontal_padding(PANEL_PADDING)
-                .with_padding_top(4.)
-                .with_padding_bottom(PANEL_PADDING + 8.)
-                .finish()
+            Container::new(
+                ConstrainedBox::new(compose_box)
+                    .with_width(VIBE_COLUMN_WIDTH)
+                    .finish(),
+            )
+            .with_horizontal_padding(PANEL_PADDING)
+            .with_padding_top(4.)
+            .with_padding_bottom(PANEL_PADDING + 8.)
+            .finish()
         } else {
             Container::new(compose_box)
                 .with_horizontal_padding(PANEL_PADDING)
