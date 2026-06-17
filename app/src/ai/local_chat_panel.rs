@@ -1283,36 +1283,40 @@ impl LocalAiChatView {
         selected: bool,
         enabled: bool,
     ) -> Box<dyn Element> {
-        let theme = appearance.theme();
         let text_color: ColorU = if enabled {
             if selected {
                 ColorU::new(215, 248, 234, 255)
             } else {
-                theme.active_ui_text_color().into()
+                ColorU::new(228, 231, 236, 255)
             }
         } else {
-            theme.disabled_text_color(theme.background()).into()
+            ColorU::new(132, 137, 145, 255)
         };
         let background = if selected {
-            green_tint()
+            ColorU::new(15, 143, 106, 44)
         } else if enabled {
-            ColorU::new(255, 255, 255, 10)
+            ColorU::new(255, 255, 255, 14)
         } else {
-            ColorU::new(255, 255, 255, 5)
+            ColorU::new(255, 255, 255, 8)
         };
         let border = if selected {
             green_soft()
         } else {
-            genesi_subtle_border()
+            ColorU::new(255, 255, 255, 32)
         };
         let icon_color = if selected { genesi_green() } else { text_color };
 
         let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
         if let Some(path) = icon_path {
             row.add_child(
-                Container::new(Icon::new(path, icon_color).finish())
-                    .with_margin_right(5.)
-                    .finish(),
+                Container::new(
+                    ConstrainedBox::new(Icon::new(path, icon_color).finish())
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                )
+                .with_margin_right(5.)
+                .finish(),
             );
         }
         row.add_child(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false));
@@ -1665,9 +1669,14 @@ impl LocalAiChatView {
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
                 .with_child(
-                    Container::new(Icon::new(chevron, text_color).finish())
-                        .with_margin_left(6.)
-                        .finish(),
+                    Container::new(
+                        ConstrainedBox::new(Icon::new(chevron, text_color).finish())
+                            .with_width(12.)
+                            .with_height(12.)
+                            .finish(),
+                    )
+                    .with_margin_left(6.)
+                    .finish(),
                 )
                 .finish(),
         )
@@ -1712,17 +1721,22 @@ impl LocalAiChatView {
             )
         };
 
-        let button = Container::new(Icon::new(icon_path, icon_color).finish())
-            .with_horizontal_padding(8.)
-            .with_vertical_padding(8.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
-            .with_border(Border::all(1.).with_border_color(if self.in_flight {
-                ColorU::new(181, 68, 68, 90)
-            } else {
-                green_soft()
-            }))
-            .with_background_color(fill)
-            .finish();
+        let button = Container::new(
+            ConstrainedBox::new(Icon::new(icon_path, icon_color).finish())
+                .with_width(14.)
+                .with_height(14.)
+                .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(8.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_border(Border::all(1.).with_border_color(if self.in_flight {
+            ColorU::new(181, 68, 68, 90)
+        } else {
+            green_soft()
+        }))
+        .with_background_color(fill)
+        .finish();
 
         EventHandler::new(button)
             .on_left_mouse_down(move |ctx, _, _| {
