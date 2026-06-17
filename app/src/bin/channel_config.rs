@@ -70,7 +70,14 @@ pub fn load_config_from_generator(channel: &str) -> ChannelConfig {
     let _ = (channel, target_family, target_os);
     ChannelConfig {
         app_id: AppId::new("dev", "genesi", "GenesiCode"),
-        logfile_name: "".into(),
+        // MUST be non-empty: when stdout isn't a tty (launched from the KDE menu
+        // / a plasmoid), the logger writes to a file at `log_directory / logfile_
+        // name`. An empty name made that path the log directory itself, so opening
+        // it as a file failed with "Is a directory (os error 21)" and the whole
+        // app exited before its window appeared — i.e. "runs from a terminal but
+        // loads-and-closes from the menu". A terminal (tty) skips the logfile path
+        // entirely, which is why it only crashed off a tty.
+        logfile_name: "genesicode.log".into(),
         server_config: WarpServerConfig::production(),
         oz_config: OzConfig::production(),
         telemetry_config: None,
