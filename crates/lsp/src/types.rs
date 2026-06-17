@@ -279,9 +279,15 @@ pub enum CompletionTrigger {
 pub struct CompletionItem {
     /// The text shown in the completion list.
     pub label: String,
-    /// The text actually inserted when the item is accepted. For v1 this is
-    /// plain text (snippets are disabled in the advertised capabilities).
+    /// The text actually inserted when the item is accepted, after falling back
+    /// through `textEdit.newText` and finally `label` when `insertText` is
+    /// absent.
     pub insert_text: String,
+    /// Whether `insert_text` should be interpreted as a snippet.
+    pub insert_text_format: Option<lsp_types::InsertTextFormat>,
+    /// Optional server-provided edit range/new text; some languages (notably
+    /// HTML/CSS) rely on this instead of a simple prefix replacement.
+    pub text_edit: Option<lsp_types::CompletionTextEdit>,
     /// Extra info (type signature, source module, ...) shown alongside the label.
     pub detail: Option<String>,
     /// The semantic kind (function, variable, ...), used to pick an icon.
@@ -306,9 +312,7 @@ pub struct CompletionList {
 impl From<lsp_types::CompletionItem> for CompletionItem {
     fn from(item: lsp_types::CompletionItem) -> Self {
         // Prefer an explicit insert_text, then a text edit's new_text, then the
-        // label. We deliberately ignore the text-edit range here; the editor
-        // replaces the current identifier prefix on accept (simple + correct for
-        // the common identifier/member-access cases).
+        // label.
         let insert_text = item
             .insert_text
             .clone()
@@ -324,6 +328,8 @@ impl From<lsp_types::CompletionItem> for CompletionItem {
         Self {
             label: item.label,
             insert_text,
+            insert_text_format: item.insert_text_format,
+            text_edit: item.text_edit,
             detail: item.detail,
             kind: item.kind,
             sort_text: item.sort_text,

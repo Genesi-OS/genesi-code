@@ -16,7 +16,7 @@ use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
-    FormattedTextElement, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
+    FormattedTextElement, Icon, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
 };
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
@@ -328,6 +328,8 @@ pub enum LocalAiChatAction {
     SetModel,
     /// Clear the active conversation and start a fresh one.
     NewChat,
+    /// Submit whatever is currently typed into the compose input.
+    SubmitPromptInput,
 }
 
 pub struct LocalAiChatView {
@@ -405,6 +407,8 @@ impl LocalAiChatView {
         let input = ctx.add_typed_action_view(|ctx| SubmittableTextInput::new(ctx));
         input.update(ctx, |input, ctx| {
             input.set_placeholder_text(" Ask the local model...", ctx);
+            input.set_outer_margins(0., 0., ctx);
+            input.set_submit_button_visible(false, ctx);
         });
         ctx.subscribe_to_view(&input, |me, _, event, ctx| {
             me.handle_input_event(event, ctx);
@@ -1271,27 +1275,72 @@ impl LocalAiChatView {
         )
     }
 
-    fn chip(
+    fn chip_content(
         &self,
         appearance: &Appearance,
         label: String,
-        action: LocalAiChatAction,
-        active: bool,
+        icon_path: Option<&'static str>,
+        selected: bool,
+        enabled: bool,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let text_color: ColorU = if active {
-            theme.active_ui_text_color().into()
+        let text_color: ColorU = if enabled {
+            if selected {
+                ColorU::new(215, 248, 234, 255)
+            } else {
+                theme.active_ui_text_color().into()
+            }
         } else {
             theme.disabled_text_color(theme.background()).into()
         };
-        let container =
-            Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false))
-                .with_horizontal_padding(7.)
-                .with_vertical_padding(4.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                .with_margin_right(4.)
-                .with_margin_top(2.);
-        let content = container.finish();
+        let background = if selected {
+            green_tint()
+        } else if enabled {
+            ColorU::new(255, 255, 255, 10)
+        } else {
+            ColorU::new(255, 255, 255, 5)
+        };
+        let border = if selected {
+            green_soft()
+        } else {
+            genesi_subtle_border()
+        };
+        let icon_color = if selected { genesi_green() } else { text_color };
+
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if let Some(path) = icon_path {
+            row.add_child(
+                Container::new(Icon::new(path, icon_color).finish())
+                    .with_margin_right(5.)
+                    .finish(),
+            );
+        }
+        row.add_child(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false));
+
+        Container::new(row.finish())
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(5.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+            .with_border(Border::all(1.).with_border_color(border))
+            .with_background_color(background)
+            .with_margin_right(6.)
+            .with_margin_top(2.)
+            .finish()
+    }
+
+    fn chip_with_icon(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        icon_path: Option<&'static str>,
+        action: LocalAiChatAction,
+        selected: bool,
+        enabled: bool,
+    ) -> Box<dyn Element> {
+        let content = self.chip_content(appearance, label, icon_path, selected, enabled);
+        if !enabled {
+            return content;
+        }
 
         EventHandler::new(content)
             .on_left_mouse_down(move |ctx, _, _| {
@@ -1299,6 +1348,16 @@ impl LocalAiChatView {
                 DispatchEventResult::StopPropagation
             })
             .finish()
+    }
+
+    fn chip(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        action: LocalAiChatAction,
+        selected: bool,
+    ) -> Box<dyn Element> {
+        self.chip_with_icon(appearance, label, None, action, selected, true)
     }
 
     pub fn current_chat_title(&self) -> String {
@@ -1476,24 +1535,20 @@ impl LocalAiChatView {
                 false,
             ))
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
-            .with_child(self.chip(
+            .with_child(self.chip_with_icon(
                 appearance,
                 "Refresh".to_string(),
+                Some("bundled/svg/refresh-cw-04.svg"),
                 LocalAiChatAction::Refresh,
+                false,
                 true,
             ));
-        if self.in_flight {
-            row.add_child(self.chip(
-                appearance,
-                "Stop".to_string(),
-                LocalAiChatAction::Stop,
-                true,
-            ));
-        }
-        row.add_child(self.chip(
+        row.add_child(self.chip_with_icon(
             appearance,
             "Clear".to_string(),
+            Some("bundled/svg/trash-02.svg"),
             LocalAiChatAction::Clear,
+            false,
             !self.messages.is_empty(),
         ));
         row.finish()
@@ -1529,43 +1584,53 @@ impl LocalAiChatView {
                 )
                 .finish(),
             )
-            .with_child(self.chip(
+            .with_child(self.chip_with_icon(
                 appearance,
                 "Turbo".to_string(),
+                Some("bundled/svg/lightning-02.svg"),
                 LocalAiChatAction::ToggleTurbo,
                 self.endpoint == LocalEndpoint::Turbo,
+                true,
             ))
             .finish();
 
         let mut toggles_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip(
+            .with_child(self.chip_with_icon(
                 appearance,
                 "Agent".to_string(),
+                Some("bundled/svg/agentmode.svg"),
                 LocalAiChatAction::ToggleAgent,
                 self.agent_mode,
+                true,
             ));
         if self.agent_mode {
-            toggles_row.add_child(self.chip(
+            toggles_row.add_child(self.chip_with_icon(
                 appearance,
                 format!("AUTO {}", if self.auto_approve { "on" } else { "off" }),
+                Some("bundled/svg/sparkle.svg"),
                 LocalAiChatAction::ToggleAuto,
                 self.auto_approve,
+                true,
             ));
         }
-        toggles_row.add_child(self.chip(
+        toggles_row.add_child(self.chip_with_icon(
             appearance,
             "Attach".to_string(),
+            Some("bundled/svg/paperclip.svg"),
             LocalAiChatAction::ToggleAttachContext,
             self.attach_context,
+            true,
         ));
         toggles_row.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
-        toggles_row.add_child(self.chip(
+        toggles_row.add_child(self.chip_with_icon(
             appearance,
             ai_mode_short_label(self.ai_mode.as_ref()),
+            Some("bundled/svg/psychology.svg"),
             LocalAiChatAction::CycleAiMode,
             self.ai_mode.is_some(),
+            true,
         ));
 
         Flex::column()
@@ -1590,20 +1655,76 @@ impl LocalAiChatView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let text_color: ColorU = theme.active_ui_text_color().into();
-        let mut label = label;
-        if open {
-            label.push_str("  ^");
+        let chevron = if open {
+            "bundled/svg/chevron-up.svg"
         } else {
-            label.push_str("  v");
-        }
-        let container =
-            Container::new(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
-                .with_horizontal_padding(2.)
-                .with_vertical_padding(4.)
-                .with_margin_right(4.)
-                .with_margin_top(2.);
+            "bundled/svg/chevron-down.svg"
+        };
+        let container = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false))
+                .with_child(
+                    Container::new(Icon::new(chevron, text_color).finish())
+                        .with_margin_left(6.)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(5.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_border(Border::all(1.).with_border_color(if open {
+            green_soft()
+        } else {
+            genesi_subtle_border()
+        }))
+        .with_background_color(if open {
+            green_tint()
+        } else {
+            ColorU::new(255, 255, 255, 6)
+        })
+        .with_margin_right(4.)
+        .with_margin_top(2.);
 
         EventHandler::new(container.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn render_prompt_action_button(&self, _appearance: &Appearance) -> Box<dyn Element> {
+        let (icon_path, action, fill, icon_color) = if self.in_flight {
+            (
+                "bundled/svg/stop-filled.svg",
+                LocalAiChatAction::Stop,
+                ColorU::new(117, 34, 34, 255),
+                ColorU::new(255, 214, 214, 255),
+            )
+        } else {
+            (
+                "bundled/svg/send.svg",
+                LocalAiChatAction::SubmitPromptInput,
+                genesi_green(),
+                ColorU::white(),
+            )
+        };
+
+        let button = Container::new(Icon::new(icon_path, icon_color).finish())
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(8.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .with_border(Border::all(1.).with_border_color(if self.in_flight {
+                ColorU::new(181, 68, 68, 90)
+            } else {
+                green_soft()
+            }))
+            .with_background_color(fill)
+            .finish();
+
+        EventHandler::new(button)
             .on_left_mouse_down(move |ctx, _, _| {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
@@ -2660,6 +2781,9 @@ impl TypedActionView for LocalAiChatView {
                 self.reset_current_chat();
                 ctx.notify();
             }
+            LocalAiChatAction::SubmitPromptInput => {
+                self.input.update(ctx, |input, ctx| input.submit(ctx));
+            }
         }
     }
 }
@@ -2688,14 +2812,23 @@ impl View for LocalAiChatView {
             root = root.with_cross_axis_alignment(CrossAxisAlignment::Center);
         }
 
-        if !self.vibe_mode {
-            root.add_child(
-                Container::new(self.render_header(appearance))
-                    .with_uniform_padding(PANEL_PADDING)
-                    .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+        let header = if self.vibe_mode {
+            Container::new(
+                ConstrainedBox::new(self.render_header(appearance))
+                    .with_width(760.)
                     .finish(),
-            );
-        }
+            )
+            .with_horizontal_padding(PANEL_PADDING)
+            .with_padding_top(PANEL_PADDING + 4.)
+            .with_padding_bottom(4.)
+            .finish()
+        } else {
+            Container::new(self.render_header(appearance))
+                .with_uniform_padding(PANEL_PADDING)
+                .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+                .finish()
+        };
+        root.add_child(header);
 
         let transcript: Box<dyn Element> = if self.vibe_mode {
             // Cap the transcript width to match the 760px compose box so the
@@ -2748,10 +2881,22 @@ impl View for LocalAiChatView {
         let compose_inner = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(
-                Container::new(ChildView::new(&self.input).finish())
-                    .with_horizontal_padding(4.)
-                    .with_vertical_padding(2.)
-                    .finish(),
+                Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Shrinkable::new(1., ChildView::new(&self.input).finish()).finish(),
+                        )
+                        .with_child(
+                            Container::new(self.render_prompt_action_button(appearance))
+                                .with_margin_left(8.)
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_horizontal_padding(4.)
+                .with_vertical_padding(2.)
+                .finish(),
             )
             .with_child(
                 Container::new(self.render_control_strip(appearance))

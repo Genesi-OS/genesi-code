@@ -34,6 +34,7 @@ pub struct SubmittableTextInput {
     /// Whether or not the last edit made the contents valid.
     has_error: bool,
     submit_button_state: MouseStateHandle,
+    show_submit_button: bool,
     outer_margin_top: f32,
     outer_margin_bottom: f32,
 }
@@ -59,6 +60,7 @@ impl SubmittableTextInput {
             validator_type: ValidatorType::OnEdit,
             has_error: false,
             submit_button_state: Default::default(),
+            show_submit_button: true,
             outer_margin_top: 10.,
             outer_margin_bottom: 10.,
         }
@@ -92,9 +94,18 @@ impl SubmittableTextInput {
         ctx.notify();
     }
 
+    pub fn set_submit_button_visible(&mut self, visible: bool, ctx: &mut ViewContext<Self>) {
+        self.show_submit_button = visible;
+        ctx.notify();
+    }
+
     /// Returns a handle to the backing [`EditorView`].
     pub fn editor(&self) -> &ViewHandle<EditorView> {
         &self.editor
+    }
+
+    pub fn submit(&mut self, ctx: &mut ViewContext<Self>) {
+        self.on_try_submit(ctx);
     }
 
     fn handle_editor_event(
@@ -174,42 +185,46 @@ impl View for SubmittableTextInput {
             submit_button = submit_button.disable();
         }
 
-        Container::new(
-            Flex::row()
-                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_children([
-                    Shrinkable::new(
-                        1.,
-                        appearance
-                            .ui_builder()
-                            .text_input(self.editor.clone())
-                            .with_style(UiComponentStyles {
-                                background: Some(Fill::Solid(ColorU::transparent_black()).into()),
-                                border_color: Some(Fill::Solid(ColorU::transparent_black()).into()),
-                                padding: Some(Coords::uniform(8.)),
-                                ..Default::default()
-                            })
-                            .build()
-                            .finish(),
-                    )
-                    .finish(),
-                    submit_button
-                        .on_click(|ctx, _, _| {
-                            ctx.dispatch_typed_action(SubmittableTextInputAction::Submit)
+        let mut row = Flex::row()
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    appearance
+                        .ui_builder()
+                        .text_input(self.editor.clone())
+                        .with_style(UiComponentStyles {
+                            background: Some(Fill::Solid(ColorU::transparent_black()).into()),
+                            border_color: Some(Fill::Solid(ColorU::transparent_black()).into()),
+                            padding: Some(Coords::uniform(8.)),
+                            ..Default::default()
                         })
+                        .build()
                         .finish(),
-                ])
+                )
                 .finish(),
-        )
-        .with_border(Border::all(1.).with_border_fill(border_fill))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-        .with_margin_top(self.outer_margin_top)
-        .with_margin_bottom(self.outer_margin_bottom)
-        .with_padding_left(4.)
-        .with_padding_right(8.)
-        .finish()
+            );
+
+        if self.show_submit_button {
+            row.add_child(
+                submit_button
+                    .on_click(|ctx, _, _| {
+                        ctx.dispatch_typed_action(SubmittableTextInputAction::Submit)
+                    })
+                    .finish(),
+            );
+        }
+
+        Container::new(row.finish())
+            .with_border(Border::all(1.).with_border_fill(border_fill))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_margin_top(self.outer_margin_top)
+            .with_margin_bottom(self.outer_margin_bottom)
+            .with_padding_left(4.)
+            .with_padding_right(8.)
+            .finish()
     }
 }
 

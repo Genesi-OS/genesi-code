@@ -83,14 +83,14 @@ pub const LANGUAGES: &[LanguageSpec] = &[
     },
     LanguageSpec {
         id: LanguageId::Python,
-        extensions: &["py"],
+        extensions: &["py", "pyi", "pyw"],
         lsp_id: "python",
         server: LSPServerType::Pyright,
         trigger_chars: &['.'],
     },
     LanguageSpec {
         id: LanguageId::TypeScript,
-        extensions: &["ts"],
+        extensions: &["ts", "mts", "cts"],
         lsp_id: "typescript",
         server: LSPServerType::TypeScriptLanguageServer,
         trigger_chars: &['.'],
@@ -104,7 +104,7 @@ pub const LANGUAGES: &[LanguageSpec] = &[
     },
     LanguageSpec {
         id: LanguageId::JavaScript,
-        extensions: &["js", "mjs", "cjs"],
+        extensions: &["js", "mjs", "cjs", "jsm", "es6"],
         lsp_id: "javascript",
         server: LSPServerType::TypeScriptLanguageServer,
         trigger_chars: &['.'],
@@ -132,21 +132,21 @@ pub const LANGUAGES: &[LanguageSpec] = &[
     },
     LanguageSpec {
         id: LanguageId::Html,
-        extensions: &["html", "htm"],
+        extensions: &["html", "htm", "xhtml"],
         lsp_id: "html",
         server: LSPServerType::VscodeHtmlLanguageServer,
         trigger_chars: &['<', '/', '"', '=', ':', '.', '&'],
     },
     LanguageSpec {
         id: LanguageId::Css,
-        extensions: &["css"],
+        extensions: &["css", "scss", "sass", "less"],
         lsp_id: "css",
         server: LSPServerType::VscodeCssLanguageServer,
         trigger_chars: &[':', '-', '/', '@', '.', '#', '!'],
     },
     LanguageSpec {
         id: LanguageId::Json,
-        extensions: &["json"],
+        extensions: &["json", "jsonc", "webmanifest", "code-workspace"],
         lsp_id: "json",
         server: LSPServerType::VscodeJsonLanguageServer,
         trigger_chars: &['"', ':', '/'],
@@ -412,15 +412,14 @@ fn default_client_capabilities() -> ClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
             }),
             // Genesi: advertise textDocument/completion so language servers offer
-            // classic (non-AI) autocomplete. Upstream Warp never declared this, so
-            // servers withheld completions even though diagnostics/hover worked.
-            // snippet_support is intentionally false for v1: we insert plain text
-            // (the item's insert_text/label) and don't interpret `$1`/`${...}`
-            // placeholders, keeping the editor-side accept path simple.
+            // classic (non-AI) autocomplete. We also enable snippet / insert-
+            // replace support so servers can return richer edits like HTML tag
+            // expansions with cursor placeholders.
             completion: Some(CompletionClientCapabilities {
                 dynamic_registration: Some(false),
                 completion_item: Some(CompletionItemCapability {
-                    snippet_support: Some(false),
+                    snippet_support: Some(true),
+                    insert_replace_support: Some(true),
                     documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                     ..Default::default()
                 }),

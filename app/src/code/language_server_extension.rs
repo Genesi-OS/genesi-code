@@ -14,6 +14,7 @@ use warpui::elements::{
     CornerRadius, CrossAxisAlignment, Flex, FormattedTextElement, HighlightedHyperlink, Hoverable,
     MouseStateHandle, ParentElement, Radius, Rect, ScrollbarWidth,
 };
+use warpui::text::point::Point;
 use warpui::{AppContext, Element, SingletonEntity, ViewContext};
 
 use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
@@ -129,6 +130,11 @@ impl PendingSections {
         }
         segments
     }
+}
+
+struct ParsedCompletionInsert {
+    text: String,
+    cursor_offset: Option<usize>,
 }
 
 impl LocalCodeEditorView {
@@ -627,6 +633,21 @@ impl LocalCodeEditorView {
 
         let filtered = Self::completion_filter(&items, &prefix);
         if filtered.is_empty() {
+            if let Some(fallback_items) = self.html_tag_fallback_items(anchor, cursor, &prefix, ctx)
+            {
+                let filtered = (0..fallback_items.len()).collect();
+                self.lsp_completion_state = LspCompletionState::Active {
+                    items: fallback_items,
+                    filtered,
+                    selected: 0,
+                    anchor,
+                    is_incomplete: false,
+                    scroll_state: Default::default(),
+                };
+                self.set_editor_completion_active(true, ctx);
+                ctx.notify();
+                return;
+            }
             self.dismiss_completion(ctx);
             return;
         }
@@ -682,7 +703,12 @@ impl LocalCodeEditorView {
             .enumerate()
             .filter(|(_, item)| {
                 let haystack = item.filter_text.as_deref().unwrap_or(&item.label);
+                let normalized = haystack
+                    .trim_start_matches('<')
+                    .trim_start_matches('/')
+                    .trim_start_matches("</");
                 haystack.to_lowercase().starts_with(&needle)
+                    || normalized.to_lowercase().starts_with(&needle)
             })
             .map(|(index, _)| index)
             .take(COMPLETION_MAX_VISIBLE_ITEMS)
@@ -713,6 +739,20 @@ impl LocalCodeEditorView {
             _ => return,
         };
         if new_filtered.is_empty() {
+            if let Some(fallback_items) = self.html_tag_fallback_items(anchor, cursor, &prefix, ctx)
+            {
+                let filtered = (0..fallback_items.len()).collect();
+                self.lsp_completion_state = LspCompletionState::Active {
+                    items: fallback_items,
+                    filtered,
+                    selected: 0,
+                    anchor,
+                    is_incomplete: false,
+                    scroll_state: Default::default(),
+                };
+                ctx.notify();
+                return;
+            }
             self.dismiss_completion(ctx);
             return;
         }
@@ -757,7 +797,7 @@ impl LocalCodeEditorView {
     /// Apply the selected candidate: replace the typed prefix `anchor..cursor`
     /// with the item's insert text, then close the popup.
     pub(super) fn accept_completion(&mut self, ctx: &mut ViewContext<Self>) {
-        let (anchor, insert_text) = match &self.lsp_completion_state {
+        let (anchor, item) = match &self.lsp_completion_state {
             LspCompletionState::Active {
                 items,
                 filtered,
@@ -771,42 +811,297 @@ impl LocalCodeEditorView {
                 let Some(item) = items.get(item_index) else {
                     return;
                 };
-                (*anchor, item.insert_text.clone())
+                (*anchor, item.clone())
             }
             _ => return,
         };
 
         let cursor = self.editor().as_ref(ctx).cursor_head_offset(ctx);
-
-        // Defensive de-dup (generalizes the old `.`-only guard): some servers bake
-        // a punctuation char the user already typed into the insert text — e.g.
-        // typing `</` in HTML then accepting `body` returns `/body>`, which naively
-        // appended yields `<//body>`. If the punctuation char immediately before the
-        // anchor equals the first char of the insert text, drop it. Restricted to
-        // punctuation so plain identifier/member completions are untouched.
-        let before_anchor = anchor.saturating_sub(&CharOffset::from(1));
-        let char_before = self.editor().as_ref(ctx).char_at(before_anchor, ctx);
-        let insert_text = match insert_text.chars().next() {
-            Some(first)
-                if !first.is_alphanumeric() && first != '_' && char_before == Some(first) =>
-            {
-                insert_text[first.len_utf8()..].to_string()
-            }
-            _ => insert_text,
-        };
-
-        log::info!(
-            "completion accept: anchor={anchor:?} cursor={cursor:?} char_before={char_before:?} insert={insert_text:?}"
+        let parsed = Self::parse_completion_insert(
+            &item.insert_text,
+            item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET),
         );
 
-        self.editor.update(ctx, |editor, ctx| {
-            let edits = vec![(insert_text, anchor..cursor)];
+        self.editor.update(ctx, move |editor, ctx| {
+            let to_location = |position: &lsp_types::Position| lsp::types::Location {
+                line: position.line as usize,
+                column: position.character as usize,
+            };
+            let replacement_range = match &item.text_edit {
+                Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
+                    let start = editor.lsp_location_to_offset(&to_location(&edit.range.start), ctx);
+                    let end = editor.lsp_location_to_offset(&to_location(&edit.range.end), ctx);
+                    start..end
+                }
+                Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+                    let start =
+                        editor.lsp_location_to_offset(&to_location(&edit.replace.start), ctx);
+                    let end = editor.lsp_location_to_offset(&to_location(&edit.replace.end), ctx);
+                    start..end
+                }
+                None => anchor..cursor,
+            };
+
+            if replacement_range.start > replacement_range.end {
+                log::warn!(
+                    "completion accept: invalid replacement range {:?}..{:?}",
+                    replacement_range.start,
+                    replacement_range.end
+                );
+                return;
+            }
+
+            let before_start = replacement_range.start.saturating_sub(&CharOffset::from(1));
+            let char_before = editor.char_at(before_start, ctx);
+            let mut insert_text = parsed.text.clone();
+            let mut cursor_offset = parsed.cursor_offset;
+
+            if let Some(first) = insert_text.chars().next() {
+                if !first.is_alphanumeric() && first != '_' && char_before == Some(first) {
+                    insert_text = insert_text[first.len_utf8()..].to_string();
+                    if let Some(offset) = &mut cursor_offset {
+                        *offset = offset.saturating_sub(1);
+                    }
+                }
+            }
+
+            log::info!(
+                "completion accept: anchor={anchor:?} cursor={cursor:?} char_before={char_before:?} insert={insert_text:?}"
+            );
+
+            let edit_end = replacement_range.start + CharOffset::from(insert_text.chars().count());
+            let edits = vec![(insert_text, replacement_range.clone())];
             if let Ok(edits) = Vec1::try_from_vec(edits) {
                 editor.apply_edits(edits, ctx);
+                let move_cursor_to =
+                    |offset: CharOffset, editor: &mut CodeEditorView, ctx: &mut ViewContext<CodeEditorView>| {
+                        let location = editor.offset_to_lsp_position(offset, ctx);
+                        let point = Point::new((location.line + 1) as u32, location.column as u32);
+                        editor.cursor_at(point, ctx);
+                    };
+                if let Some(offset) = cursor_offset {
+                    move_cursor_to(replacement_range.start + CharOffset::from(offset), editor, ctx);
+                } else {
+                    move_cursor_to(edit_end, editor, ctx);
+                }
             }
         });
 
         self.dismiss_completion(ctx);
+    }
+
+    fn parse_completion_insert(insert_text: &str, is_snippet: bool) -> ParsedCompletionInsert {
+        if !is_snippet {
+            return ParsedCompletionInsert {
+                text: insert_text.to_string(),
+                cursor_offset: None,
+            };
+        }
+
+        let chars: Vec<char> = insert_text.chars().collect();
+        let mut output = String::new();
+        let mut final_cursor = None;
+        let mut first_tabstop = None;
+        let mut index = 0usize;
+
+        while index < chars.len() {
+            match chars[index] {
+                '\\' if index + 1 < chars.len() => {
+                    output.push(chars[index + 1]);
+                    index += 2;
+                }
+                '$' => {
+                    if let Some((consumed, placeholder, default_text)) =
+                        Self::parse_snippet_placeholder(&chars[index..])
+                    {
+                        let cursor_here = output.chars().count();
+                        if placeholder == 0 {
+                            final_cursor = Some(cursor_here);
+                        } else if first_tabstop.is_none() {
+                            first_tabstop = Some(cursor_here);
+                        }
+                        output.push_str(&default_text);
+                        index += consumed;
+                    } else {
+                        output.push('$');
+                        index += 1;
+                    }
+                }
+                ch => {
+                    output.push(ch);
+                    index += 1;
+                }
+            }
+        }
+
+        ParsedCompletionInsert {
+            text: output,
+            cursor_offset: final_cursor.or(first_tabstop),
+        }
+    }
+
+    fn parse_snippet_placeholder(chars: &[char]) -> Option<(usize, usize, String)> {
+        if chars.first().copied()? != '$' {
+            return None;
+        }
+
+        if chars.get(1).is_some_and(|c| c.is_ascii_digit()) {
+            let mut end = 1usize;
+            while chars.get(end).is_some_and(|c| c.is_ascii_digit()) {
+                end += 1;
+            }
+            let placeholder = chars[1..end].iter().collect::<String>().parse().ok()?;
+            return Some((end, placeholder, String::new()));
+        }
+
+        if chars.get(1) != Some(&'{') {
+            return None;
+        }
+
+        let mut digit_end = 2usize;
+        while chars.get(digit_end).is_some_and(|c| c.is_ascii_digit()) {
+            digit_end += 1;
+        }
+        if digit_end == 2 {
+            return None;
+        }
+
+        let placeholder = chars[2..digit_end]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
+
+        match chars.get(digit_end) {
+            Some('}') => Some((digit_end + 1, placeholder, String::new())),
+            Some(':') => {
+                let mut default_text = String::new();
+                let mut cursor = digit_end + 1;
+                while cursor < chars.len() {
+                    match chars[cursor] {
+                        '\\' if cursor + 1 < chars.len() => {
+                            default_text.push(chars[cursor + 1]);
+                            cursor += 2;
+                        }
+                        '}' => return Some((cursor + 1, placeholder, default_text)),
+                        other => {
+                            default_text.push(other);
+                            cursor += 1;
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn html_tag_fallback_items(
+        &self,
+        anchor: CharOffset,
+        cursor: CharOffset,
+        prefix: &str,
+        ctx: &ViewContext<Self>,
+    ) -> Option<Vec<lsp::CompletionItem>> {
+        if prefix.is_empty()
+            || self.file_path().and_then(lsp::LanguageId::from_path) != Some(lsp::LanguageId::Html)
+        {
+            return None;
+        }
+
+        let editor = self.editor().as_ref(ctx);
+        let before_anchor = if anchor.as_usize() == 0 {
+            None
+        } else {
+            editor.char_at(anchor.saturating_sub(&CharOffset::from(1)), ctx)
+        };
+        let after_cursor = editor.char_at(cursor, ctx);
+        let safe_context = match before_anchor {
+            None => true,
+            Some(ch) => ch.is_whitespace() || ch == '>' || ch == '/',
+        } && !after_cursor
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_');
+        if !safe_context {
+            return None;
+        }
+
+        const HTML_TAGS: &[&str] = &[
+            "div",
+            "span",
+            "section",
+            "article",
+            "main",
+            "header",
+            "footer",
+            "nav",
+            "aside",
+            "button",
+            "form",
+            "label",
+            "input",
+            "textarea",
+            "select",
+            "option",
+            "ul",
+            "ol",
+            "li",
+            "a",
+            "img",
+            "figure",
+            "figcaption",
+            "p",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "table",
+            "thead",
+            "tbody",
+            "tr",
+            "td",
+            "th",
+            "script",
+            "style",
+            "template",
+            "dialog",
+            "details",
+            "summary",
+            "canvas",
+            "video",
+            "audio",
+        ];
+        const VOID_TAGS: &[&str] = &[
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
+        ];
+
+        let needle = prefix.to_ascii_lowercase();
+        let items = HTML_TAGS
+            .iter()
+            .filter(|tag| tag.starts_with(&needle))
+            .take(COMPLETION_MAX_VISIBLE_ITEMS)
+            .map(|tag| {
+                let insert_text = if VOID_TAGS.contains(tag) {
+                    format!("<{tag}>$0")
+                } else {
+                    format!("<{tag}>$0</{tag}>")
+                };
+                lsp::CompletionItem {
+                    label: (*tag).to_string(),
+                    insert_text,
+                    insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                    text_edit: None,
+                    detail: Some("HTML tag".to_string()),
+                    kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+                    sort_text: None,
+                    filter_text: Some((*tag).to_string()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        (!items.is_empty()).then_some(items)
     }
 
     /// Close the completion popup (if any) and stop the editor from intercepting
