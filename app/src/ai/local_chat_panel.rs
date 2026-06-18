@@ -374,7 +374,7 @@ pub enum LocalAiChatAction {
     KeepEdits,
     /// Undo the agent's file changes (restore each captured original).
     UndoEdits,
-    /// Expand the detailed diff preview for a transcript file card.
+    /// Open the workspace diff / review panel for a transcript file card.
     OpenDiff(usize),
     /// Expand/collapse the modified-files review browser.
     ToggleReviewExpanded,
@@ -507,7 +507,7 @@ impl LocalAiChatView {
             error: None,
             current_turn: 0,
             attach_context: true,
-            agent_mode: false,
+            agent_mode: true,
             agent_root: None,
             agent_messages: Vec::new(),
             agent_model: String::new(),
@@ -2293,10 +2293,6 @@ impl LocalAiChatView {
                     .with_background_color(genesi_panel_surface())
                     .finish(),
             );
-
-            if let Some(edit) = self.selected_review_edit() {
-                column.add_child(self.render_diff_preview(appearance, &edit.diff_preview));
-            }
         }
 
         let wrapped = if self.vibe_mode {
@@ -2624,11 +2620,7 @@ impl LocalAiChatView {
             .with_child(header);
 
         if !entry.collapsed {
-            if let Some(lines) = &entry.diff_preview {
-                if !lines.is_empty() {
-                    column.add_child(self.render_diff_preview(appearance, lines));
-                }
-            } else if !entry.text.trim().is_empty() {
+            if entry.diff_preview.is_none() && !entry.text.trim().is_empty() {
                 let body = Container::new(self.mono_text(
                     appearance,
                     entry.text.clone(),
@@ -3036,10 +3028,15 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::OpenDiff(index) => {
-                self.collapse_other_diffs(*index);
-                if let Some(entry) = self.messages.get_mut(*index) {
-                    entry.collapsed = false;
+                if let Some(path) = self
+                    .messages
+                    .get(*index)
+                    .and_then(|entry| entry.tool_title.clone())
+                {
+                    self.review_expanded = true;
+                    self.selected_review_path = Some(path);
                 }
+                ctx.emit(LocalAiChatEvent::OpenDiff);
                 ctx.notify();
             }
             LocalAiChatAction::ToggleReviewExpanded => {
@@ -3053,6 +3050,7 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::SelectReviewFile(path) => {
                 self.review_expanded = true;
                 self.selected_review_path = Some(path.clone());
+                ctx.emit(LocalAiChatEvent::OpenDiff);
                 ctx.notify();
             }
             LocalAiChatAction::ApproveTool => {
@@ -3290,6 +3288,36 @@ impl LocalAiChatView {
             ctx.emit(LocalAiChatEvent::StateChanged);
             ctx.notify();
         }
+    }
+
+    pub fn delete_chat(&mut self, chat_id: &str, ctx: &mut ViewContext<Self>) {
+        self.stop_turn(ctx);
+
+        let was_active = chat_id == self.active_chat_id;
+        if !was_active {
+            self.persist_mempalace(ctx, false);
+        }
+
+        self.chats.retain(|chat| chat.id != chat_id);
+
+        if was_active {
+            if let Some(next_chat) = self
+                .chats
+                .iter()
+                .max_by_key(|chat| chat.updated_at_ms)
+                .cloned()
+            {
+                self.active_chat_id = next_chat.id.clone();
+                self.restore_chat(&next_chat);
+                self.scroll_to_bottom();
+            } else {
+                self.active_chat_id = Self::new_chat_id();
+                self.reset_current_chat();
+            }
+        }
+
+        self.persist_mempalace(ctx, true);
+        ctx.notify();
     }
 }
 

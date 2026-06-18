@@ -601,6 +601,12 @@ pub fn init(ctx: &mut AppContext) {
         EditableBinding::new("editor_view:paste", "Paste", EditorAction::Paste)
             .with_context_predicate(id!("EditorView") & !id!("IMEOpen") & !id!("Input"))
             .with_linux_or_windows_key_binding("ctrl-v"),
+        EditableBinding::new("editor_view:copy_input", "Copy", EditorAction::Copy)
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen") & id!("Input"))
+            .with_linux_or_windows_key_binding("ctrl-c"),
+        EditableBinding::new("editor_view:paste_input", "Paste", EditorAction::Paste)
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen") & id!("Input"))
+            .with_linux_or_windows_key_binding("ctrl-v"),
         EditableBinding::new(
             "editor_view:add_next_occurrence",
             "Add selection for next occurrence",

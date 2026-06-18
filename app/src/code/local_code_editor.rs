@@ -50,6 +50,7 @@ use warpui::elements::{
 use warpui::keymap::macros::*;
 use warpui::keymap::FixedBinding;
 use warpui::platform::SaveFilePickerConfiguration;
+use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::text::point::Point;
 use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
@@ -58,6 +59,8 @@ use warpui::{
     ViewHandle, WindowId,
 };
 
+#[cfg(feature = "local_fs")]
+use crate::ai::persisted_workspace::{LSPInstallationStatus, LspRepoStatus};
 use crate::ai::persisted_workspace::{PersistedWorkspace, PersistedWorkspaceEvent};
 use crate::code::buffer_location::LocalOrRemotePath as BufferFileLocation;
 use crate::code::editor::model::HoverableLink;
@@ -67,7 +70,7 @@ use crate::code::global_buffer_model::{BufferState, GlobalBufferModel, GlobalBuf
 use crate::code::{SaveOutcome, ShowFindReferencesCardProvider};
 use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
-use crate::settings::AISettings;
+use crate::settings::{AISettings, CodeSettings};
 use crate::terminal::TerminalView;
 use crate::workspace::WorkspaceAction;
 
@@ -343,6 +346,7 @@ pub struct LocalCodeEditorView {
     pub(super) diagnostic_decorations: Vec<Decoration>,
     /// View for the find references feature.
     find_references_view: Option<ViewHandle<FindReferencesView>>,
+    autosave_handle: Option<SpawnedFutureHandle>,
 }
 
 impl LocalCodeEditorView {
@@ -385,6 +389,8 @@ impl LocalCodeEditorView {
                     if me.is_lsp_server_available(ctx) {
                         me.handle_completion_trigger(ctx);
                     }
+
+                    me.schedule_autosave(ctx);
                 }
             }
             CodeEditorEvent::VimEscapeInNormalMode => {
@@ -548,12 +554,54 @@ impl LocalCodeEditorView {
             processed_diagnostics: Vec::new(),
             diagnostic_decorations: Vec::new(),
             find_references_view: None,
+            autosave_handle: None,
         };
 
         if let Some(display_mode) = display_mode {
             model.set_display_mode(display_mode, ctx);
         }
         model
+    }
+
+    fn autosave_enabled(&self, app: &AppContext) -> bool {
+        *CodeSettings::as_ref(app).autosave_enabled
+            && self.diff_type.is_none()
+            && self.file_path().is_some()
+    }
+
+    fn cancel_autosave(&mut self) {
+        if let Some(handle) = self.autosave_handle.take() {
+            handle.abort();
+        }
+    }
+
+    fn schedule_autosave(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cancel_autosave();
+
+        if !self.autosave_enabled(ctx) {
+            return;
+        }
+
+        let handle = ctx.spawn(
+            async move {
+                Timer::after(Duration::from_millis(700)).await;
+            },
+            |me, _, ctx| {
+                me.autosave_handle = None;
+
+                if !me.autosave_enabled(ctx) || !me.has_version_conflicts(ctx) {
+                    return;
+                }
+
+                if let Err(ImmediateSaveError::FailedToSave(err)) = me.save_local(ctx) {
+                    log::error!("Autosave failed: {err:?}");
+                    ctx.emit(LocalCodeEditorEvent::FailedToSave {
+                        error: Rc::new(err),
+                    });
+                }
+            },
+        );
+        self.autosave_handle = Some(handle);
     }
 
     /// Calls LSP goto_definition and spawns a callback with the result.
@@ -983,10 +1031,7 @@ impl LocalCodeEditorView {
             // If the LSP is not registered, try to start it via PersistedWorkspace.
             #[cfg(feature = "local_fs")]
             {
-                use crate::ai::persisted_workspace::LspTask;
-                PersistedWorkspace::handle(ctx).update(ctx, |workspace, ctx| {
-                    workspace.execute_lsp_task(LspTask::Spawn { file_path: path }, ctx);
-                });
+                Self::maybe_auto_enable_lsp_for_path(&path, ctx);
             }
             return;
         };
@@ -1432,6 +1477,25 @@ impl LocalCodeEditorView {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
+            PersistedWorkspaceEvent::InstallStatusUpdate {
+                server_type,
+                status: LSPInstallationStatus::Installed,
+            } => {
+                let matches_file = me
+                    .file_path()
+                    .and_then(LanguageId::from_path)
+                    .is_some_and(|language_id| language_id.server_type() == *server_type);
+                if matches_file {
+                    if let Some(path) = me.file_path().map(Path::to_path_buf) {
+                        Self::maybe_auto_enable_lsp_for_path(&path, ctx);
+                    }
+                }
+                if let Some(footer) = &me.footer {
+                    footer.update(ctx, |_, ctx| {
+                        ctx.notify();
+                    });
+                }
+            }
             PersistedWorkspaceEvent::InstallationSucceeded
             | PersistedWorkspaceEvent::InstallationFailed => {
                 // PersistedWorkspace handles spawning the server after install;
@@ -1442,8 +1506,66 @@ impl LocalCodeEditorView {
                     });
                 }
             }
+            PersistedWorkspaceEvent::AvailableServersDetected { workspace_path, .. }
+            | PersistedWorkspaceEvent::WorkspaceAdded {
+                path: workspace_path,
+            } => {
+                let should_retry = me
+                    .file_path()
+                    .is_some_and(|path| path.starts_with(workspace_path));
+                if should_retry {
+                    if let Some(path) = me.file_path().map(Path::to_path_buf) {
+                        Self::maybe_auto_enable_lsp_for_path(&path, ctx);
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn resolve_lsp_workspace_root(path: &Path, ctx: &AppContext) -> Option<PathBuf> {
+        if let Some(workspace_root) = PersistedWorkspace::as_ref(ctx).root_for_workspace(path) {
+            return Some(workspace_root.to_path_buf());
+        }
+
+        DetectedRepositories::as_ref(ctx)
+            .get_root_for_path(&LocalOrRemotePath::Local(path.to_path_buf()))
+            .and_then(|root| PathBuf::try_from(root).ok())
+            .or_else(|| path.parent().map(Path::to_path_buf))
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn maybe_auto_enable_lsp_for_path(path: &Path, ctx: &mut ViewContext<Self>) {
+        use crate::ai::persisted_workspace::LspTask;
+
+        let Some(language_id) = LanguageId::from_path(path) else {
+            return;
+        };
+        let lsp_server_type = language_id.server_type();
+        let Some(repo_root) = Self::resolve_lsp_workspace_root(path, ctx) else {
+            return;
+        };
+        let path = path.to_path_buf();
+
+        PersistedWorkspace::handle(ctx).update(ctx, |workspace, ctx| {
+            if workspace.root_for_workspace(&path).is_none() {
+                workspace.user_added_workspace(repo_root.clone(), ctx);
+            }
+
+            match workspace.detect_lsp_workspace_status(repo_root.clone(), lsp_server_type, ctx) {
+                LspRepoStatus::Ready | LspRepoStatus::Enabled => {
+                    workspace.execute_lsp_task(LspTask::Spawn { file_path: path }, ctx);
+                }
+                LspRepoStatus::DisabledAndInstalled { .. } => {
+                    workspace.enable_lsp_server_for_path(&repo_root, lsp_server_type);
+                    workspace.execute_lsp_task(LspTask::Spawn { file_path: path }, ctx);
+                }
+                LspRepoStatus::CheckingForInstallation
+                | LspRepoStatus::DisabledAndNotInstalled { .. }
+                | LspRepoStatus::Installing { .. } => {}
+            }
+        });
     }
 
     /// Enables LSP for the given file path by:
@@ -1468,19 +1590,7 @@ impl LocalCodeEditorView {
         // Get the repository root from PersistedWorkspace.
         // If it doesn't exist, try to get it from DetectedRepositories.
         // If it also doesn't exist in DetectedRepositories, use the parent path.
-        let repo_root = if let Some(workspace_root) =
-            PersistedWorkspace::as_ref(ctx).root_for_workspace(path)
-        {
-            Some(workspace_root.to_path_buf())
-        } else {
-            match DetectedRepositories::as_ref(ctx)
-                .get_root_for_path(&LocalOrRemotePath::Local(path.to_path_buf()))
-                .and_then(|r| PathBuf::try_from(r).ok())
-            {
-                Some(root) => Some(root),
-                None => path.parent().map(|s| s.to_path_buf()), // If we can't find root, treat the parent as the root.
-            }
-        };
+        let repo_root = Self::resolve_lsp_workspace_root(path, ctx);
 
         let Some(repo_root) = repo_root else {
             return;
@@ -1509,19 +1619,7 @@ impl LocalCodeEditorView {
         let lsp_server_type = language_id.server_type();
         let path = path.to_path_buf();
 
-        let repo_root = if let Some(workspace_root) =
-            PersistedWorkspace::as_ref(ctx).root_for_workspace(&path)
-        {
-            Some(workspace_root.to_path_buf())
-        } else {
-            match DetectedRepositories::as_ref(ctx)
-                .get_root_for_path(&LocalOrRemotePath::Local(path.to_path_buf()))
-                .and_then(|r| PathBuf::try_from(r).ok())
-            {
-                Some(root) => Some(root),
-                None => path.parent().map(|s| s.to_path_buf()),
-            }
-        };
+        let repo_root = Self::resolve_lsp_workspace_root(&path, ctx);
 
         let Some(repo_root) = repo_root else {
             return;
@@ -1676,6 +1774,8 @@ impl LocalCodeEditorView {
     /// This will only return an error immediately if there is a failure in the sync part of the call.
     /// Other errors could be returned asynchronously via the FileModelEvent::FailedToSave event.
     pub fn save_local(&mut self, ctx: &mut ViewContext<Self>) -> Result<(), ImmediateSaveError> {
+        self.cancel_autosave();
+
         if self.is_remote_disconnected(ctx) {
             return Err(ImmediateSaveError::RemoteDisconnected);
         }

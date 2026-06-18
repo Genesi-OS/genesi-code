@@ -312,6 +312,7 @@ pub enum WorkspaceAction {
     SetGenesiModeIde,
     StartNewLocalChat,
     OpenLocalChatSession(String),
+    DeleteLocalChatSession(String),
     ToggleKeybindingsPage,
     ShowCommandSearch(CommandSearchOptions),
     CreatePersonalNotebook,
@@ -954,6 +955,7 @@ impl WorkspaceAction {
             | SetGenesiModeIde
             | StartNewLocalChat
             | OpenLocalChatSession(_)
+            | DeleteLocalChatSession(_)
             | OpenCloudAgentSetupGuide
             | ToggleKeybindingsPage
             | ShowCommandSearch(_)

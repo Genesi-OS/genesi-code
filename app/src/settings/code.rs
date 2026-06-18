@@ -9,7 +9,16 @@ define_settings_group!(CodeSettings, settings: [
         sync_to_cloud: SyncToCloud::Never,
         private: false,
         toml_path: "code.editor.use_warp_as_default_editor",
-        description: "Whether Warp is used as the default code editor.",
+        description: "Whether Genesi Code is used as the default code editor.",
+    },
+    autosave_enabled: AutosaveEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.editor.autosave",
+        description: "Whether IDE edits are automatically saved shortly after typing stops.",
     }
     codebase_context_enabled: CodebaseContextEnabled {
         type: bool,

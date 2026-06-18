@@ -736,6 +736,8 @@ impl PersistedWorkspace {
             }
         }
         self.index_repo(path.clone(), ctx);
+        #[cfg(feature = "local_fs")]
+        self.detect_available_servers_for_workspaces(vec![path.clone()], false, ctx);
         ctx.emit(PersistedWorkspaceEvent::WorkspaceAdded { path });
     }
 

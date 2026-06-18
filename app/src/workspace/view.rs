@@ -4706,8 +4706,39 @@ impl Workspace {
             }
             #[cfg(feature = "local_fs")]
             LocalAiChatEvent::OpenDiff => {
-                self.current_workspace_state.is_local_ai_panel_open = false;
-                self.setup_code_review_panel(None, ctx);
+                let pane_group_handle = self.active_tab_pane_group().clone();
+                let read_result = pane_group_handle.read(ctx, |pane_group, ctx| {
+                    pane_group.active_session_view(ctx).map(|terminal_view| {
+                        let repo_path = terminal_view.as_ref(ctx).current_repo_path().cloned();
+                        let preferred_session = terminal_view.as_ref(ctx).active_block_session_id();
+                        (repo_path, preferred_session, terminal_view.downgrade())
+                    })
+                });
+
+                if let Some((repo_path, preferred_session, terminal_view)) = read_result {
+                    if let Some(diff_state_model) = repo_path.as_ref().and_then(|repo_path| {
+                        self.working_directories_model.update(ctx, |model, ctx| {
+                            model.get_or_create_diff_state_model(
+                                repo_path.clone(),
+                                preferred_session,
+                                ctx,
+                            )
+                        })
+                    }) {
+                        let context = CodeReviewPaneContext {
+                            repo_path,
+                            diff_state_model,
+                            terminal_view,
+                        };
+                        self.open_right_panel(
+                            &context,
+                            &pane_group_handle,
+                            CodeReviewPaneEntrypoint::RightPanel,
+                            None,
+                            ctx,
+                        );
+                    }
+                }
                 ctx.notify();
             }
             #[cfg(not(feature = "local_fs"))]
@@ -12633,6 +12664,9 @@ impl Workspace {
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
             projects.upsert_project(path_buf.clone(), ctx);
         });
+        PersistedWorkspace::handle(ctx).update(ctx, |persisted, ctx| {
+            persisted.user_added_workspace(path_buf.clone(), ctx);
+        });
         self.add_tab_with_pane_layout(
             PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
                 initial_directory: Some(path_buf.clone()),
@@ -19956,6 +19990,7 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let chats = self.local_ai_panel.as_ref(app).chat_summaries();
+        let project_label = self.current_genesi_project_label(app);
 
         let new_chat_button = appearance
             .ui_builder()
@@ -19972,6 +20007,45 @@ impl Workspace {
             .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::StartNewLocalChat))
             .finish();
 
+        let project_button = EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Text::new_inline(project_label, appearance.ui_font_family(), 12.)
+                                .with_color(theme.active_ui_text_color().into())
+                                .with_clip(ClipConfig::ellipsis())
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(
+                            icons::Icon::ChevronDown
+                                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                                .finish(),
+                        )
+                        .with_margin_left(6.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_margin_top(10.)
+            .with_horizontal_padding(10.)
+            .with_vertical_padding(10.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_background(internal_colors::fg_overlay_1(theme))
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .finish(),
+        )
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::OpenRepository { path: None });
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
         let mut chat_column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         chat_column.add_child(
             Text::new_inline("Chats", appearance.ui_font_family(), 11.)
@@ -19980,10 +20054,43 @@ impl Workspace {
         );
         for chat in chats {
             let chat_id = chat.id.clone();
+            let delete_chat_id = chat.id.clone();
             let row = Container::new(
-                Text::new_inline(chat.title, appearance.ui_font_family(), 12.)
-                    .with_color(theme.active_ui_text_color().into())
-                    .with_clip(ClipConfig::ellipsis())
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Text::new_inline(chat.title, appearance.ui_font_family(), 12.)
+                                .with_color(theme.active_ui_text_color().into())
+                                .with_clip(ClipConfig::ellipsis())
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_child(
+                        EventHandler::new(
+                            Container::new(
+                                ConstrainedBox::new(
+                                    icons::Icon::X
+                                        .to_warpui_icon(theme.sub_text_color(theme.background()))
+                                        .finish(),
+                                )
+                                .with_width(12.)
+                                .with_height(12.)
+                                .finish(),
+                            )
+                            .with_margin_left(10.)
+                            .finish(),
+                        )
+                        .on_left_mouse_down(move |ctx, _, _| {
+                            ctx.dispatch_typed_action(WorkspaceAction::DeleteLocalChatSession(
+                                delete_chat_id.clone(),
+                            ));
+                            DispatchEventResult::StopPropagation
+                        })
+                        .finish(),
+                    )
                     .finish(),
             )
             .with_margin_top(10.)
@@ -20023,6 +20130,7 @@ impl Workspace {
                 Flex::column()
                     .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                     .with_child(new_chat_button)
+                    .with_child(project_button)
                     .with_child(current_chat)
                     .finish(),
             )
@@ -20032,10 +20140,21 @@ impl Workspace {
         )
     }
 
+    fn current_genesi_project_label(&self, app: &AppContext) -> String {
+        self.focused_project_root(app)
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .unwrap_or_else(|| "Choose folder".to_string())
+    }
+
     fn render_genesi_vibe_layout(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-
-        Flex::row()
+        let pane_group = self.active_tab_pane_group().as_ref(app);
+        let mut layout = Flex::row()
             .with_child(
                 ConstrainedBox::new(self.render_genesi_vibe_sidebar(appearance, app))
                     .with_width(248.)
@@ -20051,44 +20170,67 @@ impl Workspace {
                     ),
                 )
                 .finish(),
-            )
-            .finish()
+            );
+
+        if pane_group.right_panel_open {
+            layout = layout
+                .with_child(Self::render_panel_separator(app))
+                .with_child(self.render_panel(
+                    app,
+                    ChildView::new(&self.right_panel_view).finish(),
+                    &PanelPosition::Right,
+                ));
+        }
+
+        layout.finish()
     }
 
-    fn render_genesi_project_chip(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_genesi_project_chip(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let text_color = theme.active_ui_text_color();
+        let label = self.current_genesi_project_label(app);
 
-        Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(
-                    Text::new_inline("Project name", appearance.ui_font_family(), 12.)
-                        .with_color(text_color.into())
-                        .with_clip(ClipConfig::ellipsis())
-                        .finish(),
-                )
-                .with_child(
-                    Container::new(
-                        ConstrainedBox::new(
-                            icons::Icon::ChevronDown
-                                .to_warpui_icon(theme.sub_text_color(theme.background()))
-                                .finish(),
+        EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Text::new_inline(label, appearance.ui_font_family(), 12.)
+                            .with_color(text_color.into())
+                            .with_clip(ClipConfig::ellipsis())
+                            .finish(),
+                    )
+                    .with_child(
+                        Container::new(
+                            ConstrainedBox::new(
+                                icons::Icon::ChevronDown
+                                    .to_warpui_icon(theme.sub_text_color(theme.background()))
+                                    .finish(),
+                            )
+                            .with_width(12.)
+                            .with_height(12.)
+                            .finish(),
                         )
-                        .with_width(12.)
-                        .with_height(12.)
+                        .with_margin_left(5.)
                         .finish(),
                     )
-                    .with_margin_left(5.)
                     .finish(),
-                )
-                .finish(),
+            )
+            .with_horizontal_padding(10.)
+            .with_vertical_padding(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+            .with_background(internal_colors::fg_overlay_1(theme))
+            .with_border(Border::all(1.).with_border_fill(internal_colors::fg_overlay_1(theme)))
+            .finish(),
         )
-        .with_horizontal_padding(10.)
-        .with_vertical_padding(6.)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
-        .with_background(internal_colors::fg_overlay_1(theme))
-        .with_border(Border::all(1.).with_border_fill(internal_colors::fg_overlay_1(theme)))
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::OpenRepository { path: None });
+            DispatchEventResult::StopPropagation
+        })
         .finish()
     }
 
@@ -20205,7 +20347,7 @@ impl Workspace {
                 .finish(),
         );
         tab_bar.add_child(
-            Container::new(self.render_genesi_project_chip(appearance))
+            Container::new(self.render_genesi_project_chip(appearance, ctx))
                 .with_margin_right(8.)
                 .finish(),
         );
@@ -24302,6 +24444,13 @@ impl TypedActionView for Workspace {
                     panel.open_chat(&chat_id, ctx);
                 });
                 ctx.focus(&self.local_ai_panel);
+                ctx.notify();
+            }
+            DeleteLocalChatSession(chat_id) => {
+                let chat_id = chat_id.clone();
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.delete_chat(&chat_id, ctx);
+                });
                 ctx.notify();
             }
             ClickedAIAssistantIcon => {
