@@ -1303,7 +1303,7 @@ impl SettingsView {
             SettingsNavItem::Page(SettingsSection::Account),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "AI",
-                SettingsSection::ai_subpages().to_vec(),
+                vec![SettingsSection::WarpAgent],
             )),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Code",

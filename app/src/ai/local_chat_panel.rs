@@ -694,8 +694,9 @@ impl LocalAiChatView {
         &mut self,
         provider: CloudProviderKind,
         close_picker: bool,
-        _ctx: &mut ViewContext<Self>,
+        ctx: &mut ViewContext<Self>,
     ) {
+        self.load_cloud_keys(ctx);
         self.endpoint_user_chosen = true;
         self.cloud_active = true;
         self.endpoint = LocalEndpoint::Ollama;
@@ -784,14 +785,13 @@ impl LocalAiChatView {
         if prompt.is_empty() || self.in_flight {
             return;
         }
+        self.load_cloud_keys(ctx);
         // BYOK: a selected cloud provider needs its key before it can be used.
         if self.cloud_active && !self.cloud_ready() {
             self.error = Some(format!(
-                "Add your {} API key first (Set key).",
+                "Add your {} API key in Genesi AI settings first.",
                 self.cloud.provider.label()
             ));
-            self.error =
-                Some("Add your API key for the cloud provider first (🔑 Set key).".to_string());
             ctx.notify();
             return;
         }
@@ -2963,6 +2963,7 @@ impl TypedActionView for LocalAiChatView {
     fn handle_action(&mut self, action: &LocalAiChatAction, ctx: &mut ViewContext<Self>) {
         match action {
             LocalAiChatAction::CycleEndpoint => {
+                self.load_cloud_keys(ctx);
                 // A deliberate choice — stop the Turbo auto-default from
                 // overriding it on the next probe. Cycle: Local -> Turbo (if up)
                 // -> Cloud (BYOK) -> Local.
@@ -2990,6 +2991,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::CycleProvider => {
+                self.load_cloud_keys(ctx);
                 let presets = cloud_presets();
                 let current = presets
                     .iter()
@@ -3023,6 +3025,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::PickCloudModel(model) => {
+                self.load_cloud_keys(ctx);
                 self.cloud_active = true;
                 self.cloud.model = model.clone();
                 match save_cloud_config(&self.cloud) {
@@ -3066,6 +3069,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::Refresh => {
+                self.load_cloud_keys(ctx);
                 self.refresh_models(ctx);
                 self.refresh_ai_mode();
                 ctx.notify();
@@ -3088,6 +3092,7 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::ToggleModelPicker => {
+                self.load_cloud_keys(ctx);
                 self.model_picker_open = !self.model_picker_open;
                 ctx.notify();
             }

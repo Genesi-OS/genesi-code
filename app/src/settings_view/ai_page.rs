@@ -2176,45 +2176,9 @@ impl AISettingsPageView {
                 }
             }
             Some(AISubpage::WarpAgent) => {
-                // Oz page: global toggle + Active AI + Input + Other
-                widgets.push(Box::new(GlobalAIWidget::default()));
-                if ai_settings
-                    .intelligent_autosuggestions_enabled_internal
-                    .is_supported_on_current_platform()
-                    || ai_settings
-                        .prompt_suggestions_enabled_internal
-                        .is_supported_on_current_platform()
-                    || (FeatureFlag::PredictAMQueries.is_enabled()
-                        && ai_settings
-                            .natural_language_autosuggestions_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::SharedBlockTitleGeneration.is_enabled()
-                        && ai_settings
-                            .shared_block_title_generation_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::GitOperationsInCodeReview.is_enabled()
-                        && ai_settings
-                            .git_operations_autogen_enabled_internal
-                            .is_supported_on_current_platform())
-                {
-                    widgets.push(Box::new(ActiveAIWidget::default()));
-                }
-                widgets.push(Box::new(AIInputWidget::default()));
-                let voice_supported = cfg!(feature = "voice_input")
-                    && ai_settings
-                        .voice_input_enabled_internal
-                        .is_supported_on_current_platform();
-                if voice_supported {
-                    widgets.push(Box::new(VoiceWidget::default()));
-                }
-                widgets.push(Box::new(CloudHandoffWidget::default()));
+                // Genesi AI is local-first and account-free. Keep this page
+                // independent from Warp Agent and its account-gated settings.
                 widgets.push(Box::new(GenesiCloudKeysWidget::new(ctx)));
-                widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
-                widgets.push(Box::new(AgentAttributionWidget::default()));
-                widgets.push(Box::new(OtherAIWidget::default()));
-                if FeatureFlag::AgentModeComputerUse.is_enabled() {
-                    widgets.push(Box::new(CloudAgentComputerUseWidget::default()));
-                }
             }
             Some(AISubpage::Profiles) => {
                 if !FeatureFlag::UsageBasedPricing.is_enabled() {
@@ -7303,7 +7267,10 @@ impl GenesiCloudKeysWidget {
 
         AISettingsPageView::update_editor_interaction_state(editor.clone(), true, ctx);
         ctx.subscribe_to_view(&editor, move |_, editor, event, ctx| {
-            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+            if matches!(
+                event,
+                EditorEvent::Edited(_) | EditorEvent::Blurred | EditorEvent::Enter
+            ) {
                 let mut keys = Self::load_cloud_keys(ctx);
                 keys.set(
                     provider,
@@ -7394,14 +7361,23 @@ impl SettingsWidget for GenesiCloudKeysWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let is_enabled = true;
         let mut column = Flex::column()
+            .with_child(
+                Text::new_inline(
+                    "Genesi AI",
+                    appearance.ui_font_family(),
+                    PRIMARY_HEADER_FONT_SIZE,
+                )
+                .with_style(Properties::default().weight(Weight::Bold))
+                .with_color(appearance.theme().active_ui_text_color().into())
+                .finish(),
+            )
             .with_child(render_separator(appearance))
             .with_child(
                 build_sub_header(
                     appearance,
                     "Cloud providers",
-                    Some(styles::header_font_color(is_enabled, app)),
+                    Some(styles::header_font_color(true, app)),
                 )
                 .with_padding_bottom(HEADER_PADDING)
                 .finish(),
@@ -7453,7 +7429,7 @@ impl SettingsWidget for GenesiCloudKeysWidget {
                 appearance,
                 Self::provider_label(provider),
                 editor,
-                is_enabled,
+                true,
                 app,
             ));
         }
