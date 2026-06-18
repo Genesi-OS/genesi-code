@@ -177,6 +177,7 @@ native-dialog = "0.7.0"
 open = "5.0.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ashpd.workspace = true
 blocking.workspace = true
 dirs.workspace = true
 fontconfig = { version = "0.8.0", features = ["dlopen"] }

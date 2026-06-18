@@ -18,7 +18,8 @@ use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
-    FormattedTextElement, Icon, MainAxisSize, ParentElement, Radius, ScrollbarWidth, Shrinkable,
+    FormattedTextElement, Icon, MainAxisAlignment, MainAxisSize, ParentElement, Radius,
+    ScrollbarWidth, Shrinkable,
 };
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
@@ -33,11 +34,13 @@ use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     cloud_presets, list_models, load_cloud_config, load_legacy_cloud_key, read_ai_mode_state,
     save_cloud_config, set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok,
-    AiModeState, ChatMessage, ChatStreamItem, CloudConfig, CloudProviderKind, CodeContext,
-    LocalEndpoint,
+    AiModeState, ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind,
+    CodeContext, LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
 };
 use crate::appearance::Appearance;
+use crate::settings_view::SettingsSection;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
+use crate::workspace::WorkspaceAction;
 
 const TITLE_FONT_SIZE: f32 = 15.;
 const CHIP_FONT_SIZE: f32 = 11.;
@@ -47,7 +50,6 @@ const MONO_FONT_SIZE: f32 = 12.;
 const PANEL_PADDING: f32 = 8.;
 const MODEL_LABEL_MAX_CHARS: usize = 34;
 const VIBE_COLUMN_WIDTH: f32 = 760.;
-const CLOUD_KEYS_STORAGE_KEY: &str = "GenesiCodeCloudApiKeys";
 const MEMPALACE_STORAGE_KEY: &str = "GenesiCodeMempalaceV1";
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
@@ -119,38 +121,6 @@ enum InputMode {
     Chat,
     CloudKey,
     CloudModel,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct CloudKeyStore {
-    #[serde(default)]
-    hugging_face: String,
-    #[serde(default)]
-    openai: String,
-    #[serde(default)]
-    anthropic: String,
-    #[serde(default)]
-    gemini: String,
-}
-
-impl CloudKeyStore {
-    fn get(&self, provider: CloudProviderKind) -> &str {
-        match provider {
-            CloudProviderKind::HuggingFace => &self.hugging_face,
-            CloudProviderKind::OpenAI => &self.openai,
-            CloudProviderKind::Anthropic => &self.anthropic,
-            CloudProviderKind::Gemini => &self.gemini,
-        }
-    }
-
-    fn set(&mut self, provider: CloudProviderKind, value: String) {
-        match provider {
-            CloudProviderKind::HuggingFace => self.hugging_face = value,
-            CloudProviderKind::OpenAI => self.openai = value,
-            CloudProviderKind::Anthropic => self.anthropic = value,
-            CloudProviderKind::Gemini => self.gemini = value,
-        }
-    }
 }
 
 /// Who authored a transcript entry.
@@ -410,6 +380,7 @@ pub struct LocalAiChatView {
     active_chat_id: String,
     chats: Vec<PersistedLocalChat>,
     transcript_scroll: ClippedScrollStateHandle,
+    review_sidebar_scroll: ClippedScrollStateHandle,
     vibe_mode: bool,
 
     endpoint: LocalEndpoint,
@@ -496,6 +467,7 @@ impl LocalAiChatView {
             active_chat_id: String::new(),
             chats: Vec::new(),
             transcript_scroll: ClippedScrollStateHandle::default(),
+            review_sidebar_scroll: ClippedScrollStateHandle::default(),
             vibe_mode: false,
             endpoint: LocalEndpoint::Ollama,
             turbo_available: false,
@@ -549,10 +521,12 @@ impl LocalAiChatView {
     /// endpoint. Both yield the same `ChatStreamItem` stream so the agent loop
     /// and plain chat don't care which one is in use.
     fn build_stream(
-        &self,
+        &mut self,
         model: &str,
         messages: Vec<ChatMessage>,
+        ctx: &mut ViewContext<Self>,
     ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
+        self.load_cloud_keys(ctx);
         if self.cloud_active && self.cloud_ready() {
             stream_chat_cloud(
                 self.cloud.provider,
@@ -738,7 +712,7 @@ impl LocalAiChatView {
             self.error = Some(format!("Couldn't save cloud config: {err}"));
         } else if !self.cloud_ready() {
             self.error = Some(format!(
-                "Add your {} API key to use {}.",
+                "Add your {} API key in Settings to use {}.",
                 self.cloud.provider.label(),
                 self.cloud.model
             ));
@@ -900,7 +874,7 @@ impl LocalAiChatView {
         self.messages
             .push(ChatEntry::prose(ChatRole::Assistant, String::new(), None));
         let turn = self.current_turn;
-        let stream = self.build_stream(&model, request);
+        let stream = self.build_stream(&model, request, ctx);
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_stream_item(turn, item, ctx),
@@ -934,7 +908,9 @@ impl LocalAiChatView {
             diff_preview: None,
         });
         let turn = self.current_turn;
-        let stream = self.build_stream(&self.agent_model, self.agent_messages.clone());
+        let agent_model = self.agent_model.clone();
+        let agent_messages = self.agent_messages.clone();
+        let stream = self.build_stream(&agent_model, agent_messages, ctx);
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_agent_token(turn, item, ctx),
@@ -1529,6 +1505,22 @@ impl LocalAiChatView {
         self.chip_with_icon(appearance, label, None, action, selected, true)
     }
 
+    fn workspace_chip(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        icon_path: Option<&'static str>,
+        action: WorkspaceAction,
+        selected: bool,
+    ) -> Box<dyn Element> {
+        EventHandler::new(self.chip_content(appearance, label, icon_path, selected, true))
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
     pub fn current_chat_title(&self) -> String {
         Self::chat_title_from_entries(&self.messages)
     }
@@ -1549,6 +1541,225 @@ impl LocalAiChatView {
     pub fn set_vibe_mode(&mut self, enabled: bool, ctx: &mut ViewContext<Self>) {
         self.vibe_mode = enabled;
         ctx.notify();
+    }
+
+    pub fn select_review_file(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+        if self.pending_edits.iter().any(|edit| edit.path == path) {
+            self.selected_review_path = Some(path.to_string());
+            self.review_expanded = true;
+            ctx.notify();
+        }
+    }
+
+    pub fn keep_pending_edits(&mut self, ctx: &mut ViewContext<Self>) {
+        self.pending_edits.clear();
+        self.review_expanded = false;
+        self.selected_review_path = None;
+        self.persist_mempalace(ctx, false);
+        ctx.notify();
+    }
+
+    pub fn undo_pending_edits(&mut self, ctx: &mut ViewContext<Self>) {
+        let edits = std::mem::take(&mut self.pending_edits);
+        if let Some(root) = self.agent_root.clone() {
+            for edit in edits {
+                let Some(path) = local_agent::resolve_in_project(&root, &edit.path) else {
+                    continue;
+                };
+                match edit.original {
+                    Some(content) => {
+                        let _ = std::fs::write(&path, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        self.review_expanded = false;
+        self.selected_review_path = None;
+        self.persist_mempalace(ctx, false);
+        ctx.notify();
+    }
+
+    pub fn render_review_sidebar(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut root = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        let header = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Expanded::new(
+                    1.,
+                    self.label_text(
+                        appearance,
+                        "Review".to_string(),
+                        TITLE_FONT_SIZE,
+                        theme.main_text_color(theme.background()).into(),
+                        false,
+                    ),
+                )
+                .finish(),
+            )
+            .with_child(self.workspace_chip(
+                appearance,
+                "Files".to_string(),
+                Some("folder"),
+                WorkspaceAction::OpenGenesiFilesTool,
+                false,
+            ))
+            .with_child(self.workspace_chip(
+                appearance,
+                "Terminal".to_string(),
+                Some("terminal"),
+                WorkspaceAction::OpenGenesiTerminalTool,
+                false,
+            ))
+            .finish();
+        root.add_child(
+            Container::new(header)
+                .with_uniform_padding(10.)
+                .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+                .finish(),
+        );
+
+        if self.pending_edits.is_empty() {
+            root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.label_text(
+                        appearance,
+                        "No changes to review yet.".to_string(),
+                        BODY_FONT_SIZE,
+                        theme.disabled_text_color(theme.background()).into(),
+                        true,
+                    ))
+                    .with_uniform_padding(16.)
+                    .finish(),
+                )
+                .finish(),
+            );
+            return root.finish();
+        }
+
+        let selected_path = self
+            .selected_review_edit()
+            .map(|edit| edit.path.clone())
+            .unwrap_or_default();
+        let mut files = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for edit in &self.pending_edits {
+            let path = edit.path.clone();
+            let row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.label_text(
+                            appearance,
+                            edit.path.clone(),
+                            CHIP_FONT_SIZE,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ),
+                    )
+                    .finish(),
+                )
+                .with_child(self.label_text(
+                    appearance,
+                    format!("+{}", edit.added),
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        format!("-{}", edit.removed),
+                        CHIP_FONT_SIZE,
+                        theme.ui_error_color().into(),
+                        false,
+                    ))
+                    .with_margin_left(5.)
+                    .finish(),
+                )
+                .finish();
+            files.add_child(
+                EventHandler::new(
+                    Container::new(row)
+                        .with_horizontal_padding(10.)
+                        .with_vertical_padding(8.)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                        .with_background_color(if edit.path == selected_path {
+                            ColorU::new(255, 255, 255, 18)
+                        } else {
+                            ColorU::new(0, 0, 0, 0)
+                        })
+                        .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::SelectGenesiReviewFile(
+                        path.clone(),
+                    ));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+            );
+        }
+        root.add_child(
+            Container::new(files.finish())
+                .with_uniform_padding(8.)
+                .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+                .finish(),
+        );
+
+        if let Some(edit) = self.selected_review_edit() {
+            root.add_child(
+                Expanded::new(
+                    1.,
+                    ClippedScrollable::vertical(
+                        self.review_sidebar_scroll.clone(),
+                        Container::new(self.render_diff_preview(appearance, &edit.diff_preview))
+                            .with_uniform_padding(8.)
+                            .finish(),
+                        ScrollbarWidth::Auto,
+                        theme.disabled_ui_text_color().into(),
+                        theme.active_ui_text_color().into(),
+                        Fill::None,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            );
+        }
+
+        root.add_child(
+            Container::new(
+                Flex::row()
+                    .with_main_axis_alignment(MainAxisAlignment::End)
+                    .with_child(self.workspace_chip(
+                        appearance,
+                        "Undo".to_string(),
+                        None,
+                        WorkspaceAction::UndoGenesiEdits,
+                        false,
+                    ))
+                    .with_child(self.workspace_chip(
+                        appearance,
+                        "Keep All".to_string(),
+                        None,
+                        WorkspaceAction::KeepGenesiEdits,
+                        true,
+                    ))
+                    .finish(),
+            )
+            .with_uniform_padding(10.)
+            .with_border(Border::top(1.).with_border_fill(theme.outline()))
+            .finish(),
+        );
+
+        root.finish()
     }
 
     fn reset_current_chat(&mut self) {
@@ -2003,7 +2214,10 @@ impl LocalAiChatView {
         let key_status = if key_saved {
             format!("Key stored securely for {}", self.cloud.provider.label())
         } else {
-            format!("No API key saved for {}", self.cloud.provider.label())
+            format!(
+                "No API key saved for {}. Open Settings to add one.",
+                self.cloud.provider.label()
+            )
         };
         list.add_child(
             Container::new(self.label_text(appearance, key_status, BODY_FONT_SIZE, muted, false))
@@ -2014,9 +2228,9 @@ impl LocalAiChatView {
         list.add_child(self.picker_row(
             appearance,
             if key_saved {
-                "Update API key".to_string()
+                "Manage API keys in Settings".to_string()
             } else {
-                "Add API key".to_string()
+                "Open API key Settings".to_string()
             },
             LocalAiChatAction::SetKey,
             key_saved,
@@ -2147,11 +2361,7 @@ impl LocalAiChatView {
         let n = self.pending_edits.len();
         let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
         let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
-        let caret = if self.review_expanded { "v" } else { ">" };
-        let label = format!(
-            "{caret} {n} file{} need review",
-            if n == 1 { "" } else { "s" }
-        );
+        let label = format!("> {n} file{} need review", if n == 1 { "" } else { "s" });
 
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -2197,7 +2407,7 @@ impl LocalAiChatView {
             ))
             .finish();
 
-        let mut column = Flex::column()
+        let column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(
                 EventHandler::new(
@@ -2214,86 +2424,6 @@ impl LocalAiChatView {
                 })
                 .finish(),
             );
-
-        if self.review_expanded {
-            let selected_path = self
-                .selected_review_edit()
-                .map(|edit| edit.path.clone())
-                .unwrap_or_default();
-
-            let mut file_list =
-                Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-            for edit in &self.pending_edits {
-                let is_selected = edit.path == selected_path;
-                let file_row = Container::new(
-                    Flex::row()
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(
-                            Expanded::new(
-                                1.,
-                                self.label_text(
-                                    appearance,
-                                    edit.path.clone(),
-                                    CHIP_FONT_SIZE,
-                                    theme.main_text_color(theme.background()).into(),
-                                    false,
-                                ),
-                            )
-                            .finish(),
-                        )
-                        .with_child(self.label_text(
-                            appearance,
-                            format!("+{}", edit.added),
-                            CHIP_FONT_SIZE,
-                            genesi_green(),
-                            false,
-                        ))
-                        .with_child(
-                            Container::new(self.label_text(
-                                appearance,
-                                format!("-{}", edit.removed),
-                                CHIP_FONT_SIZE,
-                                theme.ui_error_color().into(),
-                                false,
-                            ))
-                            .with_margin_left(6.)
-                            .finish(),
-                        )
-                        .finish(),
-                )
-                .with_horizontal_padding(8.)
-                .with_vertical_padding(6.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                .with_background_color(if is_selected {
-                    ColorU::new(255, 255, 255, 20)
-                } else {
-                    ColorU::new(0, 0, 0, 0)
-                })
-                .finish();
-
-                let path = edit.path.clone();
-                file_list.add_child(
-                    EventHandler::new(file_row)
-                        .on_left_mouse_down(move |ctx, _, _| {
-                            ctx.dispatch_typed_action(LocalAiChatAction::SelectReviewFile(
-                                path.clone(),
-                            ));
-                            DispatchEventResult::StopPropagation
-                        })
-                        .finish(),
-                );
-            }
-
-            column.add_child(
-                Container::new(file_list.finish())
-                    .with_margin_top(6.)
-                    .with_uniform_padding(6.)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-                    .with_background_color(genesi_panel_surface())
-                    .finish(),
-            );
-        }
 
         let wrapped = if self.vibe_mode {
             ConstrainedBox::new(column.finish())
@@ -2901,7 +3031,9 @@ impl TypedActionView for LocalAiChatView {
                 }
                 ctx.notify();
             }
-            LocalAiChatAction::SetKey => self.set_input_mode(InputMode::CloudKey, ctx),
+            LocalAiChatAction::SetKey => ctx.dispatch_typed_action(
+                &WorkspaceAction::ShowSettingsPage(SettingsSection::WarpAgent),
+            ),
             LocalAiChatAction::SetModel => self.set_input_mode(InputMode::CloudModel, ctx),
             LocalAiChatAction::CycleModel => {
                 if !self.models.is_empty() {
@@ -3040,11 +3172,12 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::ToggleReviewExpanded => {
-                self.review_expanded = !self.review_expanded;
-                if self.review_expanded && self.selected_review_path.is_none() {
+                self.review_expanded = true;
+                if self.selected_review_path.is_none() {
                     self.selected_review_path =
                         self.pending_edits.first().map(|edit| edit.path.clone());
                 }
+                ctx.emit(LocalAiChatEvent::OpenDiff);
                 ctx.notify();
             }
             LocalAiChatAction::SelectReviewFile(path) => {

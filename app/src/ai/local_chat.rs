@@ -808,6 +808,47 @@ pub fn cloud_presets() -> &'static [CloudProviderKind] {
     ]
 }
 
+pub const CLOUD_KEYS_STORAGE_KEY: &str = "GenesiCodeCloudApiKeys";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudKeyStore {
+    #[serde(default)]
+    hugging_face: String,
+    #[serde(default)]
+    openai: String,
+    #[serde(default)]
+    anthropic: String,
+    #[serde(default)]
+    gemini: String,
+}
+
+impl CloudKeyStore {
+    pub fn get(&self, provider: CloudProviderKind) -> &str {
+        match provider {
+            CloudProviderKind::HuggingFace => &self.hugging_face,
+            CloudProviderKind::OpenAI => &self.openai,
+            CloudProviderKind::Anthropic => &self.anthropic,
+            CloudProviderKind::Gemini => &self.gemini,
+        }
+    }
+
+    pub fn set(&mut self, provider: CloudProviderKind, value: String) {
+        match provider {
+            CloudProviderKind::HuggingFace => self.hugging_face = value,
+            CloudProviderKind::OpenAI => self.openai = value,
+            CloudProviderKind::Anthropic => self.anthropic = value,
+            CloudProviderKind::Gemini => self.gemini = value,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hugging_face.trim().is_empty()
+            && self.openai.trim().is_empty()
+            && self.anthropic.trim().is_empty()
+            && self.gemini.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudConfig {
     /// Selected cloud provider.

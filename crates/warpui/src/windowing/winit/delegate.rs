@@ -53,6 +53,33 @@ impl GlobalHotKeyHandler {
 /// to determine if a given thread is the main thread or not.
 static MAIN_THREAD_ID: OnceLock<thread::ThreadId> = OnceLock::new();
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn open_folder_with_desktop_portal() -> Result<Vec<PathBuf>, String> {
+    futures_lite::future::block_on(async {
+        let request = ashpd::desktop::file_chooser::OpenFileRequest::default()
+            .title("Choose directory...")
+            .directory(true)
+            .multiple(false);
+        let response = request
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .response()
+            .map_err(|err| err.to_string())?;
+
+        response
+            .uris()
+            .iter()
+            .map(|uri| {
+                url::Url::parse(&uri.to_string())
+                    .map_err(|err| err.to_string())?
+                    .to_file_path()
+                    .map_err(|_| format!("Portal returned a non-local URI: {uri}"))
+            })
+            .collect()
+    })
+}
+
 /// Open a URL using the platform's default handler.
 pub fn open_url_in_system(url: &str) {
     #[cfg(target_family = "wasm")]
@@ -363,7 +390,8 @@ impl platform::Delegate for AppDelegate {
 
                     // native-dialog doesn't support file-or-directory or multi-directory pickers,
                     // so if folders are allowed, it can only show a directory picker.
-                    let result = if file_picker_config.allows_folder() {
+                    let allows_folder = file_picker_config.allows_folder();
+                    let result = if allows_folder {
                         native_dialog::FileDialog::new()
                             .set_title("Choose directory...")
                             .show_open_single_dir()
@@ -388,6 +416,18 @@ impl platform::Delegate for AppDelegate {
                                 .map(|opt| opt.into_iter().collect())
                                 .map_err(|e| FilePickerError::DialogFailed(e.to_string()))
                         }
+                    };
+
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    let result = match result {
+                        Ok(paths) => Ok(paths),
+                        Err(native_error) if allows_folder => open_folder_with_desktop_portal()
+                            .map_err(|portal_error| {
+                                FilePickerError::DialogFailed(format!(
+                                    "{native_error}; desktop portal fallback failed: {portal_error}"
+                                ))
+                            }),
+                        Err(error) => Err(error),
                     };
 
                     let result =

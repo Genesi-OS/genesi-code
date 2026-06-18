@@ -15252,6 +15252,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "ashpd",
  "asset_cache",
  "async-io",
  "async-task",

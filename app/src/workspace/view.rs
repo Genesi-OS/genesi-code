@@ -1061,6 +1061,7 @@ pub struct Workspace {
     ai_assistant_panel: ViewHandle<AIAssistantPanelView>,
     local_ai_panel: ViewHandle<LocalAiChatView>,
     genesi_vibe_mode: bool,
+    genesi_tools_panel_open: bool,
     // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
     // sidebar's "New Chat" button. These MUST live in the view (not be
     // `MouseStateHandle::default()` rebuilt each render): a button tracks the
@@ -3348,6 +3349,7 @@ impl Workspace {
             right_panel_view,
             working_directories_model,
             genesi_vibe_mode: false,
+            genesi_tools_panel_open: false,
             genesi_vibe_button_mouse_state: Default::default(),
             genesi_ide_button_mouse_state: Default::default(),
             genesi_new_chat_button_mouse_state: Default::default(),
@@ -4706,43 +4708,12 @@ impl Workspace {
             }
             #[cfg(feature = "local_fs")]
             LocalAiChatEvent::OpenDiff => {
-                let pane_group_handle = self.active_tab_pane_group().clone();
-                let read_result = pane_group_handle.read(ctx, |pane_group, ctx| {
-                    pane_group.active_session_view(ctx).map(|terminal_view| {
-                        let repo_path = terminal_view.as_ref(ctx).current_repo_path().cloned();
-                        let preferred_session = terminal_view.as_ref(ctx).active_block_session_id();
-                        (repo_path, preferred_session, terminal_view.downgrade())
-                    })
-                });
-
-                if let Some((repo_path, preferred_session, terminal_view)) = read_result {
-                    if let Some(diff_state_model) = repo_path.as_ref().and_then(|repo_path| {
-                        self.working_directories_model.update(ctx, |model, ctx| {
-                            model.get_or_create_diff_state_model(
-                                repo_path.clone(),
-                                preferred_session,
-                                ctx,
-                            )
-                        })
-                    }) {
-                        let context = CodeReviewPaneContext {
-                            repo_path,
-                            diff_state_model,
-                            terminal_view,
-                        };
-                        self.open_right_panel(
-                            &context,
-                            &pane_group_handle,
-                            CodeReviewPaneEntrypoint::RightPanel,
-                            None,
-                            ctx,
-                        );
-                    }
-                }
+                self.genesi_tools_panel_open = true;
                 ctx.notify();
             }
             #[cfg(not(feature = "local_fs"))]
             LocalAiChatEvent::OpenDiff => {
+                self.genesi_tools_panel_open = true;
                 ctx.notify();
             }
             LocalAiChatEvent::StateChanged => {
@@ -20153,7 +20124,6 @@ impl Workspace {
 
     fn render_genesi_vibe_layout(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        let pane_group = self.active_tab_pane_group().as_ref(app);
         let mut layout = Flex::row()
             .with_child(
                 ConstrainedBox::new(self.render_genesi_vibe_sidebar(appearance, app))
@@ -20172,14 +20142,10 @@ impl Workspace {
                 .finish(),
             );
 
-        if pane_group.right_panel_open {
+        if self.genesi_tools_panel_open {
             layout = layout
                 .with_child(Self::render_panel_separator(app))
-                .with_child(self.render_panel(
-                    app,
-                    ChildView::new(&self.right_panel_view).finish(),
-                    &PanelPosition::Right,
-                ));
+                .with_child(self.render_resizable_genesi_tools_panel(app));
         }
 
         layout.finish()
@@ -20355,6 +20321,7 @@ impl Workspace {
             let left_toolbar_buttons = config
                 .left_items()
                 .into_iter()
+                .filter(|item| *item != HeaderToolbarItemKind::CodeReview)
                 .filter_map(|item| self.render_header_toolbar_button(&item, appearance, ctx))
                 .collect::<Vec<_>>();
             let left_toolbar_button_count = left_toolbar_buttons.len();
@@ -20764,7 +20731,11 @@ impl Workspace {
             );
         }
 
-        for item in config.right_items() {
+        for item in config
+            .right_items()
+            .into_iter()
+            .filter(|item| *item != HeaderToolbarItemKind::CodeReview)
+        {
             if let Some(button) = self.render_header_toolbar_button(&item, appearance, ctx) {
                 target.add_child(button);
             }
@@ -20775,6 +20746,11 @@ impl Workspace {
         target.add_child(
             Container::new(self.render_local_ai_entrypoint_button(appearance))
                 .with_margin_left(TAB_BAR_PADDING_LEFT)
+                .finish(),
+        );
+        target.add_child(
+            Container::new(self.render_genesi_tools_entrypoint_button(appearance))
+                .with_margin_left(4.)
                 .finish(),
         );
 
@@ -21420,6 +21396,23 @@ impl Workspace {
                 "Local AI".to_owned(),
                 None,
                 is_active,
+                false,
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
+    fn render_genesi_tools_entrypoint_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Align::new(
+            self.render_tab_bar_icon_button(
+                appearance,
+                icons::Icon::Diff,
+                &self.mouse_states.right_panel_icon,
+                WorkspaceAction::ToggleGenesiToolsPanel,
+                "Review and tools".to_owned(),
+                None,
+                self.genesi_tools_panel_open,
                 false,
             )
             .finish(),
@@ -22224,6 +22217,33 @@ impl Workspace {
             .finish()
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn render_resizable_genesi_tools_panel(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let contents = self
+            .local_ai_panel
+            .as_ref(app)
+            .render_review_sidebar(appearance);
+        let panel = self.render_panel(app, contents, &PanelPosition::Right);
+        let resizable_data = ResizableData::handle(app);
+        let Some(handle) = resizable_data
+            .as_ref(app)
+            .get_handle(self.window_id, ModalType::RightPanelWidth)
+        else {
+            return panel;
+        };
+
+        Resizable::new(handle, panel)
+            .with_dragbar_side(DragBarSide::Left)
+            .with_bounds_callback(Box::new(|window_size| {
+                let min_width = LOCAL_AI_PANEL_MIN_WIDTH;
+                let max_width = (window_size.x() * 0.65).max(min_width);
+                (min_width, max_width)
+            }))
+            .on_resize(|ctx, _| ctx.notify())
+            .finish()
+    }
+
     fn render_panel_separator(_app: &AppContext) -> Box<dyn Element> {
         ConstrainedBox::new(Empty::new().finish())
             .with_width(GENESI_SHELL_PANEL_GAP)
@@ -22387,6 +22407,10 @@ impl Workspace {
             if let Some(right_panel_content) = right_panel_content {
                 panels_view = panels_view.with_child(right_panel_content);
             }
+        }
+
+        if self.genesi_tools_panel_open {
+            panels_view = panels_view.with_child(self.render_resizable_genesi_tools_panel(app));
         }
 
         panels_view.finish()
@@ -24408,6 +24432,44 @@ impl TypedActionView for Workspace {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
                 self.toggle_local_ai_panel(ctx);
+            }
+            ToggleGenesiToolsPanel => {
+                self.genesi_tools_panel_open = !self.genesi_tools_panel_open;
+                ctx.notify();
+            }
+            OpenGenesiFilesTool => {
+                self.genesi_vibe_mode = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
+                if *CodeSettings::as_ref(ctx).show_project_explorer {
+                    self.open_left_panel_view(&LeftPanelAction::ProjectExplorer, ctx);
+                }
+                ctx.notify();
+            }
+            OpenGenesiTerminalTool => {
+                self.genesi_vibe_mode = false;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
+                ctx.dispatch_typed_action(&WorkspaceAction::AddTerminalTab {
+                    hide_homepage: true,
+                });
+                ctx.notify();
+            }
+            SelectGenesiReviewFile(path) => {
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.select_review_file(path, ctx));
+                ctx.notify();
+            }
+            UndoGenesiEdits => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.undo_pending_edits(ctx));
+                ctx.notify();
+            }
+            KeepGenesiEdits => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.keep_pending_edits(ctx));
+                ctx.notify();
             }
             SetGenesiModeVibe => {
                 self.genesi_vibe_mode = true;

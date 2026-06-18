@@ -308,6 +308,12 @@ pub enum WorkspaceAction {
     ToggleAIAssistant,
     ClickedAIAssistantIcon,
     ToggleLocalAi,
+    ToggleGenesiToolsPanel,
+    OpenGenesiFilesTool,
+    OpenGenesiTerminalTool,
+    SelectGenesiReviewFile(String),
+    UndoGenesiEdits,
+    KeepGenesiEdits,
     SetGenesiModeVibe,
     SetGenesiModeIde,
     StartNewLocalChat,
@@ -985,6 +991,12 @@ impl WorkspaceAction {
             | ClosePanel
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
+            | ToggleGenesiToolsPanel
+            | OpenGenesiFilesTool
+            | OpenGenesiTerminalTool
+            | SelectGenesiReviewFile(_)
+            | UndoGenesiEdits
+            | KeepGenesiEdits
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)

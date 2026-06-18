@@ -65,6 +65,7 @@ use crate::ai::execution_profiles::{
     ActionPermission, WriteToPtyPermission,
 };
 use crate::ai::llms::{LLMContextWindow, LLMId, LLMPreferences, LLMPreferencesEvent};
+use crate::ai::local_chat::{CloudKeyStore, CloudProviderKind, CLOUD_KEYS_STORAGE_KEY};
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::paths::host_native_absolute_path;
 use crate::auth::auth_manager::{AuthManager, LoginGatedFeature};
@@ -96,6 +97,7 @@ use crate::view_components::{
     WarningBoxConfig,
 };
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
+use warpui_extras::secure_storage::AppContextExt as _;
 
 /// Identifies which subpage of the AI settings the user is viewing.
 /// When `None`, the page shows all widgets (legacy/full view).
@@ -169,9 +171,12 @@ const SHARED_BLOCK_TITLE_GENERATION_DESCRIPTION: &str =
 const GIT_OPERATIONS_AUTOGEN_DESCRIPTION: &str =
     "Let AI generate commit messages and pull request titles and descriptions.";
 const WISPR_FLOW_URL: &str = "https://wisprflow.ai/";
+#[allow(dead_code)]
 const CUSTOM_INFERENCE_LEARN_MORE_URL: &str =
     "https://docs.warp.dev/support-and-community/plans-and-billing/bring-your-own-api-key/";
+#[allow(dead_code)]
 const CUSTOM_INFERENCE_TERMS_URL: &str = "https://www.warp.dev/legal/terms-of-service";
+#[allow(dead_code)]
 const CUSTOM_INFERENCE_INFO_TOOLTIP_MAX_WIDTH: f32 = 320.;
 
 pub fn init_actions_from_parent_view<T: Action + Clone>(
@@ -2163,7 +2168,7 @@ impl AISettingsPageView {
                 }
                 widgets.push(Box::new(CloudHandoffWidget::default()));
                 widgets.push(Box::new(CLIAgentWidget::default()));
-                widgets.push(Box::new(ApiKeysWidget::new(ctx)));
+                widgets.push(Box::new(GenesiCloudKeysWidget::new(ctx)));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
                 widgets.push(Box::new(AgentAttributionWidget::default()));
                 widgets.push(Box::new(OtherAIWidget::default()));
@@ -2204,7 +2209,7 @@ impl AISettingsPageView {
                     widgets.push(Box::new(VoiceWidget::default()));
                 }
                 widgets.push(Box::new(CloudHandoffWidget::default()));
-                widgets.push(Box::new(ApiKeysWidget::new(ctx)));
+                widgets.push(Box::new(GenesiCloudKeysWidget::new(ctx)));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
                 widgets.push(Box::new(AgentAttributionWidget::default()));
                 widgets.push(Box::new(OtherAIWidget::default()));
@@ -7276,6 +7281,269 @@ impl SettingsWidget for CloudHandoffWidget {
     }
 }
 
+struct GenesiCloudKeysWidget {
+    hugging_face_api_key_editor: ViewHandle<EditorView>,
+    openai_api_key_editor: ViewHandle<EditorView>,
+    anthropic_api_key_editor: ViewHandle<EditorView>,
+    gemini_api_key_editor: ViewHandle<EditorView>,
+}
+
+impl GenesiCloudKeysWidget {
+    fn load_cloud_keys(ctx: &AppContext) -> CloudKeyStore {
+        match ctx.secure_storage().read_value(CLOUD_KEYS_STORAGE_KEY) {
+            Ok(json) => serde_json::from_str::<CloudKeyStore>(&json).unwrap_or_default(),
+            Err(_) => CloudKeyStore::default(),
+        }
+    }
+
+    fn persist_cloud_keys(keys: &CloudKeyStore, ctx: &AppContext) {
+        let result = if keys.is_empty() {
+            ctx.secure_storage().remove_value(CLOUD_KEYS_STORAGE_KEY)
+        } else {
+            match serde_json::to_string(keys) {
+                Ok(json) => ctx
+                    .secure_storage()
+                    .write_value_with_owner_only_fallback(CLOUD_KEYS_STORAGE_KEY, &json),
+                Err(err) => {
+                    log::warn!("Failed to serialize Genesi cloud keys: {err:#}");
+                    return;
+                }
+            }
+        };
+        if let Err(err) = result {
+            log::warn!("Failed to persist Genesi cloud keys: {err:#}");
+        }
+    }
+
+    fn provider_label(provider: CloudProviderKind) -> &'static str {
+        match provider {
+            CloudProviderKind::HuggingFace => "Hugging Face API key",
+            CloudProviderKind::OpenAI => "OpenAI API key",
+            CloudProviderKind::Anthropic => "Anthropic API key",
+            CloudProviderKind::Gemini => "Gemini API key",
+        }
+    }
+
+    fn provider_placeholder(provider: CloudProviderKind) -> &'static str {
+        match provider {
+            CloudProviderKind::HuggingFace => "hf_...",
+            CloudProviderKind::OpenAI => "sk-...",
+            CloudProviderKind::Anthropic => "sk-ant-...",
+            CloudProviderKind::Gemini => "AIza...",
+        }
+    }
+
+    fn make_key_editor(
+        provider: CloudProviderKind,
+        initial_value: &str,
+        enabled: bool,
+        ctx: &mut ViewContext<<Self as SettingsWidget>::View>,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password: true,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text(Self::provider_placeholder(provider), ctx);
+            if !initial_value.trim().is_empty() {
+                editor.set_buffer_text(initial_value, ctx);
+            }
+            editor
+        });
+
+        AISettingsPageView::update_editor_interaction_state(editor.clone(), enabled, ctx);
+        ctx.subscribe_to_view(&editor, move |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let mut keys = Self::load_cloud_keys(ctx);
+                keys.set(
+                    provider,
+                    editor.as_ref(ctx).buffer_text(ctx).trim().to_string(),
+                );
+                Self::persist_cloud_keys(&keys, ctx);
+            }
+        });
+
+        let editor_clone = editor.clone();
+        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
+            if matches!(event, AISettingsChangedEvent::IsAnyAIEnabled { .. }) {
+                let is_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+                AISettingsPageView::update_editor_interaction_state(
+                    editor_clone.clone(),
+                    is_enabled,
+                    ctx,
+                );
+                ctx.notify();
+            }
+        });
+
+        editor
+    }
+
+    fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
+        let keys = Self::load_cloud_keys(ctx);
+        let is_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+
+        Self {
+            hugging_face_api_key_editor: Self::make_key_editor(
+                CloudProviderKind::HuggingFace,
+                keys.get(CloudProviderKind::HuggingFace),
+                is_enabled,
+                ctx,
+            ),
+            openai_api_key_editor: Self::make_key_editor(
+                CloudProviderKind::OpenAI,
+                keys.get(CloudProviderKind::OpenAI),
+                is_enabled,
+                ctx,
+            ),
+            anthropic_api_key_editor: Self::make_key_editor(
+                CloudProviderKind::Anthropic,
+                keys.get(CloudProviderKind::Anthropic),
+                is_enabled,
+                ctx,
+            ),
+            gemini_api_key_editor: Self::make_key_editor(
+                CloudProviderKind::Gemini,
+                keys.get(CloudProviderKind::Gemini),
+                is_enabled,
+                ctx,
+            ),
+        }
+    }
+
+    fn render_api_key_input(
+        &self,
+        appearance: &Appearance,
+        label: &'static str,
+        editor: ViewHandle<EditorView>,
+        is_enabled: bool,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let padding = Some(Coords {
+            top: 10.,
+            bottom: 10.,
+            left: 16.,
+            right: 16.,
+        });
+        let editor_style = UiComponentStyles {
+            padding,
+            background: Some(appearance.theme().surface_2().into()),
+            ..Default::default()
+        };
+
+        let label = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+            .with_color(styles::header_font_color(is_enabled, app).into())
+            .finish();
+
+        let input = appearance
+            .ui_builder()
+            .text_input(editor)
+            .with_style(editor_style)
+            .build()
+            .finish();
+
+        Flex::column()
+            .with_spacing(8.)
+            .with_child(label)
+            .with_child(input)
+            .finish()
+    }
+}
+
+impl SettingsWidget for GenesiCloudKeysWidget {
+    type View = AISettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "genesi cloud api keys hugging face openai anthropic gemini google local chat secure storage"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
+        let mut column = Flex::column()
+            .with_child(render_separator(appearance))
+            .with_child(
+                build_sub_header(
+                    appearance,
+                    "Cloud providers",
+                    Some(styles::header_font_color(is_enabled, app)),
+                )
+                .with_padding_bottom(HEADER_PADDING)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    FormattedTextElement::new(
+                        FormattedText::new([FormattedTextLine::Line(vec![
+                            FormattedTextFragment::plain_text(
+                                "These keys are stored only on this device using secure storage. Clear a field and press Enter to remove its saved key.",
+                            ),
+                        ])]),
+                        CONTENT_FONT_SIZE,
+                        appearance.ui_font_family(),
+                        appearance.ui_font_family(),
+                        blended_colors::text_sub(
+                            appearance.theme(),
+                            appearance.theme().surface_1(),
+                        ),
+                        Default::default(),
+                    )
+                    .finish(),
+                )
+                .with_margin_top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
+                .with_margin_bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                .with_margin_right(styles::TOGGLE_WIDTH_MARGIN)
+                .finish(),
+            );
+
+        for (provider, editor) in [
+            (
+                CloudProviderKind::HuggingFace,
+                self.hugging_face_api_key_editor.clone(),
+            ),
+            (
+                CloudProviderKind::OpenAI,
+                self.openai_api_key_editor.clone(),
+            ),
+            (
+                CloudProviderKind::Anthropic,
+                self.anthropic_api_key_editor.clone(),
+            ),
+            (
+                CloudProviderKind::Gemini,
+                self.gemini_api_key_editor.clone(),
+            ),
+        ] {
+            column.add_child(self.render_api_key_input(
+                appearance,
+                Self::provider_label(provider),
+                editor,
+                is_enabled,
+                app,
+            ));
+        }
+
+        column.finish()
+    }
+}
+
+#[allow(dead_code)]
 struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
@@ -7289,6 +7557,7 @@ struct ApiKeysWidget {
     description_learn_more_index: HighlightedHyperlink,
 }
 
+#[allow(dead_code)]
 impl ApiKeysWidget {
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
