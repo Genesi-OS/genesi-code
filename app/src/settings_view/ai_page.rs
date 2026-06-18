@@ -22,7 +22,6 @@ use warpui::elements::{
 use warpui::fonts::{Properties, Weight};
 use warpui::keymap::{ContextPredicate, Keystroke};
 use warpui::platform::Cursor;
-use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::slider::SliderStateHandle;
 use warpui::ui_components::switch::{SwitchStateHandle, TooltipConfig};
@@ -3975,7 +3974,6 @@ fn render_ai_list(
 #[derive(Default)]
 struct GlobalAIWidget {
     switch_state: SwitchStateHandle,
-    sign_up_button: MouseStateHandle,
 }
 
 impl SettingsWidget for GlobalAIWidget {
@@ -3996,17 +3994,13 @@ impl SettingsWidget for GlobalAIWidget {
         let is_ai_disabled_due_to_remote_session_org_policy =
             AISettings::as_ref(app).is_ai_disabled_due_to_remote_session_org_policy(app);
 
-        let is_anonymous = AuthStateProvider::as_ref(app)
-            .get()
-            .is_anonymous_or_logged_out();
-
         let mut row = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
             .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(
                 Text::new_inline(
-                    "Warp Agent",
+                    "Genesi AI",
                     appearance.ui_font_family(),
                     PRIMARY_HEADER_FONT_SIZE,
                 )
@@ -4032,75 +4026,20 @@ impl SettingsWidget for GlobalAIWidget {
             );
         }
 
-        // Show sign-up button for anonymous users, toggle for logged-in users
-        if is_anonymous {
-            row.add_child(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(
-                        Container::new(
-                            Text::new_inline(
-                                "To use AI features, please create an account.",
-                                appearance.ui_font_family(),
-                                14.,
-                            )
-                            .with_color(
-                                appearance
-                                    .theme()
-                                    .sub_text_color(appearance.theme().surface_2())
-                                    .into_solid(),
-                            )
-                            .finish(),
-                        )
-                        .with_margin_right(16.)
-                        .finish(),
-                    )
-                    .with_child(
-                        Container::new(
-                            ui_builder
-                                .button(ButtonVariant::Accent, self.sign_up_button.clone())
-                                .with_style(UiComponentStyles {
-                                    font_size: Some(14.),
-                                    font_weight: Some(Weight::Semibold),
-                                    border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
-                                    padding: Some(Coords {
-                                        top: 8.,
-                                        bottom: 8.,
-                                        left: 24.,
-                                        right: 24.,
-                                    }),
-                                    ..Default::default()
-                                })
-                                .with_text_label("Sign up".to_owned())
-                                .build()
-                                .on_click(move |ctx, _, _| {
-                                    ctx.dispatch_typed_action(
-                                        AISettingsPageAction::SignupAnonymousUser,
-                                    );
-                                })
-                                .finish(),
-                        )
-                        .with_padding_right(TOGGLE_BUTTON_RIGHT_PADDING)
-                        .finish(),
-                    )
+        row.add_child(
+            Container::new(
+                ui_builder
+                    .switch(self.switch_state.clone())
+                    .check(AISettings::as_ref(app).is_any_ai_enabled(app))
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(AISettingsPageAction::ToggleGlobalAI);
+                    })
                     .finish(),
-            );
-        } else {
-            row.add_child(
-                Container::new(
-                    ui_builder
-                        .switch(self.switch_state.clone())
-                        .check(AISettings::as_ref(app).is_any_ai_enabled(app))
-                        .build()
-                        .on_click(move |ctx, _, _| {
-                            ctx.dispatch_typed_action(AISettingsPageAction::ToggleGlobalAI);
-                        })
-                        .finish(),
-                )
-                .with_padding_right(TOGGLE_BUTTON_RIGHT_PADDING)
-                .finish(),
-            );
-        }
+            )
+            .with_padding_right(TOGGLE_BUTTON_RIGHT_PADDING)
+            .finish(),
+        );
 
         Container::new(row.finish())
             .with_padding_bottom(15.)
@@ -7336,7 +7275,6 @@ impl GenesiCloudKeysWidget {
     fn make_key_editor(
         provider: CloudProviderKind,
         initial_value: &str,
-        enabled: bool,
         ctx: &mut ViewContext<<Self as SettingsWidget>::View>,
     ) -> ViewHandle<EditorView> {
         let editor = ctx.add_typed_action_view(move |ctx| {
@@ -7363,7 +7301,7 @@ impl GenesiCloudKeysWidget {
             editor
         });
 
-        AISettingsPageView::update_editor_interaction_state(editor.clone(), enabled, ctx);
+        AISettingsPageView::update_editor_interaction_state(editor.clone(), true, ctx);
         ctx.subscribe_to_view(&editor, move |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let mut keys = Self::load_cloud_keys(ctx);
@@ -7375,49 +7313,30 @@ impl GenesiCloudKeysWidget {
             }
         });
 
-        let editor_clone = editor.clone();
-        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
-            if matches!(event, AISettingsChangedEvent::IsAnyAIEnabled { .. }) {
-                let is_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
-                AISettingsPageView::update_editor_interaction_state(
-                    editor_clone.clone(),
-                    is_enabled,
-                    ctx,
-                );
-                ctx.notify();
-            }
-        });
-
         editor
     }
 
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let keys = Self::load_cloud_keys(ctx);
-        let is_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
-
         Self {
             hugging_face_api_key_editor: Self::make_key_editor(
                 CloudProviderKind::HuggingFace,
                 keys.get(CloudProviderKind::HuggingFace),
-                is_enabled,
                 ctx,
             ),
             openai_api_key_editor: Self::make_key_editor(
                 CloudProviderKind::OpenAI,
                 keys.get(CloudProviderKind::OpenAI),
-                is_enabled,
                 ctx,
             ),
             anthropic_api_key_editor: Self::make_key_editor(
                 CloudProviderKind::Anthropic,
                 keys.get(CloudProviderKind::Anthropic),
-                is_enabled,
                 ctx,
             ),
             gemini_api_key_editor: Self::make_key_editor(
                 CloudProviderKind::Gemini,
                 keys.get(CloudProviderKind::Gemini),
-                is_enabled,
                 ctx,
             ),
         }
@@ -7475,7 +7394,7 @@ impl SettingsWidget for GenesiCloudKeysWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let is_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
+        let is_enabled = true;
         let mut column = Flex::column()
             .with_child(render_separator(appearance))
             .with_child(
