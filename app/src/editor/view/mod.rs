@@ -4177,7 +4177,12 @@ impl EditorView {
         if self.can_select(ctx) {
             let text = self.selected_text(ctx);
             if text.is_empty() {
-                ctx.emit(Event::Copy);
+                // Text editors such as the Genesi chat composer own Ctrl+C.
+                // Do not bubble an empty selection to terminal-style parents,
+                // where Copy is also interpreted as interrupt/clear.
+                if self.delegate_paste_handling {
+                    ctx.emit(Event::Copy);
+                }
             } else {
                 ctx.clipboard().write(ClipboardContent::plain_text(text));
             }

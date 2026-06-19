@@ -8,19 +8,23 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, ChangeTag, TextDiff};
+use warpui::clipboard::ClipboardContent;
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
     FormattedTextElement, Icon, MainAxisAlignment, MainAxisSize, ParentElement, Radius,
-    ScrollbarWidth, Shrinkable,
+    ScrollbarWidth, SelectableArea, SelectionHandle, Shrinkable,
 };
+use warpui::keymap::FixedBinding;
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::units::Pixels;
@@ -57,6 +61,23 @@ const SCROLL_TO_BOTTOM: f32 = 1.0e7;
 
 const SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant running locally on Genesi OS. Be concise.";
+
+pub fn init(app: &mut AppContext) {
+    use warpui::keymap::macros::*;
+
+    app.register_fixed_bindings([
+        FixedBinding::new(
+            "ctrl-c",
+            LocalAiChatAction::CopySelectedText,
+            id!(LocalAiChatView::ui_name()),
+        ),
+        FixedBinding::new(
+            "cmd-c",
+            LocalAiChatAction::CopySelectedText,
+            id!(LocalAiChatView::ui_name()),
+        ),
+    ]);
+}
 
 /// The Genesi brand green, used as the panel's accent.
 fn genesi_green() -> ColorU {
@@ -317,6 +338,8 @@ pub struct LocalChatSummary {
 /// Click actions dispatched by the header chips.
 #[derive(Debug, Clone)]
 pub enum LocalAiChatAction {
+    /// Copy the text currently selected in the transcript.
+    CopySelectedText,
     /// Switch between the Local (ollama) and Turbo endpoints.
     CycleEndpoint,
     /// Advance to the next available model.
@@ -380,6 +403,8 @@ pub struct LocalAiChatView {
     active_chat_id: String,
     chats: Vec<PersistedLocalChat>,
     transcript_scroll: ClippedScrollStateHandle,
+    transcript_selection: SelectionHandle,
+    selected_transcript_text: Arc<RwLock<Option<String>>>,
     review_sidebar_scroll: ClippedScrollStateHandle,
     vibe_mode: bool,
 
@@ -467,6 +492,8 @@ impl LocalAiChatView {
             active_chat_id: String::new(),
             chats: Vec::new(),
             transcript_scroll: ClippedScrollStateHandle::default(),
+            transcript_selection: SelectionHandle::default(),
+            selected_transcript_text: Arc::new(RwLock::new(None)),
             review_sidebar_scroll: ClippedScrollStateHandle::default(),
             vibe_mode: false,
             endpoint: LocalEndpoint::Ollama,
@@ -1410,9 +1437,7 @@ impl LocalAiChatView {
                 color,
                 Default::default(),
             )
-            // Behave like static text in the scroll view (no selection/hyperlink
-            // handling stealing scroll or clicks).
-            .disable_mouse_interaction(),
+            .set_selectable(true),
         )
     }
 
@@ -2939,7 +2964,7 @@ impl LocalAiChatView {
             }
         }
 
-        ClippedScrollable::vertical(
+        let transcript = ClippedScrollable::vertical(
             self.transcript_scroll.clone(),
             Container::new(column.finish())
                 .with_horizontal_padding(PANEL_PADDING)
@@ -2948,6 +2973,16 @@ impl LocalAiChatView {
             theme.disabled_ui_text_color().into(),
             theme.active_ui_text_color().into(),
             Fill::None,
+        )
+        .finish();
+
+        let selected_text = self.selected_transcript_text.clone();
+        SelectableArea::new(
+            self.transcript_selection.clone(),
+            move |selection, _, _| {
+                *selected_text.write() = selection.selection.filter(|text| !text.is_empty());
+            },
+            transcript,
         )
         .finish()
     }
@@ -2962,6 +2997,20 @@ impl TypedActionView for LocalAiChatView {
 
     fn handle_action(&mut self, action: &LocalAiChatAction, ctx: &mut ViewContext<Self>) {
         match action {
+            LocalAiChatAction::CopySelectedText => {
+                if let Some(text) = self
+                    .selected_transcript_text
+                    .read()
+                    .clone()
+                    .filter(|text| !text.is_empty())
+                {
+                    ctx.clipboard().write(ClipboardContent::plain_text(text));
+                } else {
+                    self.input.update(ctx, |input, ctx| {
+                        input.editor().update(ctx, |editor, ctx| editor.copy(ctx));
+                    });
+                }
+            }
             LocalAiChatAction::CycleEndpoint => {
                 self.load_cloud_keys(ctx);
                 // A deliberate choice — stop the Turbo auto-default from

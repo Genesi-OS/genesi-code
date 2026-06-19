@@ -1297,48 +1297,46 @@ impl SettingsView {
             SettingsPage::new(about_page_handle),
         ]);
 
-        // Build sidebar nav items. AI page is presented as an "Agents" umbrella
-        // with subpages; the actual AI SettingsPage is hidden from direct sidebar listing.
+        // Keep the settings surface focused on Genesi Code. Legacy Warp pages
+        // remain available internally for compatibility, but are not exposed.
         let mut nav_items = vec![
-            SettingsNavItem::Page(SettingsSection::Account),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "AI",
+                "Genesi AI",
                 vec![SettingsSection::WarpAgent],
             )),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "Code",
+                "Editor",
                 vec![
                     SettingsSection::CodeIndexing,
                     SettingsSection::EditorAndCodeReview,
                 ],
             )),
             SettingsNavItem::Page(SettingsSection::Appearance),
-            SettingsNavItem::Page(SettingsSection::Features),
             SettingsNavItem::Page(SettingsSection::Keybindings),
-            SettingsNavItem::Page(SettingsSection::Privacy),
             SettingsNavItem::Page(SettingsSection::About),
         ];
-
-        if FeatureFlag::WarpControlCli.is_enabled() {
-            let privacy_index = nav_items
-                .iter()
-                .position(|item| matches!(item, SettingsNavItem::Page(SettingsSection::Privacy)))
-                .unwrap_or(nav_items.len());
-            nav_items.insert(
-                privacy_index,
-                SettingsNavItem::Page(SettingsSection::Scripting),
-            );
-        }
 
         // Resolve the initial page: map internal backing-page sections to their default subpage.
         let initial_page = match page {
             Some(SettingsSection::AI) => SettingsSection::WarpAgent,
             Some(SettingsSection::Code) => SettingsSection::CodeIndexing,
-            Some(SettingsSection::Scripting) if !FeatureFlag::WarpControlCli.is_enabled() => {
-                SettingsSection::Account
-            }
             Some(section) if section.is_subpage() => section,
-            other => other.unwrap_or_default(),
+            Some(
+                SettingsSection::Account
+                | SettingsSection::BillingAndUsage
+                | SettingsSection::Features
+                | SettingsSection::Privacy
+                | SettingsSection::Referrals
+                | SettingsSection::Scripting
+                | SettingsSection::SharedBlocks
+                | SettingsSection::Teams
+                | SettingsSection::WarpDrive
+                | SettingsSection::Warpify
+                | SettingsSection::CloudEnvironments
+                | SettingsSection::OzCloudAPIKeys,
+            )
+            | None => SettingsSection::Appearance,
+            Some(section) => section,
         };
 
         // Auto-expand the umbrella if the initial page is one of its subpages.
