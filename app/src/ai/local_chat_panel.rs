@@ -44,6 +44,7 @@ use super::local_chat::{
 use crate::appearance::Appearance;
 use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::settings_view::SettingsSection;
+use crate::util::bindings::CustomAction;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
 use crate::workspace::WorkspaceAction;
 
@@ -66,18 +67,12 @@ const SYSTEM_PROMPT: &str =
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
 
-    app.register_fixed_bindings([
-        FixedBinding::new(
-            "ctrl-c",
-            LocalAiChatAction::CopySelectedText,
-            id!(LocalAiChatView::ui_name()),
-        ),
-        FixedBinding::new(
-            "cmd-c",
-            LocalAiChatAction::CopySelectedText,
-            id!(LocalAiChatView::ui_name()),
-        ),
-    ]);
+    app.register_fixed_bindings([FixedBinding::custom(
+        CustomAction::Copy,
+        LocalAiChatAction::CopySelectedText,
+        "Copy",
+        id!(LocalAiChatView::ui_name()) & !id!("IMEOpen"),
+    )]);
 }
 
 /// The Genesi brand green, used as the panel's accent.
@@ -341,6 +336,8 @@ pub struct LocalChatSummary {
 pub enum LocalAiChatAction {
     /// Copy the text currently selected in the transcript.
     CopySelectedText,
+    /// Move keyboard focus from the prompt editor to the transcript selection.
+    FocusTranscript,
     /// Switch between the Local (ollama) and Turbo endpoints.
     CycleEndpoint,
     /// Advance to the next available model.
@@ -3063,6 +3060,9 @@ impl LocalAiChatView {
                 .with_horizontal_padding(PANEL_PADDING)
                 .finish(),
         )
+        .on_selection_updated(|ctx, _| {
+            ctx.dispatch_typed_action(LocalAiChatAction::FocusTranscript);
+        })
         .finish();
 
         ClippedScrollable::vertical(
@@ -3099,6 +3099,9 @@ impl TypedActionView for LocalAiChatView {
                         input.editor().update(ctx, |editor, ctx| editor.copy(ctx));
                     });
                 }
+            }
+            LocalAiChatAction::FocusTranscript => {
+                ctx.focus_self();
             }
             LocalAiChatAction::CycleEndpoint => {
                 self.load_cloud_keys(ctx);
