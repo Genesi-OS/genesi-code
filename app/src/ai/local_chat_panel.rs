@@ -42,6 +42,7 @@ use super::local_chat::{
     CodeContext, LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
 };
 use crate::appearance::Appearance;
+use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::settings_view::SettingsSection;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
 use crate::workspace::WorkspaceAction;
@@ -1119,7 +1120,10 @@ impl LocalAiChatView {
         removed: u32,
         original: Option<String>,
         diff_preview: Vec<DiffPreviewLine>,
+        ctx: &mut ViewContext<Self>,
     ) {
+        self.update_open_editor_diff(&path, Some(original.as_deref().unwrap_or("")), ctx);
+
         if let Some(existing) = self.pending_edits.iter_mut().find(|e| e.path == path) {
             existing.added = added;
             existing.removed = removed;
@@ -1136,6 +1140,44 @@ impl LocalAiChatView {
 
         if self.selected_review_path.is_none() {
             self.selected_review_path = self.pending_edits.first().map(|edit| edit.path.clone());
+        }
+    }
+
+    fn update_open_editor_diff(
+        &self,
+        relative_path: &str,
+        original: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(root) = self.agent_root.as_ref() else {
+            return;
+        };
+        let Some(target) = local_agent::resolve_in_project(root, relative_path) else {
+            return;
+        };
+        let Some(window_id) = ctx.windows().active_window() else {
+            return;
+        };
+        let Some(editors) = ctx.views_of_type::<LocalCodeEditorView>(window_id) else {
+            return;
+        };
+
+        for editor in editors {
+            let matches = editor.as_ref(ctx).file_path().is_some_and(|path| {
+                path == target
+                    || path
+                        .canonicalize()
+                        .ok()
+                        .zip(target.canonicalize().ok())
+                        .is_some_and(|(path, target)| path == target)
+            });
+            if !matches {
+                continue;
+            }
+            editor.update(ctx, |editor, ctx| match original {
+                Some(original) => editor.show_pending_agent_diff(original, ctx),
+                None => editor.keep_pending_agent_diff(ctx),
+            });
         }
     }
 
@@ -1213,6 +1255,7 @@ impl LocalAiChatView {
                             removed,
                             original,
                             diff_preview.clone(),
+                            ctx,
                         );
                         if let Some(last) = self.messages.last_mut() {
                             last.diff_preview = Some(diff_preview);
@@ -1577,6 +1620,14 @@ impl LocalAiChatView {
     }
 
     pub fn keep_pending_edits(&mut self, ctx: &mut ViewContext<Self>) {
+        let paths = self
+            .pending_edits
+            .iter()
+            .map(|edit| edit.path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.update_open_editor_diff(&path, None, ctx);
+        }
         self.pending_edits.clear();
         self.review_expanded = false;
         self.selected_review_path = None;
@@ -1650,7 +1701,8 @@ impl LocalAiChatView {
                 .finish(),
         );
 
-        if self.pending_edits.is_empty() {
+        let selected_preview = self.selected_review_preview();
+        if self.pending_edits.is_empty() && selected_preview.is_none() {
             root.add_child(
                 Expanded::new(
                     1.,
@@ -1669,13 +1721,24 @@ impl LocalAiChatView {
             return root.finish();
         }
 
-        let selected_path = self
-            .selected_review_edit()
-            .map(|edit| edit.path.clone())
+        let selected_path = selected_preview
+            .as_ref()
+            .map(|preview| preview.0.to_string())
             .unwrap_or_default();
         let mut files = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        for edit in &self.pending_edits {
-            let path = edit.path.clone();
+        let file_rows: Vec<(&str, u32, u32)> = if self.pending_edits.is_empty() {
+            selected_preview
+                .as_ref()
+                .map(|preview| vec![(preview.0, preview.1, preview.2)])
+                .unwrap_or_default()
+        } else {
+            self.pending_edits
+                .iter()
+                .map(|edit| (edit.path.as_str(), edit.added, edit.removed))
+                .collect()
+        };
+        for (edit_path, added, removed) in file_rows {
+            let path = edit_path.to_string();
             let row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(
@@ -1683,7 +1746,7 @@ impl LocalAiChatView {
                         1.,
                         self.label_text(
                             appearance,
-                            edit.path.clone(),
+                            edit_path.to_string(),
                             CHIP_FONT_SIZE,
                             theme.main_text_color(theme.background()).into(),
                             false,
@@ -1693,7 +1756,7 @@ impl LocalAiChatView {
                 )
                 .with_child(self.label_text(
                     appearance,
-                    format!("+{}", edit.added),
+                    format!("+{added}"),
                     CHIP_FONT_SIZE,
                     genesi_green(),
                     false,
@@ -1701,7 +1764,7 @@ impl LocalAiChatView {
                 .with_child(
                     Container::new(self.label_text(
                         appearance,
-                        format!("-{}", edit.removed),
+                        format!("-{removed}"),
                         CHIP_FONT_SIZE,
                         theme.ui_error_color().into(),
                         false,
@@ -1716,7 +1779,7 @@ impl LocalAiChatView {
                         .with_horizontal_padding(10.)
                         .with_vertical_padding(8.)
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                        .with_background_color(if edit.path == selected_path {
+                        .with_background_color(if edit_path == selected_path {
                             ColorU::new(255, 255, 255, 18)
                         } else {
                             ColorU::new(0, 0, 0, 0)
@@ -1739,13 +1802,13 @@ impl LocalAiChatView {
                 .finish(),
         );
 
-        if let Some(edit) = self.selected_review_edit() {
+        if let Some((_, _, _, diff_preview)) = selected_preview {
             root.add_child(
                 Expanded::new(
                     1.,
                     ClippedScrollable::vertical(
                         self.review_sidebar_scroll.clone(),
-                        Container::new(self.render_diff_preview(appearance, &edit.diff_preview))
+                        Container::new(self.render_diff_preview(appearance, diff_preview))
                             .with_uniform_padding(8.)
                             .finish(),
                         ScrollbarWidth::Auto,
@@ -1759,30 +1822,32 @@ impl LocalAiChatView {
             );
         }
 
-        root.add_child(
-            Container::new(
-                Flex::row()
-                    .with_main_axis_alignment(MainAxisAlignment::End)
-                    .with_child(self.workspace_chip(
-                        appearance,
-                        "Undo".to_string(),
-                        None,
-                        WorkspaceAction::UndoGenesiEdits,
-                        false,
-                    ))
-                    .with_child(self.workspace_chip(
-                        appearance,
-                        "Keep All".to_string(),
-                        None,
-                        WorkspaceAction::KeepGenesiEdits,
-                        true,
-                    ))
-                    .finish(),
-            )
-            .with_uniform_padding(10.)
-            .with_border(Border::top(1.).with_border_fill(theme.outline()))
-            .finish(),
-        );
+        if !self.pending_edits.is_empty() {
+            root.add_child(
+                Container::new(
+                    Flex::row()
+                        .with_main_axis_alignment(MainAxisAlignment::End)
+                        .with_child(self.workspace_chip(
+                            appearance,
+                            "Undo".to_string(),
+                            None,
+                            WorkspaceAction::UndoGenesiEdits,
+                            false,
+                        ))
+                        .with_child(self.workspace_chip(
+                            appearance,
+                            "Keep All".to_string(),
+                            None,
+                            WorkspaceAction::KeepGenesiEdits,
+                            true,
+                        ))
+                        .finish(),
+                )
+                .with_uniform_padding(10.)
+                .with_border(Border::top(1.).with_border_fill(theme.outline()))
+                .finish(),
+            );
+        }
 
         root.finish()
     }
@@ -1809,6 +1874,30 @@ impl LocalAiChatView {
             .as_ref()
             .and_then(|path| self.pending_edits.iter().find(|edit| &edit.path == path))
             .or_else(|| self.pending_edits.first())
+    }
+
+    /// Returns the selected diff whether it is still pending or is an immutable
+    /// historical snapshot stored on the tool card in the conversation.
+    fn selected_review_preview(&self) -> Option<(&str, u32, u32, &[DiffPreviewLine])> {
+        if let Some(edit) = self.selected_review_edit() {
+            return Some((
+                edit.path.as_str(),
+                edit.added,
+                edit.removed,
+                edit.diff_preview.as_slice(),
+            ));
+        }
+
+        let selected_path = self.selected_review_path.as_deref()?;
+        self.messages.iter().rev().find_map(|entry| {
+            let path = entry.tool_title.as_deref()?;
+            if path != selected_path {
+                return None;
+            }
+            let preview = entry.diff_preview.as_deref()?;
+            let (added, removed) = entry.diff_stat.unwrap_or_default();
+            Some((path, added, removed, preview))
+        })
     }
 
     fn collapse_other_diffs(&mut self, keep_index: usize) {
@@ -2964,25 +3053,25 @@ impl LocalAiChatView {
             }
         }
 
-        let transcript = ClippedScrollable::vertical(
-            self.transcript_scroll.clone(),
-            Container::new(column.finish())
-                .with_horizontal_padding(PANEL_PADDING)
-                .finish(),
-            ScrollbarWidth::Auto,
-            theme.disabled_ui_text_color().into(),
-            theme.active_ui_text_color().into(),
-            Fill::None,
-        )
-        .finish();
-
         let selected_text = self.selected_transcript_text.clone();
-        SelectableArea::new(
+        let selectable_transcript = SelectableArea::new(
             self.transcript_selection.clone(),
             move |selection, _, _| {
                 *selected_text.write() = selection.selection.filter(|text| !text.is_empty());
             },
-            transcript,
+            Container::new(column.finish())
+                .with_horizontal_padding(PANEL_PADDING)
+                .finish(),
+        )
+        .finish();
+
+        ClippedScrollable::vertical(
+            self.transcript_scroll.clone(),
+            selectable_transcript,
+            ScrollbarWidth::Auto,
+            theme.disabled_ui_text_color().into(),
+            theme.active_ui_text_color().into(),
+            Fill::None,
         )
         .finish()
     }
@@ -3182,6 +3271,14 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::KeepEdits => {
+                let paths = self
+                    .pending_edits
+                    .iter()
+                    .map(|edit| edit.path.clone())
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    self.update_open_editor_diff(&path, None, ctx);
+                }
                 self.pending_edits.clear();
                 self.review_expanded = false;
                 self.selected_review_path = None;

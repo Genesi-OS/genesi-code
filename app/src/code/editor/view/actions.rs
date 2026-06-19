@@ -650,6 +650,10 @@ pub enum CodeEditorViewAction {
     RevertDiffHunk {
         line_range: Range<LineCount>,
     },
+    /// Keep one diff hunk and dismiss only its inline review decoration.
+    AcceptDiffHunk {
+        line_range: Range<LineCount>,
+    },
     /// Open comment line (when opening a comment on a specific line)
     NewCommentOnLine {
         line: EditorLineLocation,
@@ -799,6 +803,7 @@ impl CodeEditorViewAction {
             | Self::HiddenSectionExpansion { .. }
             | Self::AddDiffHunkContext { .. }
             | Self::RevertDiffHunk { .. }
+            | Self::AcceptDiffHunk { .. }
             | Self::NewCommentOnLine { .. }
             | Self::RequestOpenSavedComment { .. }
             | Self::MouseHovered { .. }
@@ -1106,6 +1111,19 @@ impl TypedActionView for CodeEditorView {
                     // Notify to re-render
                     ctx.notify();
                 }
+            }
+            AcceptDiffHunk { line_range } => {
+                let hunk_index = self
+                    .model
+                    .as_ref(ctx)
+                    .diff()
+                    .as_ref(ctx)
+                    .diff_hunk_count_before_line(line_range.start.as_usize());
+                self.model.update(ctx, |model, ctx| {
+                    model.accept_diff_by_index(hunk_index, ctx);
+                });
+                ctx.emit(CodeEditorEvent::DiffAcceptedByHunk);
+                ctx.notify();
             }
             NewCommentOnLine { line: line_info } => {
                 if FeatureFlag::InlineCodeReview.is_enabled() {

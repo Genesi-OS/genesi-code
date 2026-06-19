@@ -11,7 +11,7 @@ use warpui::{Element, Entity, SingletonEntity, TypedActionView, View, ViewContex
 use crate::appearance::Appearance;
 use crate::server::telemetry::TelemetryEvent;
 use crate::settings_view::settings_page::{
-    render_body_item, render_dropdown_item, AdditionalInfo, LocalOnlyIconState, ToggleState,
+    render_body_item, render_dropdown_item, LocalOnlyIconState, ToggleState,
 };
 use crate::util::file::external_editor::settings::{
     EditorChoice, EditorLayout, OpenCodePanelsFileEditor, OpenFileEditor, OpenFileLayout,
@@ -31,7 +31,6 @@ pub enum ExternalEditorAction {
     SetLayout(EditorLayout),
     TogglePreferMarkdownViewer,
     ToggleTabbedEditorView,
-    OpenUrl(String),
 }
 
 pub struct ExternalEditorView {
@@ -40,7 +39,6 @@ pub struct ExternalEditorView {
     layout_dropdown: ViewHandle<Dropdown<ExternalEditorAction>>,
     tabbed_editor_view_mouse_state: SwitchStateHandle,
     prefer_markdown_viewer_switch: SwitchStateHandle,
-    markdown_viewer_mouse_state: MouseStateHandle,
     local_only_icon_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
@@ -107,7 +105,6 @@ impl ExternalEditorView {
             layout_dropdown,
             tabbed_editor_view_mouse_state: Default::default(),
             prefer_markdown_viewer_switch: Default::default(),
-            markdown_viewer_mouse_state: Default::default(),
             local_only_icon_states: Default::default(),
         }
     }
@@ -150,7 +147,10 @@ impl ExternalEditorView {
 
         let mut items = vec![default_app];
 
-        items.push(DropdownItem::new("Warp", make_action(EditorChoice::Warp)));
+        items.push(DropdownItem::new(
+            "Genesi Code",
+            make_action(EditorChoice::Warp),
+        ));
         if FeatureFlag::AllowOpeningFileLinksUsingEditorEnv.is_enabled() {
             items.push(DropdownItem::new(
                 "$EDITOR",
@@ -172,7 +172,7 @@ impl ExternalEditorView {
             EditorChoice::ExternalEditor(editor) => {
                 dropdown.set_selected_by_name(format!("{editor}"), ctx)
             }
-            EditorChoice::Warp => dropdown.set_selected_by_name("Warp", ctx),
+            EditorChoice::Warp => dropdown.set_selected_by_name("Genesi Code", ctx),
             EditorChoice::EnvEditor => dropdown.set_selected_by_name("$EDITOR", ctx),
             EditorChoice::SystemDefault => dropdown.set_selected_by_name(default_option_text, ctx),
         };
@@ -306,7 +306,7 @@ impl View for ExternalEditorView {
 
         let default_layout = render_dropdown_item(
             appearance,
-            "Choose a layout to open files in Warp",
+            "Choose a layout to open files in Genesi Code",
             None,
             None,
             LocalOnlyIconState::for_setting(
@@ -354,15 +354,8 @@ impl View for ExternalEditorView {
         }
 
         column.add_child(render_body_item::<ExternalEditorAction>(
-            "Open Markdown files in Warp's Markdown Viewer by default".to_string(),
-            Some(AdditionalInfo {
-                mouse_state: self.markdown_viewer_mouse_state.clone(),
-                on_click_action: Some(ExternalEditorAction::OpenUrl(
-                    "https://docs.warp.dev/terminal/more-features/markdown-viewer".to_string(),
-                )),
-                secondary_text: None,
-                tooltip_override_text: None,
-            }),
+            "Open Markdown files in the built-in viewer by default".to_string(),
+            None,
             LocalOnlyIconState::for_setting(
                 PreferMarkdownViewer::storage_key(),
                 PreferMarkdownViewer::sync_to_cloud(),
@@ -402,9 +395,6 @@ impl TypedActionView for ExternalEditorView {
             }
             ExternalEditorAction::ToggleTabbedEditorView => {
                 self.toggle_prefer_tabbed_editor_view(ctx);
-            }
-            ExternalEditorAction::OpenUrl(url) => {
-                ctx.open_url(url.as_str());
             }
         }
     }

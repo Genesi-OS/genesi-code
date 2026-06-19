@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub use gutter_button::{AddAsContextButton, CommentButton, RevertHunkButton};
+pub use gutter_button::{AcceptHunkButton, AddAsContextButton, CommentButton, RevertHunkButton};
 use parking_lot::Mutex;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -284,6 +284,8 @@ pub struct EditorWrapperState {
     add_as_context_mouse_state: MouseStateHandle,
     /// Mouse state handle for the revert button.
     revert_mouse_state: MouseStateHandle,
+    /// Mouse state handle for the keep button.
+    accept_mouse_state: MouseStateHandle,
     /// Mouse state handle for the comment button.
     comment_mouse_state: MouseStateHandle,
     /// Tracks the line range where the add context button was last clicked,
@@ -406,6 +408,8 @@ pub struct EditorWrapper<V: EditorView> {
     add_hunk_as_context_button: Option<AddAsContextButton>,
     /// Display state of the "revert" button shown next to diff hunks.
     revert_hunk_button: Option<RevertHunkButton>,
+    /// Display state of the "keep" button shown next to pending diff hunks.
+    accept_hunk_button: Option<AcceptHunkButton>,
     /// Display state of the "comment" button shown next to diff hunks.
     comment_button: Option<CommentButton>,
     // Todo: kc combine all comment related fields into a struct.
@@ -510,6 +514,7 @@ impl<V: EditorView> EditorWrapper<V> {
         focused_diff_line_range: Option<Range<LineCount>>,
         add_diff_as_context_button: Option<AddAsContextButton>,
         revert_hunk_button: Option<RevertHunkButton>,
+        accept_hunk_button: Option<AcceptHunkButton>,
         comment_button: Option<CommentButton>,
         saved_comments: Vec<SavedComment>,
         expand_diff_indicator_width_on_hover: bool,
@@ -533,6 +538,7 @@ impl<V: EditorView> EditorWrapper<V> {
             child_max_z_index: None,
             add_hunk_as_context_button: add_diff_as_context_button,
             revert_hunk_button,
+            accept_hunk_button,
             comment_button,
             expand_diff_indicator_width_on_hover,
             gutter_element_hover_target,
@@ -1088,6 +1094,24 @@ impl<V: EditorView> EditorWrapper<V> {
         )
     }
 
+    fn render_accept_button(
+        &self,
+        accept_hunk_button: &AcceptHunkButton,
+        gutter_element_height: f32,
+        diff_line_range: &Range<LineCount>,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        self.render_gutter_button(
+            self.state_handle.accept_mouse_state.clone(),
+            gutter_element_height,
+            Some(CodeEditorViewAction::AcceptDiffHunk {
+                line_range: diff_line_range.to_owned(),
+            }),
+            appearance,
+            accept_hunk_button,
+        )
+    }
+
     /// Renders the comment button for adding comments to diff hunks.
     fn render_comment_button(
         &self,
@@ -1217,6 +1241,15 @@ impl<V: EditorView> EditorWrapper<V> {
                 {
                     buttons.add_child(self.render_revert_button(
                         revert_hunk_button,
+                        line_height,
+                        line.line_range(),
+                        appearance,
+                    ));
+                }
+
+                if let Some(accept_hunk_button) = self.accept_hunk_button.as_ref() {
+                    buttons.add_child(self.render_accept_button(
+                        accept_hunk_button,
                         line_height,
                         line.line_range(),
                         appearance,

@@ -243,7 +243,7 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
 
     // Add command palette entry for toggling between Warp and Classic input modes
     app.register_fixed_bindings(vec![FixedBinding::empty(
-        "Toggle Input Mode (Warp/Classic)".to_string(),
+        "Toggle Input Mode (Genesi/Classic)".to_string(),
         builder(SettingsAction::AppearancePageToggle(
             AppearancePageAction::ToggleInputMode,
         )),
@@ -1597,7 +1597,7 @@ impl AppearanceSettingsPageView {
 
     fn input_mode_dropdown_item_label(val: InputMode) -> &'static str {
         match val {
-            InputMode::PinnedToBottom => "Pin to the bottom (Warp mode)",
+            InputMode::PinnedToBottom => "Pin to the bottom (Genesi mode)",
             InputMode::PinnedToTop => "Pin to the top (Reverse mode)",
             InputMode::Waterfall => "Start at the top (Classic mode)",
         }
@@ -1621,7 +1621,7 @@ impl AppearanceSettingsPageView {
             AppIcon::Original => "Original",
             AppIcon::Starburst => "Starburst",
             AppIcon::Sticker => "Sticker",
-            AppIcon::WarpOne => "Warp 1",
+            AppIcon::WarpOne => "Genesi",
         }
     }
 
@@ -2691,7 +2691,7 @@ impl SettingsWidget for CreateCustomThemeWidget {
                 .ui_builder()
                 .link(
                     "Create your own custom theme".to_string(),
-                    Some("https://docs.warp.dev/terminal/appearance/custom-themes".to_string()),
+                    None,
                     None,
                     self.mouse_state.clone(),
                 )
@@ -2950,7 +2950,7 @@ impl SettingsWidget for CustomAppIconWidget {
                         appearance
                             .ui_builder()
                             .wrappable_text(
-                                "You may need to restart Warp for MacOS to apply the preferred icon style.",
+                                "You may need to restart Genesi Code for macOS to apply the preferred icon style.",
                                 true,
                             )
                             .with_style(UiComponentStyles {
@@ -3243,9 +3243,7 @@ impl SettingsWidget for WindowBlurWidget {
         let blur_value = *window_settings.background_blur_radius;
         let label_info = AdditionalInfo {
             mouse_state: self.info_button.clone(),
-            on_click_action: Some(AppearancePageAction::OpenUrl(
-                "https://docs.warp.dev/terminal/appearance/size-opacity-blurring".into(),
-            )),
+            on_click_action: None,
             secondary_text: None,
             tooltip_override_text: None,
         };
@@ -3360,7 +3358,7 @@ impl SettingsWidget for ToolsPanelStateScopeWidget {
     type View = AppearanceSettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "left tools panel open closed across tabs file tree project explorer global search warp drive conversation list"
+        "left tools panel open closed across tabs file tree project explorer global search conversation list"
     }
 
     fn render(
@@ -3413,7 +3411,7 @@ impl SettingsWidget for InputTypeWidget {
     type View = AppearanceSettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "input type warp universal classic style prompt terminal ai developer mode interface shell chips ps1"
+        "input type genesi universal classic style prompt terminal ai developer mode interface shell chips ps1"
     }
 
     fn render(
@@ -3428,7 +3426,7 @@ impl SettingsWidget for InputTypeWidget {
             .radio_buttons(
                 self.radio_buttons_states.clone(),
                 vec![
-                    RadioButtonItem::text("Warp"),
+                    RadioButtonItem::text("Genesi"),
                     RadioButtonItem::text("Shell (PS1)"),
                 ],
                 view.input_type_radio_state.clone(),
@@ -3502,7 +3500,7 @@ impl SettingsWidget for PromptWidget {
     type View = AppearanceSettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "prompt ps1 terminal warp shell custom"
+        "prompt ps1 terminal genesi shell custom"
     }
 
     fn render(
@@ -5154,9 +5152,7 @@ impl SettingsWidget for AltScreenPaddingWidget {
             "Use custom padding in alt-screen".into(),
             Some(AdditionalInfo {
                 mouse_state: self.additional_info_mouse_state.clone(),
-                on_click_action: Some(AppearancePageAction::OpenUrl(
-                    "https://docs.warp.dev/terminal/more-features/full-screen-apps#padding".into(),
-                )),
+                on_click_action: None,
                 secondary_text: None,
                 tooltip_override_text: None,
             }),

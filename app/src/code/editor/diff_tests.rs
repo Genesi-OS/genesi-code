@@ -107,6 +107,27 @@ fn test_reverse_action() {
 }
 
 #[test]
+fn test_accept_single_diff_hunk_updates_only_that_base_section() {
+    use warpui::App;
+    App::test((), |_| async move {
+        let mut diff_model = DiffModel::new();
+        diff_model.set_base(MultilineString::apply("one\ntwo\nthree\n"));
+        let current = "ONE\ntwo\nthree\nfour\n";
+        diff_model.compute_diff_for_test(current.to_string()).await;
+
+        assert_eq!(diff_model.diff_hunk_count(), 2);
+        assert_eq!(
+            diff_model.base_with_hunk_accepted(0, current),
+            Some("ONE\ntwo\nthree\n".to_string())
+        );
+        assert_eq!(
+            diff_model.base_with_hunk_accepted(1, current),
+            Some("one\ntwo\nthree\nfour\n".to_string())
+        );
+    });
+}
+
+#[test]
 fn test_reverse_action_replaced_newlines() {
     use warpui::App;
     App::test((), |_| async move {

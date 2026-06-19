@@ -94,6 +94,31 @@ impl RevertHunkButton {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AcceptHunkButton {
+    is_enabled: bool,
+}
+
+impl AcceptHunkButton {
+    pub fn new(is_enabled: bool) -> Self {
+        Self { is_enabled }
+    }
+}
+
+impl GutterButton for AcceptHunkButton {
+    fn is_enabled(&self) -> bool {
+        self.is_enabled
+    }
+
+    fn tooltip_text(&self) -> Option<&'static str> {
+        Some("Keep this diff hunk")
+    }
+
+    fn icon(&self) -> Icon {
+        Icon::Check
+    }
+}
+
 impl GutterButton for RevertHunkButton {
     fn is_enabled(&self) -> bool {
         self.is_enabled

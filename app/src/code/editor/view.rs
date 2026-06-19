@@ -58,8 +58,8 @@ use crate::code::editor::comment_editor::{CommentEditor, CommentEditorEvent};
 use crate::code::editor::comments::PendingComment;
 use crate::code::editor::diff::DiffStatus;
 use crate::code::editor::element::{
-    AddAsContextButton, CommentButton, EditorWrapper, EditorWrapperStateHandle, GutterHoverTarget,
-    GutterRange, InnerEditor, LineNumberConfig, RevertHunkButton,
+    AcceptHunkButton, AddAsContextButton, CommentButton, EditorWrapper, EditorWrapperStateHandle,
+    GutterHoverTarget, GutterRange, InnerEditor, LineNumberConfig, RevertHunkButton,
 };
 use crate::code::editor::find::view::{CodeEditorFind as Find, Event as FindViewEvent};
 use crate::code::editor::goto_line::view::{Event as GoToLineEvent, GoToLineView};
@@ -128,6 +128,8 @@ pub enum CodeEditorEvent {
     },
     /// Emitted when a diff hunk is reverted
     DiffReverted,
+    /// Emitted when a diff hunk is kept.
+    DiffAcceptedByHunk,
     /// Emitted when the inline comment editor is opened.
     CommentEditorOpened,
     HiddenSectionExpanded,
@@ -186,6 +188,8 @@ struct CodeEditorViewDisplayOptions {
     diff_hunk_as_context: Option<AddAsContextButton>,
     /// The revert diff button, or `None` if it is not currently visible.
     revert_diff_hunk: Option<RevertHunkButton>,
+    /// The keep diff button, or `None` if it is not currently visible.
+    accept_diff_hunk: Option<AcceptHunkButton>,
     /// The add comment button, or `None` if it is not currently visible.
     comment_button: Option<CommentButton>,
     /// Whether to expand the width of the diff indicator in the gutter on hover.
@@ -411,6 +415,7 @@ impl CodeEditorView {
                 show_nav_bar: true,
                 diff_hunk_as_context: Default::default(),
                 revert_diff_hunk: Default::default(),
+                accept_diff_hunk: Default::default(),
                 comment_button: Default::default(),
                 // By default expand diff indicators on hover.
                 expand_diff_indicator_width_on_hover: true,
@@ -492,6 +497,12 @@ impl CodeEditorView {
         self.display_options.revert_diff_hunk =
             Some(RevertHunkButton::new(true /* is_enabled */));
         self
+    }
+
+    pub fn set_pending_diff_hunk_buttons(&mut self, enabled: bool, ctx: &mut ViewContext<Self>) {
+        self.display_options.revert_diff_hunk = enabled.then(|| RevertHunkButton::new(true));
+        self.display_options.accept_diff_hunk = enabled.then(|| AcceptHunkButton::new(true));
+        ctx.notify();
     }
 
     /// Enables the "comment" button on diff hunks. Only enable this for code review views.
@@ -642,6 +653,7 @@ impl CodeEditorView {
             false,
             self.model.as_ref(ctx).diff_navigation_state().clone(),
             None,
+            Default::default(),
             Default::default(),
             Default::default(),
             Default::default(),
@@ -2265,6 +2277,7 @@ impl View for CodeEditorView {
             },
             self.display_options.diff_hunk_as_context,
             self.display_options.revert_diff_hunk,
+            self.display_options.accept_diff_hunk,
             self.display_options.comment_button,
             self.comment_locations.clone(),
             self.display_options.expand_diff_indicator_width_on_hover,

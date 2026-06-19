@@ -400,6 +400,64 @@ impl DiffModel {
         None
     }
 
+    /// Build a new diff base with only one hunk accepted. The current file
+    /// content is unchanged; replacing this hunk in the base makes its inline
+    /// diff disappear while the other hunks remain reviewable.
+    pub fn base_with_hunk_accepted(&self, index: usize, current: &str) -> Option<String> {
+        let base = self.base.as_ref()?.as_str();
+        let (current_range, is_change) = self.diff_by_index(index)?;
+
+        let (base_range, accepted_current_range) = if !is_change {
+            (
+                self.status
+                    .deletion_mapping
+                    .get(&current_range.start)?
+                    .clone(),
+                current_range.start..current_range.start,
+            )
+        } else {
+            match self.status.change_mapping.get(&current_range.start)? {
+                ChangeType::Replacement { replaced_range, .. } => {
+                    (replaced_range.clone(), current_range)
+                }
+                ChangeType::Addition => {
+                    let diff = TextDiff::configure()
+                        .algorithm(similar::Algorithm::Patience)
+                        .diff_lines(base, current);
+                    let old_index = diff.ops().iter().find_map(|op| match op {
+                        DiffOp::Insert {
+                            old_index,
+                            new_index,
+                            new_len,
+                        } if *new_index == current_range.start
+                            && *new_len == current_range.len() =>
+                        {
+                            Some(*old_index)
+                        }
+                        _ => None,
+                    })?;
+                    (old_index..old_index, current_range)
+                }
+            }
+        };
+
+        let base_lines: Vec<&str> = base.split_inclusive('\n').collect();
+        let current_lines: Vec<&str> = current.split_inclusive('\n').collect();
+        if base_range.end > base_lines.len() || accepted_current_range.end > current_lines.len() {
+            return None;
+        }
+
+        let mut accepted_base = String::new();
+        accepted_base.extend(base_lines[..base_range.start].iter().copied());
+        accepted_base.extend(
+            current_lines[accepted_current_range.start..accepted_current_range.end]
+                .iter()
+                .copied(),
+        );
+        accepted_base.extend(base_lines[base_range.end..].iter().copied());
+        Some(accepted_base)
+    }
+
     /// Given a range of lines, return the corresponding substring in the base text.
     /// Note that all lines will end with a trailing newline.
     fn base_text_by_line_range(&self, replaced_range: &Range<usize>) -> Option<String> {

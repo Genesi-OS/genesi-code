@@ -4324,6 +4324,15 @@ impl EditorView {
             self.stop_voice_input(true, ctx);
         }
 
+        // Normal text editors, including the Genesi Code prompt composer, must
+        // use the desktop convention: Ctrl+C copies and never clears content.
+        // Terminal inputs opt into delegated paste handling and keep the
+        // interrupt behavior below.
+        if !self.delegate_paste_handling {
+            self.copy(ctx);
+            return;
+        }
+
         #[cfg(windows)]
         // On Windows, if there is selected text, users expect ctrl-c to copy.
         if !self.selected_text(ctx).is_empty() {

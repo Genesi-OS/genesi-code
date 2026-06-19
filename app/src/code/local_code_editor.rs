@@ -1935,6 +1935,24 @@ impl LocalCodeEditorView {
         &self.editor
     }
 
+    /// Show an agent edit inline against the captured pre-edit content.
+    pub fn show_pending_agent_diff(&mut self, original: &str, ctx: &mut ViewContext<Self>) {
+        self.editor.update(ctx, |editor, ctx| {
+            editor.set_base(original, true, ctx);
+            editor.set_pending_diff_hunk_buttons(true, ctx);
+            editor.expand_diffs(ctx);
+        });
+    }
+
+    /// Dismiss all pending agent diff decorations while retaining file content.
+    pub fn keep_pending_agent_diff(&mut self, ctx: &mut ViewContext<Self>) {
+        let current = self.editor.as_ref(ctx).text(ctx).into_string();
+        self.editor.update(ctx, |editor, ctx| {
+            editor.set_base(&current, true, ctx);
+            editor.set_pending_diff_hunk_buttons(false, ctx);
+        });
+    }
+
     /// Accept the diff that is currently in the editor. For local files, this can only be called after the file contents
     /// have been loaded into the editor.
     /// If it is a local file, the diff content will be retrieved and the pending diff will be marked as completed.

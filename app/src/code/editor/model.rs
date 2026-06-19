@@ -712,6 +712,21 @@ impl CodeEditorModel {
         );
     }
 
+    /// Accept one diff hunk without changing the buffer. This advances the
+    /// editor's comparison base only for that hunk.
+    pub fn accept_diff_by_index(&mut self, index: usize, ctx: &mut ModelContext<Self>) {
+        let current = self.content_string(ctx).into_string();
+        let Some(base) = self
+            .diff
+            .as_ref(ctx)
+            .base_with_hunk_accepted(index, &current)
+        else {
+            return;
+        };
+        self.set_base(&base, true, ctx);
+        self.refresh_diff_state(ctx);
+    }
+
     /// Returns the string content of the active buffer using its inferred line ending mode.
     pub fn content_string(&self, ctx: &AppContext) -> AnyMultilineString {
         self.content().as_ref(ctx).text_with_line_ending()
