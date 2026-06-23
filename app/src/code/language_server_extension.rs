@@ -1,6 +1,7 @@
 use lsp::{HoverContents, LspServerLogLevel, MarkupKind};
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use num_traits::SaturatingSub;
+use std::ops::Range;
 use string_offset::CharOffset;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
@@ -827,20 +828,22 @@ impl LocalCodeEditorView {
                 line: position.line as usize,
                 column: position.character as usize,
             };
-            let replacement_range = match &item.text_edit {
+            let server_replacement_range = match &item.text_edit {
                 Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
                     let start = editor.lsp_location_to_offset(&to_location(&edit.range.start), ctx);
                     let end = editor.lsp_location_to_offset(&to_location(&edit.range.end), ctx);
-                    start..end
+                    Some(start..end)
                 }
                 Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
                     let start =
                         editor.lsp_location_to_offset(&to_location(&edit.replace.start), ctx);
                     let end = editor.lsp_location_to_offset(&to_location(&edit.replace.end), ctx);
-                    start..end
+                    Some(start..end)
                 }
-                None => anchor..cursor,
+                None => None,
             };
+            let replacement_range =
+                Self::completion_replacement_range(server_replacement_range, anchor, cursor);
 
             if replacement_range.start > replacement_range.end {
                 log::warn!(
@@ -888,6 +891,31 @@ impl LocalCodeEditorView {
         });
 
         self.dismiss_completion(ctx);
+    }
+
+    fn completion_replacement_range(
+        server_range: Option<Range<CharOffset>>,
+        anchor: CharOffset,
+        cursor: CharOffset,
+    ) -> Range<CharOffset> {
+        let typed_prefix = anchor..cursor;
+        let Some(server_range) = server_range else {
+            return typed_prefix;
+        };
+
+        if server_range.start > server_range.end || anchor > cursor {
+            return typed_prefix;
+        }
+
+        // Completion responses can arrive after more characters were typed.
+        // Merge a touching/overlapping server edit with the live prefix so
+        // accepting `console` after typing `cons` replaces `cons` instead of
+        // producing `consolecons`.
+        if server_range.start <= cursor && server_range.end >= anchor {
+            server_range.start.min(anchor)..server_range.end.max(cursor)
+        } else {
+            server_range
+        }
     }
 
     fn parse_completion_insert(insert_text: &str, is_snippet: bool) -> ParsedCompletionInsert {
@@ -1408,5 +1436,33 @@ impl LocalCodeEditorView {
             HighlightedHyperlink::default(),
         )
         .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalCodeEditorView;
+    use string_offset::CharOffset;
+
+    #[test]
+    fn completion_range_extends_stale_server_edit_to_live_prefix() {
+        let range = LocalCodeEditorView::completion_replacement_range(
+            Some(CharOffset::from(0)..CharOffset::from(3)),
+            CharOffset::from(0),
+            CharOffset::from(4),
+        );
+
+        assert_eq!(range, CharOffset::from(0)..CharOffset::from(4));
+    }
+
+    #[test]
+    fn completion_range_uses_live_prefix_for_empty_cursor_edit() {
+        let range = LocalCodeEditorView::completion_replacement_range(
+            Some(CharOffset::from(4)..CharOffset::from(4)),
+            CharOffset::from(0),
+            CharOffset::from(4),
+        );
+
+        assert_eq!(range, CharOffset::from(0)..CharOffset::from(4));
     }
 }

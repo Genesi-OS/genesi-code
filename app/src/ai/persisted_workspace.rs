@@ -1058,89 +1058,92 @@ impl PersistedWorkspace {
             return;
         }
 
-        let mut new_servers_available_to_start = false;
         let workspace_root = workspace_root.to_path_buf();
+        let mut roots_to_start = HashSet::new();
+        let mut newly_registered_roots = HashSet::new();
 
         for server in supported_servers {
-            if LspManagerModel::as_ref(ctx).server_registered_and_started(
-                &workspace_root,
-                server,
-                ctx,
-            ) {
+            let server_root = server.project_root_for_file(file_path, &workspace_root);
+            if LspManagerModel::as_ref(ctx).server_registered_and_started(&server_root, server, ctx)
+            {
                 continue;
             }
 
             log::info!(
                 "Starting {} LSP server for {}",
                 server.binary_name(),
-                workspace_root.display()
+                server_root.display()
             );
-            let log_relative_path =
-                crate::code::lsp_logs::relative_log_path(server, &workspace_root);
+            let log_relative_path = crate::code::lsp_logs::relative_log_path(server, &server_root);
             let http_client = ServerApiProvider::as_ref(ctx).get_http_client();
             let config = LspServerConfig::new(
                 server,
-                workspace_root.clone(),
+                server_root.clone(),
                 path_env_var.clone(),
                 ChannelState::app_id().application_name().to_string(),
                 http_client,
             )
             .with_log_relative_path(log_relative_path);
 
-            LspManagerModel::handle(ctx).update(ctx, |manager, m_ctx| {
-                manager.register(workspace_root.clone(), config, m_ctx);
+            let registered = LspManagerModel::handle(ctx).update(ctx, |manager, m_ctx| {
+                manager.register(server_root.clone(), config, m_ctx)
             });
-            new_servers_available_to_start = true;
+            roots_to_start.insert(server_root.clone());
+            if registered {
+                newly_registered_roots.insert(server_root);
+            }
         }
 
-        if !new_servers_available_to_start {
+        if roots_to_start.is_empty() {
             return;
         }
 
         let lsp_manager_handle = LspManagerModel::handle(ctx);
-        lsp_manager_handle.update(ctx, |manager, m_ctx| {
-            manager.start_all(workspace_root.clone(), m_ctx);
-        });
-
-        // Subscribe to LSP server events to show error toast on failure.
-        let workspace_root_display = workspace_root.display().to_string();
-        let servers = lsp_manager_handle
-            .as_ref(ctx)
-            .servers_for_workspace(&workspace_root)
-            .cloned()
-            .unwrap_or_default();
-
-        for server in servers {
-            let workspace_root_display = workspace_root_display.clone();
-            let server_type_name = server.as_ref(ctx).server_name();
-            ctx.subscribe_to_model(&server, move |_me, event, ctx| match event {
-                LspEvent::Started => {
-                    send_telemetry_from_ctx!(
-                        LspTelemetryEvent::ServerStarted {
-                            server_type: server_type_name.clone(),
-                        },
-                        ctx
-                    );
-                }
-                LspEvent::Failed(e) => {
-                    send_telemetry_from_ctx!(
-                        LspTelemetryEvent::ServerFailed {
-                            server_type: server_type_name.clone(),
-                        },
-                        ctx
-                    );
-                    if let Some(window_id) = WindowManager::as_ref(ctx).active_window()
-                    {
-                        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-                            let toast = DismissibleToast::error(format!(
-                                "Failed to start LSP server for {workspace_root_display} with error {e}",
-                            ));
-                            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
-                        });
-                    }
-                }
-                _ => {}
+        for server_root in roots_to_start {
+            lsp_manager_handle.update(ctx, |manager, m_ctx| {
+                manager.start_all(server_root.clone(), m_ctx);
             });
+
+            if newly_registered_roots.contains(&server_root) {
+                let workspace_root_display = server_root.display().to_string();
+                let servers = lsp_manager_handle
+                    .as_ref(ctx)
+                    .servers_for_workspace(&server_root)
+                    .cloned()
+                    .unwrap_or_default();
+
+                for server in servers {
+                    let workspace_root_display = workspace_root_display.clone();
+                    let server_type_name = server.as_ref(ctx).server_name();
+                    ctx.subscribe_to_model(&server, move |_me, event, ctx| match event {
+                        LspEvent::Started => {
+                            send_telemetry_from_ctx!(
+                                LspTelemetryEvent::ServerStarted {
+                                    server_type: server_type_name.clone(),
+                                },
+                                ctx
+                            );
+                        }
+                        LspEvent::Failed(e) => {
+                            send_telemetry_from_ctx!(
+                                LspTelemetryEvent::ServerFailed {
+                                    server_type: server_type_name.clone(),
+                                },
+                                ctx
+                            );
+                            if let Some(window_id) = WindowManager::as_ref(ctx).active_window() {
+                                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                                    let toast = DismissibleToast::error(format!(
+                                        "Failed to start LSP server for {workspace_root_display} with error {e}",
+                                    ));
+                                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                                });
+                            }
+                        }
+                        _ => {}
+                    });
+                }
+            }
         }
 
         // Once we start a LSP server, also start the garbage collection process if it is not active.

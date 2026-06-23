@@ -317,6 +317,8 @@ pub struct LocalCodeEditorView {
     was_edited: bool,
     /// Content version of the base file state.
     base_content_version: Option<ContentVersion>,
+    /// Whether the visible inline diff belongs to the latest agent edit.
+    pending_agent_diff: bool,
     /// Set to `true` when a `RemoteBufferConflict` event fires for this
     /// editor's buffer. Cleared when the user discards or overwrites.
     has_remote_conflict: bool,
@@ -371,6 +373,9 @@ impl LocalCodeEditorView {
                 ctx.emit(LocalCodeEditorEvent::DiffAccepted);
             }
             CodeEditorEvent::ContentChanged { origin, .. } => {
+                if origin.from_user() && me.pending_agent_diff {
+                    me.keep_pending_agent_diff(ctx);
+                }
                 me.update_diff_hunk_gutter_buttons(ctx);
 
                 // Clear cached diagnostics/decorations on any content change. This is to avoid showing stale diagnostics while we are waiting for new diagnostics.
@@ -540,6 +545,7 @@ impl LocalCodeEditorView {
             selection_as_context_tooltip: None,
             was_edited: false,
             base_content_version: None,
+            pending_agent_diff: false,
             has_remote_conflict: false,
             conflict_banner_mouse_states: Default::default(),
             default_directory: None,
@@ -1937,6 +1943,7 @@ impl LocalCodeEditorView {
 
     /// Show an agent edit inline against the captured pre-edit content.
     pub fn show_pending_agent_diff(&mut self, original: &str, ctx: &mut ViewContext<Self>) {
+        self.pending_agent_diff = true;
         self.editor.update(ctx, |editor, ctx| {
             editor.set_base(original, true, ctx);
             editor.set_pending_diff_hunk_buttons(true, ctx);
@@ -1946,6 +1953,7 @@ impl LocalCodeEditorView {
 
     /// Dismiss all pending agent diff decorations while retaining file content.
     pub fn keep_pending_agent_diff(&mut self, ctx: &mut ViewContext<Self>) {
+        self.pending_agent_diff = false;
         let current = self.editor.as_ref(ctx).text(ctx).into_string();
         self.editor.update(ctx, |editor, ctx| {
             editor.set_base(&current, true, ctx);

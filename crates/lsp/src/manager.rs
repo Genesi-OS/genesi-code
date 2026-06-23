@@ -116,21 +116,20 @@ impl LspManagerModel {
             }
         }
 
-        // Then try workspace-based lookup
-        let lsp_model = self.lsp_model_for_path(path)?;
-
-        for server in lsp_model {
-            let supported = server.as_ref(ctx).supports_language(&path_lang);
-
-            if supported {
-                return Some(server.clone());
+        // Walk every registered ancestor until a server supporting this file
+        // is found. A nested JS project must not hide a Rust/Python/etc. server
+        // registered at a broader workspace root.
+        for ancestor in path.ancestors() {
+            if let Some(servers) = self.servers.get(ancestor) {
+                for server in servers {
+                    if server.as_ref(ctx).supports_language(&path_lang) {
+                        return Some(server.clone());
+                    }
+                }
             }
         }
 
-        log::debug!(
-            "LSP server found for path: {}, but language does not match",
-            path.display()
-        );
+        log::debug!("No matching LSP server found for path: {}", path.display());
 
         None
     }

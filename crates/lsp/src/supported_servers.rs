@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -54,6 +54,64 @@ pub enum LSPServerType {
 
 /// Provides server-specific configuration for each LSP server type.
 impl LSPServerType {
+    /// Resolves the nearest project root relevant to this server, bounded by
+    /// the workspace selected by the user. Starting the server here lets it
+    /// discover local dependencies such as node_modules, Python environments,
+    /// Cargo workspaces, and Go modules.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn project_root_for_file(&self, file_path: &Path, workspace_root: &Path) -> PathBuf {
+        let markers: &[&str] = match self {
+            LSPServerType::RustAnalyzer => &["Cargo.toml"],
+            LSPServerType::GoPls => &["go.work", "go.mod"],
+            LSPServerType::Pyright => &[
+                "pyrightconfig.json",
+                "pyproject.toml",
+                "setup.cfg",
+                "setup.py",
+                "requirements.txt",
+                "Pipfile",
+            ],
+            LSPServerType::TypeScriptLanguageServer => {
+                &["tsconfig.json", "jsconfig.json", "package.json"]
+            }
+            LSPServerType::Clangd => &[
+                "compile_commands.json",
+                "compile_flags.txt",
+                ".clangd",
+                "CMakeLists.txt",
+            ],
+            LSPServerType::VscodeHtmlLanguageServer
+            | LSPServerType::VscodeCssLanguageServer
+            | LSPServerType::VscodeJsonLanguageServer => {
+                &["package.json", "tsconfig.json", "jsconfig.json"]
+            }
+        };
+
+        if !file_path.starts_with(workspace_root) {
+            return workspace_root.to_path_buf();
+        }
+
+        let start = if file_path.is_dir() {
+            file_path
+        } else {
+            file_path.parent().unwrap_or(workspace_root)
+        };
+
+        for ancestor in start.ancestors() {
+            if !ancestor.starts_with(workspace_root) {
+                break;
+            }
+            if markers.iter().any(|marker| ancestor.join(marker).is_file()) {
+                return ancestor.to_path_buf();
+            }
+            if ancestor == workspace_root {
+                break;
+            }
+        }
+
+        workspace_root.to_path_buf()
+    }
+
     /// Creates a properly configured Command for this LSP server type.
     ///
     /// Uses `CommandBuilder` to create the command, which ensures `.cmd`/`.bat`
@@ -239,5 +297,31 @@ impl LSPServerType {
 
     pub fn all() -> impl Iterator<Item = LSPServerType> {
         LSPServerType::iter()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::LSPServerType;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolves_nearest_typescript_project_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("genesi-lsp-root-{unique}"));
+        let project = workspace.join("apps").join("web");
+        let source = project.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(project.join("package.json"), "{}").unwrap();
+
+        let root = LSPServerType::TypeScriptLanguageServer
+            .project_root_for_file(&source.join("index.ts"), &workspace);
+
+        assert_eq!(root, project);
+        fs::remove_dir_all(workspace).unwrap();
     }
 }
