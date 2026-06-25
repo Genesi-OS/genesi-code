@@ -168,7 +168,7 @@ jobs:
       - name: Publish GitHub Release
         # One Release per successful build (tag = run number, monotonic). The
         # asset name is constant, so the package installer can always pull
-        # https://github.com/zFreshy/genesi-code/releases/latest/download/genesi-code-linux-x86_64.tar.zst
+        # https://github.com/Genesi-OS/genesi-code/releases/latest/download/genesi-code-linux-x86_64.tar.zst
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.0.${{ github.run_number }}
@@ -193,7 +193,7 @@ jobs:
         # so ping it directly the instant a release lands: it rebuilds genesi-code
         # into the [genesi-apps] pacman repo so genesi-update and the package
         # installer see the new version immediately instead of staying stuck on an
-        # old build. Requires a PAT on zFreshy/GenesiOS (scope: repo, or
+        # old build. Requires a PAT on Genesi-OS/GenesiOS (scope: repo, or
         # fine-grained Contents:read-write + Actions:read-write) stored as the
         # GENESIOS_DISPATCH_TOKEN secret in THIS repo's settings. Skipped (not
         # failed) when the secret is absent, so the build still succeeds without it.
@@ -201,6 +201,6 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.GENESIOS_DISPATCH_TOKEN }}
-          repository: zFreshy/GenesiOS
+          repository: Genesi-OS/GenesiOS
           event-type: genesi-code-release
           client-payload: '{"tag": "v0.0.${{ github.run_number }}", "sha": "${{ github.sha }}"}'
