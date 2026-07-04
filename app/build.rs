@@ -156,8 +156,9 @@ fn generate_channel_config_if_needed(target_family: &str, target_os: &str) {
 
     let config_bin = "warp-channel-config";
 
-    // Check if the config binary is available on PATH. If not, we can't generate embedded
-    // configs. This is expected for external contributors building Warp OSS.
+    // Check if the config binary is available on PATH. If not, generate the
+    // login-free Genesi defaults locally. The upstream generator is private, so
+    // release_bundle builds must not depend on it for this fork.
     if Command::new(config_bin)
         .arg("--help")
         .stdout(std::process::Stdio::null())
@@ -165,6 +166,7 @@ fn generate_channel_config_if_needed(target_family: &str, target_os: &str) {
         .status()
         .is_err()
     {
+        write_genesi_channel_configs(&env::var("OUT_DIR").expect("OUT_DIR must be set"));
         return;
     }
 
@@ -207,6 +209,38 @@ fn generate_channel_config_if_needed(target_family: &str, target_os: &str) {
         let config_path = Path::new(&out_dir).join(format!("{channel}_config.json"));
         fs::write(&config_path, &output.stdout).unwrap_or_else(|err| {
             panic!("Failed to write config to {}: {err}", config_path.display())
+        });
+    }
+}
+
+fn write_genesi_channel_configs(out_dir: &str) {
+    let json = r#"{
+  "app_id": "dev.genesi.GenesiCode",
+  "logfile_name": "genesicode.log",
+  "server_config": {
+    "server_root_url": "https://app.warp.dev",
+    "rtc_server_url": "wss://rtc.app.warp.dev/graphql/v2",
+    "session_sharing_server_url": "wss://sessions.app.warp.dev",
+    "firebase_auth_api_key": "AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs",
+    "iap_config": null
+  },
+  "oz_config": {
+    "oz_root_url": "https://oz.warp.dev",
+    "workload_audience_url": null
+  },
+  "telemetry_config": null,
+  "autoupdate_config": null,
+  "crash_reporting_config": null,
+  "mcp_static_config": null
+}"#;
+
+    for channel in ["local", "dev", "stable", "preview"] {
+        let config_path = Path::new(out_dir).join(format!("{channel}_config.json"));
+        fs::write(&config_path, json).unwrap_or_else(|err| {
+            panic!(
+                "Failed to write Genesi channel config to {}: {err}",
+                config_path.display()
+            )
         });
     }
 }
