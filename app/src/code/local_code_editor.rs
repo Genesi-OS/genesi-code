@@ -6,7 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ai::diff_validation::DiffType;
@@ -82,6 +82,9 @@ const DROP_SHADOW_COLOR: ColorU = ColorU {
 };
 
 const HOVER_DEBOUNCE_PERIOD: Duration = Duration::from_millis(500);
+const FLOW_KEY_INTERVAL: Duration = Duration::from_millis(180);
+const FLOW_SETTLE_PERIOD: Duration = Duration::from_millis(2500);
+const FLOW_STREAK_THRESHOLD: u8 = 8;
 
 use warp_core::send_telemetry_from_ctx;
 
@@ -349,6 +352,10 @@ pub struct LocalCodeEditorView {
     /// View for the find references feature.
     find_references_view: Option<ViewHandle<FindReferencesView>>,
     autosave_handle: Option<SpawnedFutureHandle>,
+    flow_last_edit_at: Option<Instant>,
+    flow_streak: u8,
+    flow_active_until: Option<Instant>,
+    flow_restore_handle: Option<SpawnedFutureHandle>,
 }
 
 impl LocalCodeEditorView {
@@ -385,6 +392,7 @@ impl LocalCodeEditorView {
 
                 if origin.from_user() {
                     me.was_edited = true;
+                    me.register_flow_keystroke(ctx);
                     ctx.emit(LocalCodeEditorEvent::UserEdited);
 
                     // Genesi: drive classic (non-AI) LSP autocomplete. Opens on a
@@ -561,6 +569,10 @@ impl LocalCodeEditorView {
             diagnostic_decorations: Vec::new(),
             find_references_view: None,
             autosave_handle: None,
+            flow_last_edit_at: None,
+            flow_streak: 0,
+            flow_active_until: None,
+            flow_restore_handle: None,
         };
 
         if let Some(display_mode) = display_mode {
@@ -608,6 +620,43 @@ impl LocalCodeEditorView {
             },
         );
         self.autosave_handle = Some(handle);
+    }
+
+    fn register_flow_keystroke(&mut self, ctx: &mut ViewContext<Self>) {
+        let now = Instant::now();
+        self.flow_streak = match self.flow_last_edit_at {
+            Some(previous) if now.saturating_duration_since(previous) <= FLOW_KEY_INTERVAL => {
+                self.flow_streak.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.flow_last_edit_at = Some(now);
+
+        if self.flow_streak < FLOW_STREAK_THRESHOLD {
+            return;
+        }
+
+        self.flow_active_until = Some(now + FLOW_SETTLE_PERIOD);
+        if let Some(handle) = self.flow_restore_handle.take() {
+            handle.abort();
+        }
+        self.flow_restore_handle = Some(ctx.spawn(
+            async move {
+                Timer::after(FLOW_SETTLE_PERIOD).await;
+            },
+            |me, _, ctx| {
+                me.flow_restore_handle = None;
+                me.flow_streak = 0;
+                me.flow_active_until = None;
+                ctx.notify();
+            },
+        ));
+        ctx.notify();
+    }
+
+    fn flow_active(&self) -> bool {
+        self.flow_active_until
+            .is_some_and(|until| Instant::now() <= until)
     }
 
     /// Calls LSP goto_definition and spawns a callback with the result.
@@ -2390,6 +2439,15 @@ impl View for LocalCodeEditorView {
             } else {
                 ChildView::new(&self.editor).finish()
             };
+
+        let base = if self.flow_active() {
+            Container::new(base)
+                .with_border(Border::all(1.).with_border_color(ColorU::new(36, 214, 150, 150)))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .finish()
+        } else {
+            base
+        };
 
         let base_with_handler =
             Hoverable::new(self.context_menu_state.mouse_state.clone(), |_| base)

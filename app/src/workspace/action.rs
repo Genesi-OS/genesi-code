@@ -309,8 +309,10 @@ pub enum WorkspaceAction {
     ClickedAIAssistantIcon,
     ToggleLocalAi,
     ToggleGenesiToolsPanel,
+    OpenGenesiReviewTool,
     OpenGenesiFilesTool,
     OpenGenesiTerminalTool,
+    OpenGenesiCanvasTool,
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -992,8 +994,10 @@ impl WorkspaceAction {
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
             | ToggleGenesiToolsPanel
+            | OpenGenesiReviewTool
             | OpenGenesiFilesTool
             | OpenGenesiTerminalTool
+            | OpenGenesiCanvasTool
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

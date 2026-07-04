@@ -24437,6 +24437,12 @@ impl TypedActionView for Workspace {
                 self.genesi_tools_panel_open = !self.genesi_tools_panel_open;
                 ctx.notify();
             }
+            OpenGenesiReviewTool => {
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.open_review_tool(ctx));
+                ctx.notify();
+            }
             OpenGenesiFilesTool => {
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
@@ -24453,6 +24459,12 @@ impl TypedActionView for Workspace {
                 ctx.dispatch_typed_action(&WorkspaceAction::AddTerminalTab {
                     hide_homepage: true,
                 });
+                ctx.notify();
+            }
+            OpenGenesiCanvasTool => {
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.open_project_canvas(ctx));
                 ctx.notify();
             }
             SelectGenesiReviewFile(path) => {

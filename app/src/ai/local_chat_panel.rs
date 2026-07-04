@@ -233,6 +233,12 @@ struct PendingEdit {
     diff_preview: Vec<DiffPreviewLine>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenesiSideTool {
+    Review,
+    Canvas,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedLocalChat {
     id: String,
@@ -393,6 +399,10 @@ pub enum LocalAiChatAction {
     NewChat,
     /// Submit whatever is currently typed into the compose input.
     SubmitPromptInput,
+    ToggleSoundscape,
+    CycleSoundscape,
+    ToggleKeyboardAsmr,
+    CycleKeyboardSwitch,
 }
 
 pub struct LocalAiChatView {
@@ -470,6 +480,11 @@ pub struct LocalAiChatView {
     pending_edits: Vec<PendingEdit>,
     review_expanded: bool,
     selected_review_path: Option<String>,
+    active_side_tool: GenesiSideTool,
+    soundscape_enabled: bool,
+    soundscape_index: usize,
+    keyboard_asmr_enabled: bool,
+    keyboard_switch_index: usize,
 }
 
 impl LocalAiChatView {
@@ -521,6 +536,11 @@ impl LocalAiChatView {
             pending_edits: Vec::new(),
             review_expanded: false,
             selected_review_path: None,
+            active_side_tool: GenesiSideTool::Review,
+            soundscape_enabled: false,
+            soundscape_index: 0,
+            keyboard_asmr_enabled: false,
+            keyboard_switch_index: 0,
         };
         view.load_cloud_keys(ctx);
         view.load_mempalace(ctx);
@@ -1586,6 +1606,150 @@ impl LocalAiChatView {
             .finish()
     }
 
+    fn render_canvas_node(
+        &self,
+        appearance: &Appearance,
+        title: &str,
+        subtitle: &str,
+        accent: ColorU,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    title.to_string(),
+                    TITLE_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        subtitle.to_string(),
+                        CHIP_FONT_SIZE,
+                        theme.disabled_text_color(theme.background()).into(),
+                        true,
+                    ))
+                    .with_margin_top(5.)
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(Empty::new().finish())
+                            .with_height(2.)
+                            .finish(),
+                    )
+                    .with_margin_top(10.)
+                    .with_background_color(accent)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(12.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+        .with_background_color(ColorU::new(255, 255, 255, 10))
+        .finish()
+    }
+
+    fn render_project_canvas(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+
+        let nodes = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.render_canvas_node(
+                appearance,
+                "Frontend",
+                "Pages, forms, components",
+                ColorU::new(80, 186, 255, 255),
+            ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "        -> request / response ->".to_string(),
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
+                .with_vertical_padding(8.)
+                .finish(),
+            )
+            .with_child(self.render_canvas_node(
+                appearance,
+                "API routes",
+                "Routes, controllers, services",
+                genesi_green(),
+            ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "        -> reads / writes ->".to_string(),
+                    CHIP_FONT_SIZE,
+                    genesi_green(),
+                    false,
+                ))
+                .with_vertical_padding(8.)
+                .finish(),
+            )
+            .with_child(self.render_canvas_node(
+                appearance,
+                "Database",
+                "Models, migrations, tables",
+                ColorU::new(255, 198, 92, 255),
+            ))
+            .with_child(
+                Container::new(self.render_canvas_node(
+                    appearance,
+                    "Git flow",
+                    "Branches, merges, conflicts",
+                    ColorU::new(210, 135, 255, 255),
+                ))
+                .with_margin_top(12.)
+                .finish(),
+            )
+            .finish();
+
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    "Project Canvas".to_string(),
+                    TITLE_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_child(Container::new(nodes).with_margin_top(14.).finish())
+                .with_child(
+                    Container::new(
+                        Flex::row()
+                            .with_child(self.workspace_chip(
+                                appearance,
+                                "Open Files".to_string(),
+                                Some("folder"),
+                                WorkspaceAction::OpenGenesiFilesTool,
+                                false,
+                            ))
+                            .with_child(self.workspace_chip(
+                                appearance,
+                                "Open Terminal".to_string(),
+                                Some("terminal"),
+                                WorkspaceAction::OpenGenesiTerminalTool,
+                                false,
+                            ))
+                            .finish(),
+                    )
+                    .with_margin_top(14.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(16.)
+        .finish()
+    }
+
     pub fn current_chat_title(&self) -> String {
         Self::chat_title_from_entries(&self.messages)
     }
@@ -1610,10 +1774,21 @@ impl LocalAiChatView {
 
     pub fn select_review_file(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
         if self.pending_edits.iter().any(|edit| edit.path == path) {
+            self.active_side_tool = GenesiSideTool::Review;
             self.selected_review_path = Some(path.to_string());
             self.review_expanded = true;
             ctx.notify();
         }
+    }
+
+    pub fn open_review_tool(&mut self, ctx: &mut ViewContext<Self>) {
+        self.active_side_tool = GenesiSideTool::Review;
+        ctx.notify();
+    }
+
+    pub fn open_project_canvas(&mut self, ctx: &mut ViewContext<Self>) {
+        self.active_side_tool = GenesiSideTool::Canvas;
+        ctx.notify();
     }
 
     pub fn keep_pending_edits(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1668,7 +1843,11 @@ impl LocalAiChatView {
                     1.,
                     self.label_text(
                         appearance,
-                        "Review".to_string(),
+                        match self.active_side_tool {
+                            GenesiSideTool::Review => "Review",
+                            GenesiSideTool::Canvas => "Canvas",
+                        }
+                        .to_string(),
                         TITLE_FONT_SIZE,
                         theme.main_text_color(theme.background()).into(),
                         false,
@@ -1676,6 +1855,20 @@ impl LocalAiChatView {
                 )
                 .finish(),
             )
+            .with_child(self.workspace_chip(
+                appearance,
+                "Review".to_string(),
+                None,
+                WorkspaceAction::OpenGenesiReviewTool,
+                self.active_side_tool == GenesiSideTool::Review,
+            ))
+            .with_child(self.workspace_chip(
+                appearance,
+                "Canvas".to_string(),
+                None,
+                WorkspaceAction::OpenGenesiCanvasTool,
+                self.active_side_tool == GenesiSideTool::Canvas,
+            ))
             .with_child(self.workspace_chip(
                 appearance,
                 "Files".to_string(),
@@ -1697,6 +1890,25 @@ impl LocalAiChatView {
                 .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
                 .finish(),
         );
+
+        if self.active_side_tool == GenesiSideTool::Canvas {
+            root.add_child(
+                Expanded::new(
+                    1.,
+                    ClippedScrollable::vertical(
+                        self.review_sidebar_scroll.clone(),
+                        self.render_project_canvas(appearance),
+                        ScrollbarWidth::Auto,
+                        theme.disabled_ui_text_color().into(),
+                        theme.active_ui_text_color().into(),
+                        Fill::None,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            );
+            return root.finish();
+        }
 
         let selected_preview = self.selected_review_preview();
         if self.pending_edits.is_empty() && selected_preview.is_none() {
@@ -2194,6 +2406,50 @@ impl LocalAiChatView {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
+            .finish()
+    }
+
+    fn render_vibe_lab_strip(&self, appearance: &Appearance) -> Box<dyn Element> {
+        const SOUNDSCAPES: [&str; 4] = ["Rain", "Cafe", "Forest", "Lo-fi"];
+        const SWITCHES: [&str; 3] = ["Red", "Brown", "Blue"];
+
+        let sound = SOUNDSCAPES[self.soundscape_index % SOUNDSCAPES.len()];
+        let switch = SWITCHES[self.keyboard_switch_index % SWITCHES.len()];
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(self.chip(
+                appearance,
+                if self.soundscape_enabled {
+                    format!("Sound {sound}")
+                } else {
+                    "Sound off".to_string()
+                },
+                LocalAiChatAction::ToggleSoundscape,
+                self.soundscape_enabled,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "Cycle sound".to_string(),
+                LocalAiChatAction::CycleSoundscape,
+                false,
+            ))
+            .with_child(self.chip(
+                appearance,
+                if self.keyboard_asmr_enabled {
+                    format!("Keys {switch}")
+                } else {
+                    "Keys off".to_string()
+                },
+                LocalAiChatAction::ToggleKeyboardAsmr,
+                self.keyboard_asmr_enabled,
+            ))
+            .with_child(self.chip(
+                appearance,
+                "Cycle keys".to_string(),
+                LocalAiChatAction::CycleKeyboardSwitch,
+                false,
+            ))
             .finish()
     }
 
@@ -3398,6 +3654,24 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::SubmitPromptInput => {
                 self.input.update(ctx, |input, ctx| input.submit(ctx));
             }
+            LocalAiChatAction::ToggleSoundscape => {
+                self.soundscape_enabled = !self.soundscape_enabled;
+                ctx.notify();
+            }
+            LocalAiChatAction::CycleSoundscape => {
+                self.soundscape_index = (self.soundscape_index + 1) % 4;
+                self.soundscape_enabled = true;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleKeyboardAsmr => {
+                self.keyboard_asmr_enabled = !self.keyboard_asmr_enabled;
+                ctx.notify();
+            }
+            LocalAiChatAction::CycleKeyboardSwitch => {
+                self.keyboard_switch_index = (self.keyboard_switch_index + 1) % 3;
+                self.keyboard_asmr_enabled = true;
+                ctx.notify();
+            }
         }
     }
 }
@@ -3720,6 +3994,11 @@ impl View for LocalAiChatView {
             )
             .with_child(
                 Container::new(self.render_control_strip(appearance))
+                    .with_padding_top(6.)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(self.render_vibe_lab_strip(appearance))
                     .with_padding_top(6.)
                     .finish(),
             )
