@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use editing::sort_entries_for_file_tree;
 use itertools::Itertools;
+use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use render::RenderState;
@@ -197,6 +199,56 @@ enum FileTreeItem {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTreeGitStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Conflicted,
+}
+
+impl FileTreeGitStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Modified => "M",
+            Self::Added => "A",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Copied => "C",
+            Self::Untracked => "U",
+            Self::Conflicted => "!",
+        }
+    }
+
+    fn color(self) -> ColorU {
+        match self {
+            Self::Modified => ColorU::new(232, 188, 87, 255),
+            Self::Added | Self::Untracked => ColorU::new(48, 207, 128, 255),
+            Self::Deleted | Self::Conflicted => ColorU::new(244, 92, 92, 255),
+            Self::Renamed | Self::Copied => ColorU::new(98, 168, 255, 255),
+        }
+    }
+
+    fn from_porcelain(code: &str) -> Option<Self> {
+        let mut chars = code.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        match (x, y) {
+            ('?', '?') => Some(Self::Untracked),
+            ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D') => Some(Self::Conflicted),
+            ('D', _) | (_, 'D') => Some(Self::Deleted),
+            ('R', _) | (_, 'R') => Some(Self::Renamed),
+            ('C', _) | (_, 'C') => Some(Self::Copied),
+            ('A', _) | (_, 'A') => Some(Self::Added),
+            ('M', _) | (_, 'M') => Some(Self::Modified),
+            _ => None,
+        }
+    }
+}
+
 impl FileTreeItem {
     fn path(&self) -> &StandardizedPath {
         match self {
@@ -243,6 +295,8 @@ pub struct FileTreeView {
     root_directories: HashMap<StandardizedPath, RootDirectory>,
     /// The displayed directories
     displayed_directories: Vec<StandardizedPath>,
+    /// Per displayed root git state, keyed by repo-relative path.
+    git_statuses: HashMap<StandardizedPath, HashMap<PathBuf, FileTreeGitStatus>>,
     #[cfg(feature = "local_fs")]
     enablement: CodingPanelEnablementState,
     #[cfg(feature = "local_fs")]
@@ -704,6 +758,7 @@ impl FileTreeView {
         let picker = Self {
             root_directories: HashMap::new(),
             displayed_directories: Vec::new(),
+            git_statuses: HashMap::new(),
             #[cfg(feature = "local_fs")]
             enablement: CodingPanelEnablementState::Enabled,
             #[cfg(feature = "local_fs")]
@@ -1372,8 +1427,79 @@ impl FileTreeView {
             }
         }
 
+        self.refresh_git_statuses();
         self.rebuild_flattened_items();
         ctx.notify();
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn refresh_git_statuses(&mut self) {
+        self.git_statuses
+            .retain(|root, _| self.displayed_directories.contains(root));
+
+        for root_path in self.displayed_directories.clone() {
+            let Some(root_dir) = self.root_directories.get(&root_path) else {
+                continue;
+            };
+            if root_dir.is_remote() {
+                self.git_statuses.remove(&root_path);
+                continue;
+            }
+
+            let repo_root = (**root_dir.entry.root_directory()).clone();
+            let repo_path = repo_root.to_local_path_lossy();
+            let statuses = Self::load_git_statuses(&repo_path);
+            if statuses.is_empty() {
+                self.git_statuses.remove(&root_path);
+            } else {
+                self.git_statuses.insert(root_path, statuses);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    fn refresh_git_statuses(&mut self) {}
+
+    #[cfg(feature = "local_fs")]
+    fn load_git_statuses(repo_path: &Path) -> HashMap<PathBuf, FileTreeGitStatus> {
+        let Ok(output) = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .output()
+        else {
+            return HashMap::new();
+        };
+        if !output.status.success() {
+            return HashMap::new();
+        }
+
+        let mut statuses = HashMap::new();
+        let mut tokens = output.stdout.split(|byte| *byte == 0);
+        while let Some(token) = tokens.next() {
+            if token.len() < 4 {
+                continue;
+            }
+            let code = String::from_utf8_lossy(&token[..2]);
+            let Some(status) = FileTreeGitStatus::from_porcelain(&code) else {
+                continue;
+            };
+            let raw_path = String::from_utf8_lossy(&token[3..]).replace('\\', "/");
+            if raw_path.is_empty() {
+                continue;
+            }
+            statuses.insert(PathBuf::from(raw_path), status);
+
+            if matches!(
+                status,
+                FileTreeGitStatus::Renamed | FileTreeGitStatus::Copied
+            ) {
+                // In porcelain v1 -z, renames/copies are followed by the old path.
+                let _ = tokens.next();
+            }
+        }
+
+        statuses
     }
 
     fn ensure_loaded_path(
@@ -1814,6 +1940,7 @@ impl FileTreeView {
         appearance: &Appearance,
         item_highlight_state: ItemHighlightState,
         editor_view: Option<&ViewHandle<EditorView>>,
+        git_status: Option<FileTreeGitStatus>,
     ) -> Box<dyn Element> {
         // Create the folder header row
         let mut header_row = Flex::row()
@@ -1917,6 +2044,23 @@ impl FileTreeView {
             }
         }
 
+        if let Some(status) = git_status {
+            header_row.add_child(
+                Container::new(
+                    Text::new_inline(
+                        status.label().to_string(),
+                        appearance.ui_font_family(),
+                        ITEM_FONT_SIZE - 2.,
+                    )
+                    .with_color(status.color())
+                    .with_style(Properties::default().weight(Weight::Bold))
+                    .finish(),
+                )
+                .with_margin_left(8.)
+                .finish(),
+            );
+        }
+
         let mut container = Container::new(header_row.finish())
             .with_padding_top(ITEM_PADDING)
             .with_padding_bottom(ITEM_PADDING)
@@ -1993,6 +2137,7 @@ impl FileTreeView {
         let is_selected = self.selected_item.as_ref() == Some(id);
         let is_expanded = self.is_item_expanded(&id.root, item);
         let render_state = item.to_render_state(is_expanded, appearance);
+        let git_status = self.git_status_for_item(id, item);
 
         let item_display_name = render_state.display_name.clone();
         let item_position_id = format!("file_tree_item:{item_display_name}");
@@ -2018,6 +2163,7 @@ impl FileTreeView {
                 appearance,
                 item_highlight_state,
                 editor_view,
+                git_status,
             )
         })
         .on_click(
@@ -2110,6 +2256,26 @@ impl FileTreeView {
         item.path()
             .strip_prefix(&repository_root)
             .map(PathBuf::from)
+    }
+
+    fn git_status_for_item(
+        &self,
+        id: &FileTreeIdentifier,
+        item: &FileTreeItem,
+    ) -> Option<FileTreeGitStatus> {
+        if !matches!(item, FileTreeItem::File { .. }) {
+            return None;
+        }
+
+        let repository_root = self.root_for_path(&id.root)?;
+        let relative_path = item
+            .path()
+            .strip_prefix(&repository_root)
+            .map(PathBuf::from)?;
+        self.git_statuses
+            .get(&id.root)
+            .and_then(|statuses| statuses.get(&relative_path))
+            .copied()
     }
 
     /// Selects the first item if no item is selected.
