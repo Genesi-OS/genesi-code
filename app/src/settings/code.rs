@@ -19,7 +19,7 @@ define_settings_group!(CodeSettings, settings: [
         private: false,
         toml_path: "code.editor.autosave",
         description: "Whether IDE edits are automatically saved shortly after typing stops.",
-    }
+    },
     codebase_context_enabled: CodebaseContextEnabled {
         type: bool,
         default: true,

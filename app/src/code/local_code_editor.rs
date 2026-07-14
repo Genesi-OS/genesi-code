@@ -607,7 +607,7 @@ impl LocalCodeEditorView {
             |me, _, ctx| {
                 me.autosave_handle = None;
 
-                if !me.autosave_enabled(ctx) || !me.has_version_conflicts(ctx) {
+                if !me.autosave_enabled(ctx) || me.has_version_conflicts(ctx) {
                     return;
                 }
 

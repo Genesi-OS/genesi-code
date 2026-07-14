@@ -239,10 +239,10 @@ pub enum SettingsViewEvent {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SettingsSection {
     About,
-    #[default]
     Account,
     MCPServers,
     BillingAndUsage,
+    #[default]
     Appearance,
     Features,
     Keybindings,

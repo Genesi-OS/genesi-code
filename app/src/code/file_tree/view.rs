@@ -223,12 +223,13 @@ impl FileTreeGitStatus {
         }
     }
 
-    fn color(self) -> ColorU {
+    fn color(self, appearance: &Appearance) -> ColorU {
+        let theme = appearance.theme();
         match self {
-            Self::Modified => ColorU::new(232, 188, 87, 255),
-            Self::Added | Self::Untracked => ColorU::new(48, 207, 128, 255),
-            Self::Deleted | Self::Conflicted => ColorU::new(244, 92, 92, 255),
-            Self::Renamed | Self::Copied => ColorU::new(98, 168, 255, 255),
+            Self::Modified => theme.ansi_fg_yellow(),
+            Self::Added | Self::Untracked => theme.ansi_fg_green(),
+            Self::Deleted | Self::Conflicted => theme.ansi_fg_red(),
+            Self::Renamed | Self::Copied => theme.ansi_fg_blue(),
         }
     }
 
@@ -600,6 +601,11 @@ impl FileTreeView {
                     .collect();
 
                 if !root_paths.is_empty() {
+                    // File content changes arrive through this incremental event. Refresh the
+                    // separate git cache too, otherwise badges remain stuck at the state from
+                    // the last full repository update.
+                    self.refresh_git_statuses();
+
                     let id = RepositoryIdentifier::Local(std_path.clone());
                     if let Some(state) = RepoMetadataModel::as_ref(ctx).get_repository(&id, ctx) {
                         for root_path in &root_paths {
@@ -2004,7 +2010,9 @@ impl FileTreeView {
             .finish(),
         );
 
-        let text_color = item_highlight_state.text_and_icon_color(appearance);
+        let text_color = git_status
+            .map(|status| status.color(appearance))
+            .unwrap_or_else(|| item_highlight_state.text_and_icon_color(appearance));
         let text_style = if render_state.is_ignored {
             Properties::default()
                 .style(Style::Italic)
@@ -2052,7 +2060,7 @@ impl FileTreeView {
                         appearance.ui_font_family(),
                         ITEM_FONT_SIZE - 2.,
                     )
-                    .with_color(status.color())
+                    .with_color(status.color(appearance))
                     .with_style(Properties::default().weight(Weight::Bold))
                     .finish(),
                 )

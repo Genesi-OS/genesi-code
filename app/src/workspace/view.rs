@@ -9339,11 +9339,6 @@ impl Workspace {
 
     fn user_menu_items(&self, app: &AppContext) -> Vec<MenuItem<WorkspaceAction>> {
         let mut items = Vec::new();
-        if !self.auth_state.is_anonymous_or_logged_out() {
-            let name = self.auth_state.username_for_display().unwrap_or_default();
-            items.push(MenuItemFields::new(name).with_disabled(true).into_item())
-        }
-
         let appearance = Appearance::as_ref(app);
 
         // Render the subtle autoupdate UI if autoupdate is ready and there is no incoming prominent update version.
@@ -9359,7 +9354,7 @@ impl Workspace {
                     ) =>
                 {
                     items.push(
-                        MenuItemFields::new("Update and relaunch Warp")
+                        MenuItemFields::new("Update and relaunch Genesi Code")
                             .with_on_select_action(WorkspaceAction::ApplyUpdate)
                             .with_override_text_color(appearance.theme().ansi_fg_red())
                             .into_item(),
@@ -9382,7 +9377,7 @@ impl Workspace {
                     ) =>
                 {
                     items.push(
-                        MenuItemFields::new("Update Warp manually")
+                        MenuItemFields::new("Update Genesi Code manually")
                             .with_on_select_action(WorkspaceAction::DownloadNewVersion)
                             .with_override_text_color(appearance.theme().ansi_fg_red())
                             .into_item(),
@@ -9393,81 +9388,13 @@ impl Workspace {
         }
 
         items.extend([
-            MenuItemFields::new("What's new")
-                .with_on_select_action(WorkspaceAction::ViewLatestChangelog)
-                .into_item(),
             MenuItemFields::new("Settings")
                 .with_on_select_action(WorkspaceAction::ShowSettings)
                 .into_item(),
             MenuItemFields::new("Keyboard shortcuts")
                 .with_on_select_action(WorkspaceAction::ToggleKeybindingsPage)
                 .into_item(),
-            MenuItem::Separator,
-            MenuItemFields::new("Documentation")
-                .with_on_select_action(WorkspaceAction::ViewUserDocs)
-                .into_item(),
-            MenuItemFields::new("Feedback")
-                .with_on_select_action(WorkspaceAction::SendFeedback)
-                .into_item(),
         ]);
-
-        #[cfg(not(target_family = "wasm"))]
-        items.push(
-            MenuItemFields::new("View Warp logs")
-                .with_on_select_action(WorkspaceAction::ViewLogs)
-                .into_item(),
-        );
-
-        items.extend([
-            MenuItemFields::new("Slack")
-                .with_on_select_action(WorkspaceAction::JoinSlack)
-                .into_item(),
-            MenuItem::Separator,
-        ]);
-
-        if self.auth_state.is_anonymous_or_logged_out() {
-            items.push(
-                MenuItemFields::new("Sign up")
-                    .with_on_select_action(WorkspaceAction::SignupAnonymousUser)
-                    .into_item(),
-            );
-        }
-
-        // Check if the user is on any paid plan to determine whether to show "Billing and Usage" or "Upgrade"
-        let is_on_paid_plan = UserWorkspaces::as_ref(app)
-            .current_workspace()
-            .map(|workspace| workspace.billing_metadata.is_user_on_paid_plan())
-            .unwrap_or(false);
-
-        if is_on_paid_plan {
-            items.push(
-                MenuItemFields::new("Billing and usage")
-                    .with_on_select_action(WorkspaceAction::ShowSettingsPage(
-                        SettingsSection::BillingAndUsage,
-                    ))
-                    .into_item(),
-            );
-        } else {
-            items.push(
-                MenuItemFields::new("Upgrade")
-                    .with_on_select_action(WorkspaceAction::ShowUpgrade)
-                    .into_item(),
-            );
-        }
-
-        items.push(
-            MenuItemFields::new("Invite a friend")
-                .with_on_select_action(WorkspaceAction::ShowReferralSettingsPage)
-                .into_item(),
-        );
-
-        if !self.auth_state.is_anonymous_or_logged_out() {
-            items.push(
-                MenuItemFields::new("Log out")
-                    .with_on_select_action(WorkspaceAction::LogOut)
-                    .into_item(),
-            );
-        }
         items
     }
 
