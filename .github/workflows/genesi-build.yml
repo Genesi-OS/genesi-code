@@ -65,11 +65,12 @@ jobs:
           # (run #46) a 16G swapfile didn't fit the runner's disk: fallocate failed
           # and the dd fallback filled the disk ("No space left on device"), and
           # since the step shell runs with -e that killed the build before cargo
-          # even started. Use a smaller 8G file, and if it still can't be written,
-          # drop the partial file and rely on overcommit instead of erroring out.
+          # even started. Run #70 later proved 8G still starves the Rust release
+          # target. Two build jobs plus 2G swap leave enough room for the .rlib
+          # archives while retaining a memory-pressure backstop.
           if [ ! -e /ci-swapfile ]; then
-            if fallocate -l 8G /ci-swapfile 2>/dev/null \
-               || dd if=/dev/zero of=/ci-swapfile bs=1M count=8192 2>/dev/null; then
+            if fallocate -l 2G /ci-swapfile 2>/dev/null \
+               || dd if=/dev/zero of=/ci-swapfile bs=1M count=2048 2>/dev/null; then
               chmod 600 /ci-swapfile
               mkswap /ci-swapfile
               swapon /ci-swapfile || echo "::warning::swapon failed — relying on overcommit"
@@ -132,6 +133,17 @@ jobs:
           ptrs=$(grep -rlI "git-lfs.github.com/spec" app/assets 2>/dev/null | wc -l || echo 0)
           echo "remaining LFS pointer files under app/assets: $ptrs"
 
+      - name: Reclaim disk for release target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Packages and LFS assets are materialized already, so these download
+          # caches are duplicate data that the build no longer needs.
+          rm -rf /var/cache/pacman/pkg/*
+          rm -rf .git/lfs/objects
+          echo "disk available before cargo build:"
+          df -h /
+
       - name: Build Genesi Code (release)
         shell: bash
         env:
@@ -144,7 +156,7 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: "false"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-          CARGO_BUILD_JOBS: "4"
+          CARGO_BUILD_JOBS: "2"
         run: cargo build --release --bin warp
 
       - name: Stage + compress artifact
