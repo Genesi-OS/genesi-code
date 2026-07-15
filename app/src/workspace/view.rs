@@ -21334,10 +21334,10 @@ impl Workspace {
         Align::new(
             self.render_tab_bar_icon_button(
                 appearance,
-                icons::Icon::Diff,
+                icons::Icon::Dataflow02,
                 &self.mouse_states.right_panel_icon,
-                WorkspaceAction::ToggleGenesiToolsPanel,
-                "Review and tools".to_owned(),
+                WorkspaceAction::OpenGenesiCanvasTool,
+                "Project Canvas".to_owned(),
                 None,
                 self.genesi_tools_panel_open,
                 false,
@@ -24389,9 +24389,25 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             OpenGenesiCanvasTool => {
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.open_project_canvas(project_root, ctx)
+                });
+                ctx.notify();
+            }
+            RefreshGenesiCanvas => {
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.refresh_project_canvas(project_root, ctx)
+                });
+                ctx.notify();
+            }
+            SelectGenesiCanvasNode(id) => {
                 self.genesi_tools_panel_open = true;
                 self.local_ai_panel
-                    .update(ctx, |panel, ctx| panel.open_project_canvas(ctx));
+                    .update(ctx, |panel, ctx| panel.select_project_canvas_node(id, ctx));
                 ctx.notify();
             }
             SelectGenesiReviewFile(path) => {

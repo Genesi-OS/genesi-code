@@ -313,6 +313,8 @@ pub enum WorkspaceAction {
     OpenGenesiFilesTool,
     OpenGenesiTerminalTool,
     OpenGenesiCanvasTool,
+    RefreshGenesiCanvas,
+    SelectGenesiCanvasNode(String),
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -998,6 +1000,8 @@ impl WorkspaceAction {
             | OpenGenesiFilesTool
             | OpenGenesiTerminalTool
             | OpenGenesiCanvasTool
+            | RefreshGenesiCanvas
+            | SelectGenesiCanvasNode(_)
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

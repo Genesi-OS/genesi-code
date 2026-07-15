@@ -41,6 +41,9 @@ use super::local_chat::{
     AiModeState, ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind,
     CodeContext, LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
 };
+use super::project_canvas::{
+    analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
+};
 use crate::appearance::Appearance;
 use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::settings_view::SettingsSection;
@@ -237,6 +240,14 @@ struct PendingEdit {
 enum GenesiSideTool {
     Review,
     Canvas,
+}
+
+#[derive(Debug)]
+enum ProjectCanvasState {
+    NoProject,
+    Loading(PathBuf),
+    Ready(ProjectCanvasGraph),
+    Error(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -481,6 +492,9 @@ pub struct LocalAiChatView {
     review_expanded: bool,
     selected_review_path: Option<String>,
     active_side_tool: GenesiSideTool,
+    project_canvas_state: ProjectCanvasState,
+    project_canvas_generation: u64,
+    selected_canvas_node: Option<String>,
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -537,6 +551,9 @@ impl LocalAiChatView {
             review_expanded: false,
             selected_review_path: None,
             active_side_tool: GenesiSideTool::Review,
+            project_canvas_state: ProjectCanvasState::NoProject,
+            project_canvas_generation: 0,
+            selected_canvas_node: None,
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -1606,12 +1623,273 @@ impl LocalAiChatView {
             .finish()
     }
 
+    fn canvas_node_accent(&self, appearance: &Appearance, kind: CanvasNodeKind) -> ColorU {
+        let colors = &appearance.theme().terminal_colors().normal;
+        match kind {
+            CanvasNodeKind::Page => colors.blue.into(),
+            CanvasNodeKind::Router => colors.magenta.into(),
+            CanvasNodeKind::Endpoint => colors.green.into(),
+        }
+    }
+
     fn render_canvas_node(
         &self,
         appearance: &Appearance,
+        node: &CanvasNode,
+        selected: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent = self.canvas_node_accent(appearance, node.kind);
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let subtitle = match node.kind {
+            CanvasNodeKind::Page => node
+                .estimated_load_ms
+                .map(|load| format!("{}  ·  ~{load} ms estimated load", node.kind.label()))
+                .unwrap_or_else(|| node.kind.label().to_string()),
+            CanvasNodeKind::Endpoint => format!(
+                "{}  ·  {}",
+                node.method.as_deref().unwrap_or("ANY"),
+                node.kind.label()
+            ),
+            CanvasNodeKind::Router => "Router / controller".to_string(),
+        };
+        let source = format!("{}:{}", node.source.display(), node.line);
+        let action = WorkspaceAction::SelectGenesiCanvasNode(node.id.clone());
+
+        EventHandler::new(
+            Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(
+                        Container::new(
+                            ConstrainedBox::new(Empty::new().finish())
+                                .with_height(3.)
+                                .finish(),
+                        )
+                        .with_background_color(accent)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            node.title.clone(),
+                            TITLE_FONT_SIZE,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .with_margin_top(9.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            subtitle,
+                            CHIP_FONT_SIZE,
+                            accent,
+                            false,
+                        ))
+                        .with_margin_top(4.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            source,
+                            CHIP_FONT_SIZE,
+                            muted,
+                            true,
+                        ))
+                        .with_margin_top(5.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_padding_left(12.)
+            .with_padding_right(12.)
+            .with_padding_bottom(11.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_border(Border::all(1.).with_border_fill(if selected {
+                theme.accent()
+            } else {
+                theme.outline()
+            }))
+            .with_background(theme.surface_1())
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    fn render_canvas_edge(
+        &self,
+        appearance: &Appearance,
+        graph: &ProjectCanvasGraph,
+        edge: &super::project_canvas::CanvasEdge,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let from = graph
+            .node(&edge.from)
+            .map(|node| node.title.as_str())
+            .unwrap_or("Unknown");
+        let to = graph
+            .node(&edge.to)
+            .map(|node| node.title.as_str())
+            .unwrap_or("Unknown");
+        let source = format!("{}:{}", edge.source.display(), edge.line);
+        let accent: ColorU = match edge.kind {
+            CanvasEdgeKind::PageLink => theme.terminal_colors().normal.blue.into(),
+            CanvasEdgeKind::ApiCall | CanvasEdgeKind::InternalCall => {
+                theme.terminal_colors().normal.green.into()
+            }
+            CanvasEdgeKind::Defines => theme.terminal_colors().normal.magenta.into(),
+        };
+        let action = WorkspaceAction::SelectGenesiCanvasNode(edge.to.clone());
+
+        EventHandler::new(
+            Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(self.label_text(
+                        appearance,
+                        format!("{from}  →  {to}"),
+                        BODY_FONT_SIZE,
+                        theme.main_text_color(theme.background()).into(),
+                        false,
+                    ))
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            format!("{}  ·  {}  ·  {source}", edge.kind.label(), edge.label),
+                            CHIP_FONT_SIZE,
+                            muted,
+                            true,
+                        ))
+                        .with_margin_top(4.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_uniform_padding(10.)
+            .with_border(Border::left(2.).with_border_color(accent))
+            .with_background(theme.surface_1())
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    fn render_canvas_details(
+        &self,
+        appearance: &Appearance,
+        graph: &ProjectCanvasGraph,
+        node: &CanvasNode,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let accent = self.canvas_node_accent(appearance, node.kind);
+        let mut details = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.label_text(
+                appearance,
+                "Selected node".to_string(),
+                CHIP_FONT_SIZE,
+                accent,
+                false,
+            ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    node.title.clone(),
+                    TITLE_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_margin_top(5.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    format!(
+                        "{}:{}  ·  {}",
+                        node.source.display(),
+                        node.line,
+                        node.kind.label()
+                    ),
+                    CHIP_FONT_SIZE,
+                    muted,
+                    true,
+                ))
+                .with_margin_top(5.)
+                .finish(),
+            );
+
+        if let Some(body) = &node.request_body {
+            details.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    format!("Request body\n{body}"),
+                    BODY_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_margin_top(12.)
+                .finish(),
+            );
+        }
+        if !node.dependencies.is_empty() {
+            details.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    format!("Dependencies\n{}", node.dependencies.join("  ·  ")),
+                    BODY_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_margin_top(12.)
+                .finish(),
+            );
+        }
+        let connections = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == node.id || edge.to == node.id)
+            .count();
+        details.add_child(
+            Container::new(self.label_text(
+                appearance,
+                format!(
+                    "{connections} graph connection{}",
+                    if connections == 1 { "" } else { "s" }
+                ),
+                CHIP_FONT_SIZE,
+                muted,
+                false,
+            ))
+            .with_margin_top(12.)
+            .finish(),
+        );
+
+        Container::new(details.finish())
+            .with_uniform_padding(14.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_border(Border::all(1.).with_border_fill(theme.accent()))
+            .with_background(theme.surface_1())
+            .finish()
+    }
+
+    fn render_canvas_message(
+        &self,
+        appearance: &Appearance,
         title: &str,
-        subtitle: &str,
-        accent: ColorU,
+        body: &str,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         Container::new(
@@ -1627,127 +1905,199 @@ impl LocalAiChatView {
                 .with_child(
                     Container::new(self.label_text(
                         appearance,
-                        subtitle.to_string(),
-                        CHIP_FONT_SIZE,
+                        body.to_string(),
+                        BODY_FONT_SIZE,
                         theme.disabled_text_color(theme.background()).into(),
                         true,
                     ))
-                    .with_margin_top(5.)
-                    .finish(),
-                )
-                .with_child(
-                    Container::new(
-                        ConstrainedBox::new(Empty::new().finish())
-                            .with_height(2.)
-                            .finish(),
-                    )
-                    .with_margin_top(10.)
-                    .with_background_color(accent)
+                    .with_margin_top(7.)
                     .finish(),
                 )
                 .finish(),
         )
-        .with_uniform_padding(12.)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-        .with_background_color(ColorU::new(255, 255, 255, 10))
+        .with_uniform_padding(14.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_background(theme.surface_1())
         .finish()
     }
 
     fn render_project_canvas(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
+        let mut root = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-        let nodes = Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.render_canvas_node(
-                appearance,
-                "Frontend",
-                "Pages, forms, components",
-                ColorU::new(80, 186, 255, 255),
-            ))
-            .with_child(
-                Container::new(self.label_text(
+        match &self.project_canvas_state {
+            ProjectCanvasState::NoProject => {
+                root.add_child(self.render_canvas_message(
                     appearance,
-                    "        -> request / response ->".to_string(),
-                    CHIP_FONT_SIZE,
-                    genesi_green(),
-                    false,
-                ))
-                .with_vertical_padding(8.)
-                .finish(),
-            )
-            .with_child(self.render_canvas_node(
-                appearance,
-                "API routes",
-                "Routes, controllers, services",
-                genesi_green(),
-            ))
-            .with_child(
-                Container::new(self.label_text(
+                    "No project detected",
+                    "Open a project folder or focus a source file, then open Project Canvas again.",
+                ));
+            }
+            ProjectCanvasState::Loading(path) => {
+                root.add_child(self.render_canvas_message(
                     appearance,
-                    "        -> reads / writes ->".to_string(),
-                    CHIP_FONT_SIZE,
-                    genesi_green(),
-                    false,
-                ))
-                .with_vertical_padding(8.)
-                .finish(),
-            )
-            .with_child(self.render_canvas_node(
-                appearance,
-                "Database",
-                "Models, migrations, tables",
-                ColorU::new(255, 198, 92, 255),
-            ))
-            .with_child(
-                Container::new(self.render_canvas_node(
+                    "Analyzing project…",
+                    &format!(
+                        "Scanning {} for pages, links, routers, and endpoints. Project code is never executed.",
+                        path.display()
+                    ),
+                ));
+            }
+            ProjectCanvasState::Error(error) => {
+                root.add_child(self.render_canvas_message(
                     appearance,
-                    "Git flow",
-                    "Branches, merges, conflicts",
-                    ColorU::new(210, 135, 255, 255),
-                ))
-                .with_margin_top(12.)
-                .finish(),
-            )
-            .finish();
-
-        Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.label_text(
+                    "Project analysis failed",
+                    error,
+                ));
+            }
+            ProjectCanvasState::Ready(graph) if graph.kind == ProjectKind::Unknown => {
+                root.add_child(self.render_canvas_message(
                     appearance,
-                    "Project Canvas".to_string(),
-                    TITLE_FONT_SIZE,
-                    theme.main_text_color(theme.background()).into(),
-                    false,
-                ))
-                .with_child(Container::new(nodes).with_margin_top(14.).finish())
-                .with_child(
-                    Container::new(
-                        Flex::row()
-                            .with_child(self.workspace_chip(
-                                appearance,
-                                "Open Files".to_string(),
-                                Some("folder"),
-                                WorkspaceAction::OpenGenesiFilesTool,
-                                false,
-                            ))
-                            .with_child(self.workspace_chip(
-                                appearance,
-                                "Open Terminal".to_string(),
-                                Some("terminal"),
-                                WorkspaceAction::OpenGenesiTerminalTool,
-                                false,
-                            ))
-                            .finish(),
-                    )
-                    .with_margin_top(14.)
+                    "No recognized project structure",
+                    &format!(
+                        "Scanned {} source files in {} but found no supported pages or endpoints.",
+                        graph.files_scanned,
+                        graph.root.display()
+                    ),
+                ));
+            }
+            ProjectCanvasState::Ready(graph) => {
+                let stacks = if graph.stacks.is_empty() {
+                    "Framework inferred from source".to_string()
+                } else {
+                    graph.stacks.join("  ·  ")
+                };
+                root.add_child(
+                    Flex::row()
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Flex::column()
+                                .with_child(self.label_text(
+                                    appearance,
+                                    graph.project_name.clone(),
+                                    TITLE_FONT_SIZE,
+                                    theme.main_text_color(theme.background()).into(),
+                                    false,
+                                ))
+                                .with_child(
+                                    Container::new(self.label_text(
+                                        appearance,
+                                        format!(
+                                            "{}  ·  {} pages  ·  {} endpoints",
+                                            graph.kind.label(),
+                                            graph.page_count(),
+                                            graph.endpoint_count()
+                                        ),
+                                        CHIP_FONT_SIZE,
+                                        theme.disabled_text_color(theme.background()).into(),
+                                        false,
+                                    ))
+                                    .with_margin_top(3.)
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_child(self.workspace_chip(
+                            appearance,
+                            "Refresh".to_string(),
+                            None,
+                            WorkspaceAction::RefreshGenesiCanvas,
+                            false,
+                        ))
+                        .finish(),
+                );
+                root.add_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        stacks,
+                        CHIP_FONT_SIZE,
+                        theme.accent().into_solid(),
+                        true,
+                    ))
+                    .with_margin_top(6.)
                     .finish(),
-                )
-                .finish(),
-        )
-        .with_uniform_padding(16.)
-        .finish()
+                );
+
+                if let Some(selected) = self
+                    .selected_canvas_node
+                    .as_deref()
+                    .and_then(|id| graph.node(id))
+                {
+                    root.add_child(
+                        Container::new(self.render_canvas_details(appearance, graph, selected))
+                            .with_margin_top(14.)
+                            .finish(),
+                    );
+                }
+
+                for (kind, heading) in [
+                    (CanvasNodeKind::Page, "Pages"),
+                    (CanvasNodeKind::Router, "Backend routers"),
+                    (CanvasNodeKind::Endpoint, "Endpoints"),
+                ] {
+                    let section_nodes = graph.nodes.iter().filter(|node| node.kind == kind);
+                    let mut section = Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                        .with_child(self.label_text(
+                            appearance,
+                            heading.to_string(),
+                            BODY_FONT_SIZE,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ));
+                    let mut count = 0;
+                    for node in section_nodes {
+                        count += 1;
+                        section.add_child(
+                            Container::new(self.render_canvas_node(
+                                appearance,
+                                node,
+                                self.selected_canvas_node.as_deref() == Some(node.id.as_str()),
+                            ))
+                            .with_margin_top(8.)
+                            .finish(),
+                        );
+                    }
+                    if count > 0 {
+                        root.add_child(
+                            Container::new(section.finish())
+                                .with_margin_top(16.)
+                                .finish(),
+                        );
+                    }
+                }
+
+                if !graph.edges.is_empty() {
+                    let mut connections = Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                        .with_child(self.label_text(
+                            appearance,
+                            "Connections".to_string(),
+                            BODY_FONT_SIZE,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ));
+                    for edge in graph.edges.iter().take(120) {
+                        connections.add_child(
+                            Container::new(self.render_canvas_edge(appearance, graph, edge))
+                                .with_margin_top(7.)
+                                .finish(),
+                        );
+                    }
+                    root.add_child(
+                        Container::new(connections.finish())
+                            .with_margin_top(16.)
+                            .finish(),
+                    );
+                }
+            }
+        }
+
+        Container::new(root.finish())
+            .with_uniform_padding(16.)
+            .finish()
     }
 
     pub fn current_chat_title(&self) -> String {
@@ -1786,9 +2136,77 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
-    pub fn open_project_canvas(&mut self, ctx: &mut ViewContext<Self>) {
+    pub fn open_project_canvas(
+        &mut self,
+        project_root: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
         self.active_side_tool = GenesiSideTool::Canvas;
+        self.refresh_project_canvas(project_root, ctx);
+    }
+
+    pub fn refresh_project_canvas(
+        &mut self,
+        project_root: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.project_canvas_generation = self.project_canvas_generation.wrapping_add(1);
+        let generation = self.project_canvas_generation;
+        let Some(root) = project_root else {
+            self.project_canvas_state = ProjectCanvasState::NoProject;
+            self.selected_canvas_node = None;
+            ctx.notify();
+            return;
+        };
+
+        self.agent_root = Some(root.clone());
+        self.project_canvas_state = ProjectCanvasState::Loading(root.clone());
+        self.selected_canvas_node = None;
         ctx.notify();
+
+        ctx.spawn(
+            async move { tokio::task::spawn_blocking(move || analyze_project(&root)).await },
+            move |me, result, ctx| {
+                if me.project_canvas_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(graph) => {
+                        me.selected_canvas_node = graph
+                            .nodes
+                            .iter()
+                            .find(|node| node.kind == CanvasNodeKind::Page)
+                            .or_else(|| {
+                                graph
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.kind == CanvasNodeKind::Endpoint)
+                            })
+                            .or_else(|| graph.nodes.first())
+                            .map(|node| node.id.clone());
+                        me.project_canvas_state = ProjectCanvasState::Ready(graph);
+                    }
+                    Err(error) => {
+                        me.project_canvas_state = ProjectCanvasState::Error(format!(
+                            "The background analyzer stopped unexpectedly: {error}"
+                        ));
+                        me.selected_canvas_node = None;
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    pub fn select_project_canvas_node(&mut self, id: &str, ctx: &mut ViewContext<Self>) {
+        let exists = match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) => graph.node(id).is_some(),
+            _ => false,
+        };
+        if exists {
+            self.selected_canvas_node = Some(id.to_string());
+            ctx.notify();
+        }
     }
 
     pub fn keep_pending_edits(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1868,20 +2286,6 @@ impl LocalAiChatView {
                 None,
                 WorkspaceAction::OpenGenesiCanvasTool,
                 self.active_side_tool == GenesiSideTool::Canvas,
-            ))
-            .with_child(self.workspace_chip(
-                appearance,
-                "Files".to_string(),
-                Some("folder"),
-                WorkspaceAction::OpenGenesiFilesTool,
-                false,
-            ))
-            .with_child(self.workspace_chip(
-                appearance,
-                "Terminal".to_string(),
-                Some("terminal"),
-                WorkspaceAction::OpenGenesiTerminalTool,
-                false,
             ))
             .finish();
         root.add_child(
