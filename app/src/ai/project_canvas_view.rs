@@ -5,6 +5,7 @@
 //! panning, zooming, and node dragging all share the same coordinate system.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{vec2f, Vector2F};
@@ -29,6 +30,7 @@ pub struct ProjectGraphNodeElement {
     pub child: Box<dyn Element>,
     size: Vector2F,
     screen_bounds: Option<RectF>,
+    visible: bool,
 }
 
 impl ProjectGraphNodeElement {
@@ -39,6 +41,7 @@ impl ProjectGraphNodeElement {
             child,
             size: Vector2F::zero(),
             screen_bounds: None,
+            visible: false,
         }
     }
 }
@@ -53,7 +56,7 @@ pub struct ProjectGraphColors {
 }
 
 pub struct ProjectGraphCanvas {
-    graph: ProjectCanvasGraph,
+    graph: Arc<ProjectCanvasGraph>,
     nodes: Vec<ProjectGraphNodeElement>,
     pan: Vector2F,
     zoom: f32,
@@ -65,7 +68,7 @@ pub struct ProjectGraphCanvas {
 
 impl ProjectGraphCanvas {
     pub fn new(
-        graph: ProjectCanvasGraph,
+        graph: Arc<ProjectCanvasGraph>,
         nodes: Vec<ProjectGraphNodeElement>,
         pan: Vector2F,
         zoom: f32,
@@ -124,6 +127,7 @@ impl ProjectGraphCanvas {
         &self,
         edge: &CanvasEdge,
         origin: Vector2F,
+        viewport: RectF,
         positions: &HashMap<&str, Vector2F>,
         ctx: &mut PaintContext,
     ) {
@@ -136,6 +140,16 @@ impl ProjectGraphCanvas {
         let node_size = vec2f(FORGE_NODE_WIDTH, FORGE_NODE_HEIGHT) * self.zoom;
         let start = self.sheet_to_screen(origin, *from) + vec2f(node_size.x(), node_size.y() / 2.);
         let end = self.sheet_to_screen(origin, *to) + vec2f(0., node_size.y() / 2.);
+        let connection_bounds = RectF::new(
+            vec2f(start.x().min(end.x()), start.y().min(end.y())),
+            vec2f(
+                (start.x() - end.x()).abs().max(2.),
+                (start.y() - end.y()).abs().max(2.),
+            ),
+        );
+        if connection_bounds.intersection(viewport).is_none() {
+            return;
+        }
         let middle_x = start.x() + (end.x() - start.x()) * 0.5;
         let fill = Fill::Solid(coloru_with_opacity(self.edge_accent(edge), 72));
 
@@ -187,17 +201,25 @@ impl Element for ProjectGraphCanvas {
             height.max(constraint.min.y()),
         );
         let node_size = vec2f(FORGE_NODE_WIDTH, FORGE_NODE_HEIGHT) * self.zoom;
+        let viewport = RectF::new(Vector2F::zero(), self.size);
         for node in &mut self.nodes {
-            node.size = node
-                .child
-                .layout(SizeConstraint::new(node_size, node_size), ctx, app);
+            let node_bounds = RectF::new(self.pan + node.position * self.zoom, node_size);
+            node.visible = node_bounds.intersection(viewport).is_some();
+            node.size = if node.visible {
+                node.child
+                    .layout(SizeConstraint::new(node_size, node_size), ctx, app)
+            } else {
+                node_size
+            };
         }
         self.size
     }
 
     fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
         for node in &mut self.nodes {
-            node.child.after_layout(ctx, app);
+            if node.visible {
+                node.child.after_layout(ctx, app);
+            }
         }
     }
 
@@ -210,7 +232,7 @@ impl Element for ProjectGraphCanvas {
             .draw_rect_with_hit_recording(bounds)
             .with_background(self.colors.background);
 
-        let spacing = (28. * self.zoom).clamp(18., 42.);
+        let spacing = (28. * self.zoom).clamp(18., 42.) * if self.drag_active { 2. } else { 1. };
         let dot = (1.6 * self.zoom).clamp(1., 2.4);
         let start_x = origin.x() + self.pan.x().rem_euclid(spacing);
         let start_y = origin.y() + self.pan.y().rem_euclid(spacing);
@@ -233,13 +255,17 @@ impl Element for ProjectGraphCanvas {
             .map(|node| (node.id.as_str(), node.position))
             .collect::<HashMap<_, _>>();
         for edge in &self.graph.edges {
-            self.draw_connection(edge, origin, &positions, ctx);
+            self.draw_connection(edge, origin, bounds, &positions, ctx);
         }
 
         for node in &mut self.nodes {
             let screen_origin = origin + self.pan + node.position * self.zoom;
-            node.screen_bounds = Some(RectF::new(screen_origin, node.size));
-            node.child.paint(screen_origin, ctx, app);
+            if node.visible {
+                node.screen_bounds = Some(RectF::new(screen_origin, node.size));
+                node.child.paint(screen_origin, ctx, app);
+            } else {
+                node.screen_bounds = None;
+            }
         }
         ctx.scene.stop_layer();
     }
@@ -250,7 +276,7 @@ impl Element for ProjectGraphCanvas {
         ctx: &mut EventContext,
         app: &AppContext,
     ) -> bool {
-        for node in self.nodes.iter_mut().rev() {
+        for node in self.nodes.iter_mut().rev().filter(|node| node.visible) {
             if node.child.dispatch_event(event, ctx, app) {
                 return true;
             }
@@ -323,8 +349,8 @@ impl Element for ProjectGraphCanvas {
 }
 
 pub struct ProjectGraphMinimap {
-    graph: ProjectCanvasGraph,
-    positions: HashMap<String, Vector2F>,
+    graph: Arc<ProjectCanvasGraph>,
+    positions: Arc<HashMap<String, Vector2F>>,
     colors: ProjectGraphColors,
     size: Vector2F,
     origin: Option<Point>,
@@ -332,8 +358,8 @@ pub struct ProjectGraphMinimap {
 
 impl ProjectGraphMinimap {
     pub fn new(
-        graph: ProjectCanvasGraph,
-        positions: HashMap<String, Vector2F>,
+        graph: Arc<ProjectCanvasGraph>,
+        positions: Arc<HashMap<String, Vector2F>>,
         colors: ProjectGraphColors,
     ) -> Self {
         Self {

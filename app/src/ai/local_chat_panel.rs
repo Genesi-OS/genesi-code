@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -73,6 +73,8 @@ const MEMPALACE_STORAGE_KEY: &str = "GenesiCodeMempalaceV1";
 /// A large scroll target; `ClippedScrollable::after_layout` clamps it to the
 /// real bottom, so this reliably pins the transcript to the latest message.
 const SCROLL_TO_BOTTOM: f32 = 1.0e7;
+const CANVAS_DRAG_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const CANVAS_DRAG_MIN_DISTANCE: f32 = 3.;
 
 const SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant running locally on Genesi OS. Be concise.";
@@ -256,7 +258,7 @@ enum GenesiSideTool {
 enum ProjectCanvasState {
     NoProject,
     Loading(PathBuf),
-    Ready(ProjectCanvasGraph),
+    Ready(Arc<ProjectCanvasGraph>),
     Error(String),
 }
 
@@ -518,10 +520,13 @@ pub struct LocalAiChatView {
     project_canvas_state: ProjectCanvasState,
     project_canvas_generation: u64,
     selected_canvas_node: Option<String>,
-    project_canvas_positions: HashMap<String, Vector2F>,
+    project_canvas_positions: Arc<HashMap<String, Vector2F>>,
     project_canvas_pan: Vector2F,
     project_canvas_zoom: f32,
     project_canvas_drag: Option<ProjectCanvasDragState>,
+    project_canvas_last_drag_frame: Option<Instant>,
+    project_canvas_last_drag_pointer: Option<Vector2F>,
+    project_canvas_pending_drag_pointer: Option<Vector2F>,
     project_canvas_palette_scroll: ClippedScrollStateHandle,
     project_canvas_inspector_scroll: ClippedScrollStateHandle,
     soundscape_enabled: bool,
@@ -583,10 +588,13 @@ impl LocalAiChatView {
             project_canvas_state: ProjectCanvasState::NoProject,
             project_canvas_generation: 0,
             selected_canvas_node: None,
-            project_canvas_positions: HashMap::new(),
+            project_canvas_positions: Arc::new(HashMap::new()),
             project_canvas_pan: vec2f(42., 42.),
             project_canvas_zoom: 1.,
             project_canvas_drag: None,
+            project_canvas_last_drag_frame: None,
+            project_canvas_last_drag_pointer: None,
+            project_canvas_pending_drag_pointer: None,
             project_canvas_palette_scroll: ClippedScrollStateHandle::default(),
             project_canvas_inspector_scroll: ClippedScrollStateHandle::default(),
             soundscape_enabled: false,
@@ -2293,7 +2301,7 @@ impl LocalAiChatView {
     fn render_project_graph_surface(
         &self,
         appearance: &Appearance,
-        graph: &ProjectCanvasGraph,
+        graph: &Arc<ProjectCanvasGraph>,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let colors = self.project_graph_colors(appearance);
@@ -2560,7 +2568,7 @@ impl LocalAiChatView {
     pub fn render_project_canvas_workspace(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let graph = match &self.project_canvas_state {
-            ProjectCanvasState::Ready(graph) => Some(graph),
+            ProjectCanvasState::Ready(graph) => Some(graph.as_ref()),
             _ => None,
         };
         let mut root = Flex::column()
@@ -3310,9 +3318,11 @@ impl LocalAiChatView {
 
     pub fn auto_arrange_project_canvas(&mut self, ctx: &mut ViewContext<Self>) {
         if let ProjectCanvasState::Ready(graph) = &self.project_canvas_state {
-            self.project_canvas_positions = Self::auto_arranged_project_canvas_positions(graph);
+            self.project_canvas_positions =
+                Arc::new(Self::auto_arranged_project_canvas_positions(graph));
             self.project_canvas_pan = vec2f(42., 42.);
             self.project_canvas_drag = None;
+            self.reset_project_canvas_drag_sampling();
             ctx.notify();
         }
     }
@@ -3333,6 +3343,7 @@ impl LocalAiChatView {
         };
         self.project_canvas_pan = vec2f(42., 42.);
         self.project_canvas_drag = None;
+        self.reset_project_canvas_drag_sampling();
         ctx.notify();
     }
 
@@ -3344,6 +3355,35 @@ impl LocalAiChatView {
     pub fn pan_project_canvas(&mut self, delta: Vector2F, ctx: &mut ViewContext<Self>) {
         self.project_canvas_pan += delta;
         ctx.notify();
+    }
+
+    fn reset_project_canvas_drag_sampling(&mut self) {
+        self.project_canvas_last_drag_frame = None;
+        self.project_canvas_last_drag_pointer = None;
+        self.project_canvas_pending_drag_pointer = None;
+    }
+
+    fn apply_project_canvas_drag_pointer(&mut self, pointer: Vector2F) -> bool {
+        match &self.project_canvas_drag {
+            Some(ProjectCanvasDragState::Pan {
+                pointer: start,
+                pan,
+            }) => {
+                self.project_canvas_pan = *pan + pointer - *start;
+            }
+            Some(ProjectCanvasDragState::Node {
+                id,
+                pointer: start,
+                position,
+            }) => {
+                let delta = (pointer - *start) / self.project_canvas_zoom;
+                let next = *position + delta;
+                Arc::make_mut(&mut self.project_canvas_positions)
+                    .insert(id.clone(), vec2f(next.x().max(0.), next.y().max(0.)));
+            }
+            None => return false,
+        }
+        true
     }
 
     pub fn begin_project_canvas_drag(
@@ -3370,34 +3410,43 @@ impl LocalAiChatView {
                 pan: self.project_canvas_pan,
             })
         };
+        self.project_canvas_last_drag_frame = Some(Instant::now());
+        self.project_canvas_last_drag_pointer = Some(pointer);
+        self.project_canvas_pending_drag_pointer = Some(pointer);
         ctx.notify();
     }
 
     pub fn update_project_canvas_drag(&mut self, pointer: Vector2F, ctx: &mut ViewContext<Self>) {
-        match &self.project_canvas_drag {
-            Some(ProjectCanvasDragState::Pan {
-                pointer: start,
-                pan,
-            }) => {
-                self.project_canvas_pan = *pan + pointer - *start;
-            }
-            Some(ProjectCanvasDragState::Node {
-                id,
-                pointer: start,
-                position,
-            }) => {
-                let delta = (pointer - *start) / self.project_canvas_zoom;
-                let next = *position + delta;
-                self.project_canvas_positions
-                    .insert(id.clone(), vec2f(next.x().max(0.), next.y().max(0.)));
-            }
-            None => return,
+        if self.project_canvas_drag.is_none() {
+            return;
         }
-        ctx.notify();
+
+        self.project_canvas_pending_drag_pointer = Some(pointer);
+        let now = Instant::now();
+        let frame_is_too_soon = self
+            .project_canvas_last_drag_frame
+            .is_some_and(|last| now.duration_since(last) < CANVAS_DRAG_FRAME_INTERVAL);
+        let movement_is_too_small = self
+            .project_canvas_last_drag_pointer
+            .is_some_and(|last| (pointer - last).length() < CANVAS_DRAG_MIN_DISTANCE);
+        if frame_is_too_soon || movement_is_too_small {
+            return;
+        }
+
+        if self.apply_project_canvas_drag_pointer(pointer) {
+            self.project_canvas_last_drag_frame = Some(now);
+            self.project_canvas_last_drag_pointer = Some(pointer);
+            ctx.notify();
+        }
     }
 
     pub fn end_project_canvas_drag(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.project_canvas_drag.take().is_some() {
+        if let Some(pointer) = self.project_canvas_pending_drag_pointer.take() {
+            self.apply_project_canvas_drag_pointer(pointer);
+        }
+        let ended = self.project_canvas_drag.take().is_some();
+        self.reset_project_canvas_drag_sampling();
+        if ended {
             ctx.notify();
         }
     }
@@ -3421,8 +3470,9 @@ impl LocalAiChatView {
         let Some(root) = project_root else {
             self.project_canvas_state = ProjectCanvasState::NoProject;
             self.selected_canvas_node = None;
-            self.project_canvas_positions.clear();
+            Arc::make_mut(&mut self.project_canvas_positions).clear();
             self.project_canvas_drag = None;
+            self.reset_project_canvas_drag_sampling();
             ctx.notify();
             return;
         };
@@ -3453,19 +3503,21 @@ impl LocalAiChatView {
                             .or_else(|| graph.nodes.first())
                             .map(|node| node.id.clone());
                         me.project_canvas_positions =
-                            Self::auto_arranged_project_canvas_positions(&graph);
+                            Arc::new(Self::auto_arranged_project_canvas_positions(&graph));
                         me.project_canvas_pan = vec2f(42., 42.);
                         me.project_canvas_zoom = if graph.nodes.len() > 14 { 0.75 } else { 1. };
                         me.project_canvas_drag = None;
-                        me.project_canvas_state = ProjectCanvasState::Ready(graph);
+                        me.reset_project_canvas_drag_sampling();
+                        me.project_canvas_state = ProjectCanvasState::Ready(Arc::new(graph));
                     }
                     Err(error) => {
                         me.project_canvas_state = ProjectCanvasState::Error(format!(
                             "The background analyzer stopped unexpectedly: {error}"
                         ));
                         me.selected_canvas_node = None;
-                        me.project_canvas_positions.clear();
+                        Arc::make_mut(&mut me.project_canvas_positions).clear();
                         me.project_canvas_drag = None;
+                        me.reset_project_canvas_drag_sampling();
                     }
                 }
                 ctx.notify();
