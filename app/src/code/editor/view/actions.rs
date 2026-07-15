@@ -251,6 +251,16 @@ pub fn init(app: &mut AppContext) {
             CodeEditorViewAction::Paste,
             text_entry.clone(),
         ),
+        // Terminal paste uses Ctrl+Shift+V on Linux, but an IDE editor must
+        // follow the conventional text-editing shortcut.
+        FixedBinding::new_per_platform(
+            PerPlatformKeystroke {
+                mac: "cmd-v",
+                linux_and_windows: "ctrl-v",
+            },
+            CodeEditorViewAction::Paste,
+            text_entry.clone(),
+        ),
         #[cfg(windows)]
         FixedBinding::custom(
             CustomAction::WindowsPaste,

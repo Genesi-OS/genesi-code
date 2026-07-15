@@ -141,6 +141,24 @@ struct ParsedCompletionInsert {
     selection: Option<Range<usize>>,
 }
 
+const HTML_VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+const HTML_DOCUMENT_SNIPPET: &str = concat!(
+    "<!DOCTYPE html>\n",
+    "<html lang=\"en\">\n",
+    "<head>\n",
+    "    <meta charset=\"UTF-8\">\n",
+    "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n",
+    "    <title>Document</title>\n",
+    "</head>\n",
+    "<body>\n",
+    "    $0\n",
+    "</body>\n",
+    "</html>"
+);
+
 impl LocalCodeEditorView {
     /// Refresh diagnostics from the LSP server.
     /// This updates the cached processed diagnostics and creates decorations for the editor.
@@ -435,18 +453,23 @@ impl LocalCodeEditorView {
             handle.abort();
         }
         self.completion_request_generation = self.completion_request_generation.wrapping_add(1);
+
+        // Show deterministic local completions immediately. In particular, the
+        // HTML language server intentionally returns no items for bare `di`,
+        // while IDE users expect the Emmet-style `<div></div>` suggestion.
+        if !preserve {
+            self.populate_completion(anchor, Vec::new(), false, ctx);
+        }
+        let keep_visible = matches!(self.lsp_completion_state, LspCompletionState::Active { .. });
         let request_generation = self.completion_request_generation;
 
         let Some(file_path) = self.file_path() else {
-            self.populate_completion(anchor, Vec::new(), false, ctx);
             return;
         };
         let Some(lsp_server) = self.lsp_server.as_ref() else {
-            self.populate_completion(anchor, Vec::new(), false, ctx);
             return;
         };
         if !lsp_server.as_ref(ctx).is_ready_for_requests() {
-            self.populate_completion(anchor, Vec::new(), false, ctx);
             return;
         }
 
@@ -463,7 +486,6 @@ impl LocalCodeEditorView {
                 Ok(future) => future,
                 Err(e) => {
                     log::warn!("Failed to call lsp.completion: {e}");
-                    self.populate_completion(anchor, Vec::new(), false, ctx);
                     return;
                 }
             };
@@ -495,13 +517,13 @@ impl LocalCodeEditorView {
                         // (server still indexing); don't tear down a popup the user is
                         // actively reading. The client-side refilter already closes it
                         // when the typed prefix truly matches nothing.
-                        if !preserve {
+                        if !keep_visible {
                             me.dismiss_completion(ctx);
                         }
                     }
                     Err(e) => {
                         log::warn!("lsp.completion request failed: {e}");
-                        if !preserve {
+                        if !keep_visible {
                             me.dismiss_completion(ctx);
                         }
                     }
@@ -513,7 +535,7 @@ impl LocalCodeEditorView {
 
         // Only show the loading state (which hides any current popup) for a fresh
         // open. Re-queries keep the existing popup visible until results land.
-        if !preserve {
+        if !keep_visible {
             self.lsp_completion_state = LspCompletionState::Loading;
         }
     }
@@ -547,9 +569,17 @@ impl LocalCodeEditorView {
         // `<`, ...), sourced from the language registry. Default to `.` when the
         // file's language is unknown.
         const FALLBACK_TRIGGERS: &[char] = &['.'];
-        let trigger_chars = self
-            .file_path()
-            .and_then(lsp::LanguageId::from_path)
+        let language = self.file_path().and_then(lsp::LanguageId::from_path);
+
+        // Emmet-style HTML document expansion. Include the `!` in the
+        // replacement range so accepting the completion removes it.
+        if language == Some(lsp::LanguageId::Html) && typed == '!' {
+            let anchor = cursor.saturating_sub(&CharOffset::from(1));
+            self.completion_for_offset(cursor, anchor, lsp::CompletionTrigger::Invoked, false, ctx);
+            return;
+        }
+
+        let trigger_chars = language
             .map(|lang| lang.trigger_chars())
             .unwrap_or(FALLBACK_TRIGGERS);
 
@@ -697,7 +727,7 @@ impl LocalCodeEditorView {
         let mut prefix = String::new();
         for i in anchor.as_usize()..cursor.as_usize() {
             match editor.char_at(CharOffset::from(i), ctx) {
-                Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => prefix.push(c),
+                Some(c) if c.is_alphanumeric() || matches!(c, '_' | '$' | '!') => prefix.push(c),
                 _ => return None,
             }
         }
@@ -1383,7 +1413,24 @@ impl LocalCodeEditorView {
             return None;
         }
 
+        if prefix == "!" {
+            return Some(vec![lsp::CompletionItem {
+                label: "!".to_string(),
+                insert_text: HTML_DOCUMENT_SNIPPET.to_string(),
+                insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                text_edit: None,
+                detail: Some("HTML document".to_string()),
+                kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+                sort_text: Some("0-html-document".to_string()),
+                filter_text: Some("!".to_string()),
+            }]);
+        }
+
         const HTML_TAGS: &[&str] = &[
+            "html",
+            "head",
+            "body",
+            "title",
             "div",
             "span",
             "section",
@@ -1397,6 +1444,18 @@ impl LocalCodeEditorView {
             "form",
             "label",
             "input",
+            "br",
+            "hr",
+            "meta",
+            "link",
+            "source",
+            "track",
+            "wbr",
+            "area",
+            "base",
+            "col",
+            "embed",
+            "param",
             "textarea",
             "select",
             "option",
@@ -1430,22 +1489,13 @@ impl LocalCodeEditorView {
             "video",
             "audio",
         ];
-        const VOID_TAGS: &[&str] = &[
-            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-            "source", "track", "wbr",
-        ];
-
         let needle = prefix.to_ascii_lowercase();
         let items = HTML_TAGS
             .iter()
             .filter(|tag| tag.starts_with(&needle))
             .take(COMPLETION_MAX_VISIBLE_ITEMS)
             .map(|tag| {
-                let insert_text = if VOID_TAGS.contains(tag) {
-                    format!("<{tag}>$0")
-                } else {
-                    format!("<{tag}>$0</{tag}>")
-                };
+                let insert_text = Self::html_tag_insert_text(tag);
                 lsp::CompletionItem {
                     label: (*tag).to_string(),
                     insert_text,
@@ -1460,6 +1510,14 @@ impl LocalCodeEditorView {
             .collect::<Vec<_>>();
 
         (!items.is_empty()).then_some(items)
+    }
+
+    fn html_tag_insert_text(tag: &str) -> String {
+        if HTML_VOID_TAGS.contains(&tag) {
+            format!("<{tag}>$0")
+        } else {
+            format!("<{tag}>$0</{tag}>")
+        }
     }
 
     /// Close the completion popup (if any) and stop the editor from intercepting
