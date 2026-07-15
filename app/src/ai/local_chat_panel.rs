@@ -2323,74 +2323,84 @@ impl LocalAiChatView {
             colors,
         )
         .finish();
-        let minimap = Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.label_text(
-                    appearance,
-                    "Canvas Mini-map".to_string(),
-                    10.,
-                    theme.disabled_text_color(theme.background()).into(),
-                    false,
-                ))
-                .with_child(
-                    Container::new(
-                        ConstrainedBox::new(
-                            ProjectGraphMinimap::new(
-                                graph.clone(),
-                                self.project_canvas_positions.clone(),
-                                colors,
+        let minimap = ConstrainedBox::new(
+            Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(self.label_text(
+                        appearance,
+                        "Canvas Mini-map".to_string(),
+                        10.,
+                        theme.disabled_text_color(theme.background()).into(),
+                        false,
+                    ))
+                    .with_child(
+                        Container::new(
+                            ConstrainedBox::new(
+                                ProjectGraphMinimap::new(
+                                    graph.clone(),
+                                    self.project_canvas_positions.clone(),
+                                    colors,
+                                )
+                                .finish(),
                             )
+                            .with_width(168.)
+                            .with_height(86.)
                             .finish(),
                         )
-                        .with_width(168.)
-                        .with_height(86.)
+                        .with_margin_top(6.)
                         .finish(),
                     )
-                    .with_margin_top(6.)
                     .finish(),
-                )
-                .finish(),
+            )
+            .with_uniform_padding(10.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .with_background(theme.surface_1())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .finish(),
         )
-        .with_uniform_padding(10.)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
-        .with_background(theme.surface_1())
-        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_width(190.)
+        .with_height(128.)
         .finish();
-        let zoom_controls = Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.workspace_chip(
-                    appearance,
-                    "Fit".to_string(),
-                    None,
-                    WorkspaceAction::FitGenesiCanvas,
-                    false,
-                ))
-                .with_child(
-                    Container::new(self.workspace_chip(
+        let zoom_controls = ConstrainedBox::new(
+            Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(self.workspace_chip(
                         appearance,
-                        "+".to_string(),
+                        "Fit".to_string(),
                         None,
-                        WorkspaceAction::ZoomGenesiCanvas(0.1),
+                        WorkspaceAction::FitGenesiCanvas,
                         false,
                     ))
-                    .with_margin_top(6.)
+                    .with_child(
+                        Container::new(self.workspace_chip(
+                            appearance,
+                            "+".to_string(),
+                            None,
+                            WorkspaceAction::ZoomGenesiCanvas(0.1),
+                            false,
+                        ))
+                        .with_margin_top(6.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.workspace_chip(
+                            appearance,
+                            "−".to_string(),
+                            None,
+                            WorkspaceAction::ZoomGenesiCanvas(-0.1),
+                            false,
+                        ))
+                        .with_margin_top(6.)
+                        .finish(),
+                    )
                     .finish(),
-                )
-                .with_child(
-                    Container::new(self.workspace_chip(
-                        appearance,
-                        "−".to_string(),
-                        None,
-                        WorkspaceAction::ZoomGenesiCanvas(-0.1),
-                        false,
-                    ))
-                    .with_margin_top(6.)
-                    .finish(),
-                )
-                .finish(),
+            )
+            .finish(),
         )
+        .with_width(56.)
+        .with_height(112.)
         .finish();
 
         let mut stack = Stack::new();
@@ -2643,14 +2653,14 @@ impl LocalAiChatView {
                                     .finish(),
                                 )
                                 .with_child(
-                                    Container::new(
-                                        Expanded::new(
-                                            1.,
+                                    Expanded::new(
+                                        1.,
+                                        Container::new(
                                             self.render_project_graph_surface(appearance, graph),
                                         )
+                                        .with_margin_left(12.)
                                         .finish(),
                                     )
-                                    .with_margin_left(12.)
                                     .finish(),
                                 )
                                 .with_child(

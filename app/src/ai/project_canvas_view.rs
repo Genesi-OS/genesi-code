@@ -274,9 +274,10 @@ impl Element for ProjectGraphCanvas {
             return false;
         };
         let bounds = RectF::new(origin.xy(), self.size);
-        let Some(event) = event.at_z_index(origin.z_index(), ctx) else {
-            return false;
-        };
+        // Positioned controls are dispatched before the stack's base child. The raw
+        // event keeps the rest of the clipped canvas draggable when a transparent
+        // scene layer overlaps it.
+        let event = event.raw_event();
         match event {
             warpui::Event::LeftMouseDown { position, .. } if bounds.contains_point(*position) => {
                 let node_id = self

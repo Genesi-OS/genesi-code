@@ -22202,12 +22202,20 @@ impl Workspace {
     ) -> Box<dyn Element> {
         if self.genesi_canvas_open {
             let appearance = Appearance::as_ref(app);
-            return self.wrap_in_main_surface(
-                appearance,
-                self.local_ai_panel
-                    .as_ref(app)
-                    .render_project_canvas_workspace(appearance),
-            );
+            return Flex::row()
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.wrap_in_main_surface(
+                            appearance,
+                            self.local_ai_panel
+                                .as_ref(app)
+                                .render_project_canvas_workspace(appearance),
+                        ),
+                    )
+                    .finish(),
+                )
+                .finish();
         }
 
         if self.genesi_vibe_mode {
