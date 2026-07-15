@@ -1,6 +1,7 @@
 use lsp::{HoverContents, LspServerLogLevel, MarkupKind};
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use num_traits::SaturatingSub;
+use std::collections::HashSet;
 use std::ops::Range;
 use string_offset::CharOffset;
 use warp_core::send_telemetry_from_ctx;
@@ -135,7 +136,9 @@ impl PendingSections {
 
 struct ParsedCompletionInsert {
     text: String,
-    cursor_offset: Option<usize>,
+    /// The first snippet tabstop in inserted-text character offsets. A collapsed
+    /// range is a cursor position; a non-empty range selects placeholder text.
+    selection: Option<Range<usize>>,
 }
 
 impl LocalCodeEditorView {
@@ -428,12 +431,24 @@ impl LocalCodeEditorView {
         preserve: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let Some(handle) = self.completion_request_handle.take() {
+            handle.abort();
+        }
+        self.completion_request_generation = self.completion_request_generation.wrapping_add(1);
+        let request_generation = self.completion_request_generation;
+
         let Some(file_path) = self.file_path() else {
+            self.populate_completion(anchor, Vec::new(), false, ctx);
             return;
         };
         let Some(lsp_server) = self.lsp_server.as_ref() else {
+            self.populate_completion(anchor, Vec::new(), false, ctx);
             return;
         };
+        if !lsp_server.as_ref(ctx).is_ready_for_requests() {
+            self.populate_completion(anchor, Vec::new(), false, ctx);
+            return;
+        }
 
         let lsp_position = self
             .editor()
@@ -448,48 +463,58 @@ impl LocalCodeEditorView {
                 Ok(future) => future,
                 Err(e) => {
                     log::warn!("Failed to call lsp.completion: {e}");
+                    self.populate_completion(anchor, Vec::new(), false, ctx);
                     return;
                 }
             };
 
         let abort_handle = ctx
-            .spawn(future, move |me, result, ctx| match result {
-                Ok(list) if !list.items.is_empty() => {
-                    // A preserve re-query that resolves after the user dismissed
-                    // the popup must not resurrect it.
-                    if preserve && matches!(me.lsp_completion_state, LspCompletionState::None) {
-                        return;
-                    }
-                    if let Some(server) = me.lsp_server.as_ref() {
-                        server.as_ref(ctx).log_to_server_log(
-                            LspServerLogLevel::Info,
-                            format!("completion: received {} item(s)", list.items.len()),
-                        );
-                    }
-                    me.populate_completion(anchor, list.items, list.is_incomplete, ctx);
+            .spawn(future, move |me, result, ctx| {
+                if me.completion_request_generation != request_generation {
+                    return;
                 }
-                Ok(_) => {
-                    // An empty result on a keystroke re-query is often transient
-                    // (server still indexing); don't tear down a popup the user is
-                    // actively reading. The client-side refilter already closes it
-                    // when the typed prefix truly matches nothing.
-                    if !preserve {
-                        me.dismiss_completion(ctx);
+                me.completion_request_handle = None;
+
+                match result {
+                    Ok(list) if !list.items.is_empty() => {
+                        // A preserve re-query that resolves after the user dismissed
+                        // the popup must not resurrect it.
+                        if preserve && matches!(me.lsp_completion_state, LspCompletionState::None) {
+                            return;
+                        }
+                        if let Some(server) = me.lsp_server.as_ref() {
+                            server.as_ref(ctx).log_to_server_log(
+                                LspServerLogLevel::Info,
+                                format!("completion: received {} item(s)", list.items.len()),
+                            );
+                        }
+                        me.populate_completion(anchor, list.items, list.is_incomplete, ctx);
                     }
-                }
-                Err(e) => {
-                    log::warn!("lsp.completion request failed: {e}");
-                    if !preserve {
-                        me.dismiss_completion(ctx);
+                    Ok(_) => {
+                        // An empty result on a keystroke re-query is often transient
+                        // (server still indexing); don't tear down a popup the user is
+                        // actively reading. The client-side refilter already closes it
+                        // when the typed prefix truly matches nothing.
+                        if !preserve {
+                            me.dismiss_completion(ctx);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("lsp.completion request failed: {e}");
+                        if !preserve {
+                            me.dismiss_completion(ctx);
+                        }
                     }
                 }
             })
             .abort_handle();
 
+        self.completion_request_handle = Some(abort_handle);
+
         // Only show the loading state (which hides any current popup) for a fresh
         // open. Re-queries keep the existing popup visible until results land.
         if !preserve {
-            self.lsp_completion_state = LspCompletionState::Loading(Some(abort_handle));
+            self.lsp_completion_state = LspCompletionState::Loading;
         }
     }
 
@@ -581,7 +606,7 @@ impl LocalCodeEditorView {
                     );
                 }
             }
-            LspCompletionState::Loading(_) => {
+            LspCompletionState::Loading => {
                 // A request is already in flight; it will filter to the live
                 // prefix when it resolves.
             }
@@ -621,7 +646,7 @@ impl LocalCodeEditorView {
     fn populate_completion(
         &mut self,
         anchor: CharOffset,
-        items: Vec<lsp::CompletionItem>,
+        mut items: Vec<lsp::CompletionItem>,
         is_incomplete: bool,
         ctx: &mut ViewContext<Self>,
     ) {
@@ -632,23 +657,10 @@ impl LocalCodeEditorView {
             return;
         };
 
+        self.extend_with_local_completions(&mut items, anchor, cursor, &prefix, ctx);
+
         let filtered = Self::completion_filter(&items, &prefix);
         if filtered.is_empty() {
-            if let Some(fallback_items) = self.html_tag_fallback_items(anchor, cursor, &prefix, ctx)
-            {
-                let filtered = (0..fallback_items.len()).collect();
-                self.lsp_completion_state = LspCompletionState::Active {
-                    items: fallback_items,
-                    filtered,
-                    selected: 0,
-                    anchor,
-                    is_incomplete: false,
-                    scroll_state: Default::default(),
-                };
-                self.set_editor_completion_active(true, ctx);
-                ctx.notify();
-                return;
-            }
             self.dismiss_completion(ctx);
             return;
         }
@@ -692,28 +704,75 @@ impl LocalCodeEditorView {
         Some(prefix)
     }
 
-    /// Case-insensitive prefix filter over the candidate list, capped so the
-    /// rendered/scrolled list stays bounded. Preserves the server's order.
+    /// Rank exact/prefix matches first, then fuzzy subsequence matches such as
+    /// `fb` -> `fooBar`. Server `sortText` is retained as a tie-breaker.
     fn completion_filter(items: &[lsp::CompletionItem], prefix: &str) -> Vec<usize> {
         if prefix.is_empty() {
             return (0..items.len().min(COMPLETION_MAX_VISIBLE_ITEMS)).collect();
         }
         let needle = prefix.to_lowercase();
-        items
+        let mut matches = items
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
+            .filter_map(|(index, item)| {
                 let haystack = item.filter_text.as_deref().unwrap_or(&item.label);
                 let normalized = haystack
                     .trim_start_matches('<')
                     .trim_start_matches('/')
                     .trim_start_matches("</");
-                haystack.to_lowercase().starts_with(&needle)
-                    || normalized.to_lowercase().starts_with(&needle)
+                Self::completion_match_score(normalized, &needle).map(|score| (index, score))
             })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+            let left = &items[*left_index];
+            let right = &items[*right_index];
+            left_score
+                .cmp(right_score)
+                .then_with(|| {
+                    left.sort_text
+                        .as_deref()
+                        .unwrap_or(&left.label)
+                        .cmp(right.sort_text.as_deref().unwrap_or(&right.label))
+                })
+                .then_with(|| left_index.cmp(right_index))
+        });
+
+        matches
+            .into_iter()
             .map(|(index, _)| index)
             .take(COMPLETION_MAX_VISIBLE_ITEMS)
             .collect()
+    }
+
+    fn completion_match_score(haystack: &str, needle: &str) -> Option<(u8, usize, usize)> {
+        let haystack = haystack.to_lowercase();
+        if haystack == needle {
+            return Some((0, 0, haystack.len()));
+        }
+        if haystack.starts_with(needle) {
+            return Some((
+                1,
+                haystack.len().saturating_sub(needle.len()),
+                haystack.len(),
+            ));
+        }
+
+        let mut matched = 0usize;
+        let mut gap = 0usize;
+        let needle_chars = needle.chars().collect::<Vec<_>>();
+        for (index, ch) in haystack.chars().enumerate() {
+            if needle_chars.get(matched) == Some(&ch) {
+                if matched > 0 {
+                    gap += index;
+                }
+                matched += 1;
+                if matched == needle_chars.len() {
+                    return Some((2, gap, haystack.len()));
+                }
+            }
+        }
+        None
     }
 
     fn set_editor_completion_active(&mut self, active: bool, ctx: &mut ViewContext<Self>) {
@@ -857,13 +916,14 @@ impl LocalCodeEditorView {
             let before_start = replacement_range.start.saturating_sub(&CharOffset::from(1));
             let char_before = editor.char_at(before_start, ctx);
             let mut insert_text = parsed.text.clone();
-            let mut cursor_offset = parsed.cursor_offset;
+            let mut selection = parsed.selection.clone();
 
             if let Some(first) = insert_text.chars().next() {
                 if !first.is_alphanumeric() && first != '_' && char_before == Some(first) {
                     insert_text = insert_text[first.len_utf8()..].to_string();
-                    if let Some(offset) = &mut cursor_offset {
-                        *offset = offset.saturating_sub(1);
+                    if let Some(range) = &mut selection {
+                        range.start = range.start.saturating_sub(1);
+                        range.end = range.end.saturating_sub(1);
                     }
                 }
             }
@@ -882,8 +942,14 @@ impl LocalCodeEditorView {
                         let point = Point::new((location.line + 1) as u32, location.column as u32);
                         editor.cursor_at(point, ctx);
                     };
-                if let Some(offset) = cursor_offset {
-                    move_cursor_to(replacement_range.start + CharOffset::from(offset), editor, ctx);
+                if let Some(selection) = selection {
+                    let start = replacement_range.start + CharOffset::from(selection.start);
+                    let end = replacement_range.start + CharOffset::from(selection.end);
+                    if start == end {
+                        move_cursor_to(start, editor, ctx);
+                    } else {
+                        editor.select_char_offset_range(start..end, ctx);
+                    }
                 } else {
                     move_cursor_to(edit_end, editor, ctx);
                 }
@@ -922,14 +988,14 @@ impl LocalCodeEditorView {
         if !is_snippet {
             return ParsedCompletionInsert {
                 text: insert_text.to_string(),
-                cursor_offset: None,
+                selection: None,
             };
         }
 
         let chars: Vec<char> = insert_text.chars().collect();
         let mut output = String::new();
         let mut final_cursor = None;
-        let mut first_tabstop = None;
+        let mut first_tabstop: Option<(usize, Range<usize>)> = None;
         let mut index = 0usize;
 
         while index < chars.len() {
@@ -945,10 +1011,18 @@ impl LocalCodeEditorView {
                         let cursor_here = output.chars().count();
                         if placeholder == 0 {
                             final_cursor = Some(cursor_here);
-                        } else if first_tabstop.is_none() {
-                            first_tabstop = Some(cursor_here);
                         }
                         output.push_str(&default_text);
+                        if placeholder > 0 {
+                            let placeholder_range =
+                                cursor_here..cursor_here + default_text.chars().count();
+                            if first_tabstop
+                                .as_ref()
+                                .is_none_or(|(current, _)| placeholder < *current)
+                            {
+                                first_tabstop = Some((placeholder, placeholder_range));
+                            }
+                        }
                         index += consumed;
                     } else {
                         output.push('$');
@@ -964,7 +1038,9 @@ impl LocalCodeEditorView {
 
         ParsedCompletionInsert {
             text: output,
-            cursor_offset: final_cursor.or(first_tabstop),
+            selection: first_tabstop
+                .map(|(_, range)| range)
+                .or_else(|| final_cursor.map(|cursor| cursor..cursor)),
         }
     }
 
@@ -1024,6 +1100,262 @@ impl LocalCodeEditorView {
         }
     }
 
+    fn language_completion_templates(
+        language: Option<lsp::LanguageId>,
+    ) -> &'static [(&'static str, &'static str, &'static str)] {
+        use lsp::LanguageId::*;
+
+        match language {
+            Some(Rust) => &[
+                ("fn", "fn ${1:name}(${2}) {\n    $0\n}", "Rust function"),
+                ("let", "let ${1:name} = $0;", "Rust binding"),
+                ("if", "if ${1:condition} {\n    $0\n}", "Rust if block"),
+                ("match", "match ${1:value} {\n    $0\n}", "Rust match"),
+                (
+                    "for",
+                    "for ${1:item} in ${2:iterator} {\n    $0\n}",
+                    "Rust loop",
+                ),
+                ("impl", "impl ${1:Type} {\n    $0\n}", "Rust implementation"),
+                ("struct", "struct ${1:Name} {\n    $0\n}", "Rust struct"),
+                ("enum", "enum ${1:Name} {\n    $0\n}", "Rust enum"),
+                ("return", "return $0;", "Rust return"),
+            ],
+            Some(Go) => &[
+                ("func", "func ${1:name}(${2}) {\n\t$0\n}", "Go function"),
+                ("if", "if ${1:condition} {\n\t$0\n}", "Go if block"),
+                ("for", "for ${1:condition} {\n\t$0\n}", "Go loop"),
+                (
+                    "range",
+                    "for ${1:key}, ${2:value} := range ${3:items} {\n\t$0\n}",
+                    "Go range loop",
+                ),
+                ("struct", "type ${1:Name} struct {\n\t$0\n}", "Go struct"),
+                (
+                    "interface",
+                    "type ${1:Name} interface {\n\t$0\n}",
+                    "Go interface",
+                ),
+                ("defer", "defer $0", "Go defer"),
+                ("return", "return $0", "Go return"),
+            ],
+            Some(Python) => &[
+                ("def", "def ${1:name}(${2}):\n    $0", "Python function"),
+                ("class", "class ${1:Name}:\n    $0", "Python class"),
+                ("if", "if ${1:condition}:\n    $0", "Python if block"),
+                ("for", "for ${1:item} in ${2:items}:\n    $0", "Python loop"),
+                (
+                    "while",
+                    "while ${1:condition}:\n    $0",
+                    "Python while loop",
+                ),
+                (
+                    "try",
+                    "try:\n    ${1:pass}\nexcept ${2:Exception}:\n    $0",
+                    "Python try/except",
+                ),
+                (
+                    "with",
+                    "with ${1:expression} as ${2:value}:\n    $0",
+                    "Python context manager",
+                ),
+                ("import", "import $0", "Python import"),
+                ("from", "from ${1:module} import $0", "Python import from"),
+                ("return", "return $0", "Python return"),
+            ],
+            Some(TypeScript | TypeScriptReact) => &[
+                (
+                    "function",
+                    "function ${1:name}(${2}): ${3:void} {\n  $0\n}",
+                    "TypeScript function",
+                ),
+                ("const", "const ${1:name} = $0;", "TypeScript constant"),
+                (
+                    "interface",
+                    "interface ${1:Name} {\n  $0\n}",
+                    "TypeScript interface",
+                ),
+                ("type", "type ${1:Name} = $0;", "TypeScript type"),
+                ("class", "class ${1:Name} {\n  $0\n}", "TypeScript class"),
+                (
+                    "if",
+                    "if (${1:condition}) {\n  $0\n}",
+                    "TypeScript if block",
+                ),
+                (
+                    "for",
+                    "for (const ${1:item} of ${2:items}) {\n  $0\n}",
+                    "TypeScript loop",
+                ),
+                (
+                    "import",
+                    "import { ${1:name} } from '${2:module}';$0",
+                    "TypeScript import",
+                ),
+                ("console.log", "console.log($0);", "TypeScript log"),
+                ("return", "return $0;", "TypeScript return"),
+            ],
+            Some(JavaScript | JavaScriptReact) => &[
+                (
+                    "function",
+                    "function ${1:name}(${2}) {\n  $0\n}",
+                    "JavaScript function",
+                ),
+                ("const", "const ${1:name} = $0;", "JavaScript constant"),
+                ("let", "let ${1:name} = $0;", "JavaScript binding"),
+                ("class", "class ${1:Name} {\n  $0\n}", "JavaScript class"),
+                (
+                    "if",
+                    "if (${1:condition}) {\n  $0\n}",
+                    "JavaScript if block",
+                ),
+                (
+                    "for",
+                    "for (const ${1:item} of ${2:items}) {\n  $0\n}",
+                    "JavaScript loop",
+                ),
+                (
+                    "import",
+                    "import { ${1:name} } from '${2:module}';$0",
+                    "JavaScript import",
+                ),
+                ("console.log", "console.log($0);", "JavaScript log"),
+                ("return", "return $0;", "JavaScript return"),
+            ],
+            Some(C) => &[
+                ("if", "if (${1:condition}) {\n    $0\n}", "C if block"),
+                (
+                    "for",
+                    "for (${1:int i = 0}; ${2:i < count}; ${3:i++}) {\n    $0\n}",
+                    "C loop",
+                ),
+                (
+                    "while",
+                    "while (${1:condition}) {\n    $0\n}",
+                    "C while loop",
+                ),
+                ("struct", "struct ${1:Name} {\n    $0\n};", "C struct"),
+                ("include", "#include <$0>", "C include"),
+                ("return", "return $0;", "C return"),
+            ],
+            Some(Cpp) => &[
+                ("if", "if (${1:condition}) {\n    $0\n}", "C++ if block"),
+                (
+                    "for",
+                    "for (${1:auto &item} : ${2:items}) {\n    $0\n}",
+                    "C++ range loop",
+                ),
+                (
+                    "class",
+                    "class ${1:Name} {\npublic:\n    $0\n};",
+                    "C++ class",
+                ),
+                ("struct", "struct ${1:Name} {\n    $0\n};", "C++ struct"),
+                (
+                    "namespace",
+                    "namespace ${1:name} {\n    $0\n}",
+                    "C++ namespace",
+                ),
+                ("include", "#include <$0>", "C++ include"),
+                ("return", "return $0;", "C++ return"),
+            ],
+            Some(Css) => &[
+                ("display", "display: ${1:flex};", "CSS property"),
+                ("position", "position: ${1:relative};", "CSS property"),
+                ("color", "color: $0;", "CSS property"),
+                ("background", "background: $0;", "CSS property"),
+                ("margin", "margin: $0;", "CSS property"),
+                ("padding", "padding: $0;", "CSS property"),
+                ("align-items", "align-items: ${1:center};", "CSS property"),
+                (
+                    "justify-content",
+                    "justify-content: ${1:center};",
+                    "CSS property",
+                ),
+                (
+                    "grid-template-columns",
+                    "grid-template-columns: $0;",
+                    "CSS property",
+                ),
+            ],
+            Some(Json) => &[
+                ("property", "\"${1:key}\": $0", "JSON property"),
+                ("true", "true", "JSON boolean"),
+                ("false", "false", "JSON boolean"),
+                ("null", "null", "JSON null"),
+            ],
+            Some(Html) | None => &[],
+        }
+    }
+
+    /// Add fast, deterministic suggestions even while an LSP is installing or
+    /// indexing: language snippets plus identifiers already present in the file.
+    /// LSP items win on duplicate labels.
+    fn extend_with_local_completions(
+        &self,
+        items: &mut Vec<lsp::CompletionItem>,
+        anchor: CharOffset,
+        cursor: CharOffset,
+        prefix: &str,
+        ctx: &ViewContext<Self>,
+    ) {
+        let mut seen = items
+            .iter()
+            .map(|item| item.label.to_lowercase())
+            .collect::<HashSet<_>>();
+        let language = self.file_path().and_then(lsp::LanguageId::from_path);
+
+        for &(label, insert_text, detail) in Self::language_completion_templates(language) {
+            if seen.insert(label.to_lowercase()) {
+                items.push(lsp::CompletionItem {
+                    label: label.to_string(),
+                    insert_text: insert_text.to_string(),
+                    insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                    text_edit: None,
+                    detail: Some(detail.to_string()),
+                    kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+                    sort_text: Some(format!("~builtin-{label}")),
+                    filter_text: Some(label.to_string()),
+                });
+            }
+        }
+
+        if let Some(html_items) = self.html_tag_fallback_items(anchor, cursor, prefix, ctx) {
+            for item in html_items {
+                if seen.insert(item.label.to_lowercase()) {
+                    items.push(item);
+                }
+            }
+        }
+
+        if prefix.is_empty() {
+            return;
+        }
+
+        let text = self.editor().as_ref(ctx).text(ctx).into_string();
+        for identifier in text
+            .split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+            .filter(|word| word.chars().count() >= 2 && !word.chars().all(|ch| ch.is_numeric()))
+            .take(2000)
+        {
+            if seen.len() >= 400 {
+                break;
+            }
+            if seen.insert(identifier.to_lowercase()) {
+                items.push(lsp::CompletionItem {
+                    label: identifier.to_string(),
+                    insert_text: identifier.to_string(),
+                    insert_text_format: Some(lsp_types::InsertTextFormat::PLAIN_TEXT),
+                    text_edit: None,
+                    detail: Some("Current file".to_string()),
+                    kind: Some(lsp_types::CompletionItemKind::TEXT),
+                    sort_text: Some(format!("~~local-{identifier}")),
+                    filter_text: Some(identifier.to_string()),
+                });
+            }
+        }
+    }
+
     fn html_tag_fallback_items(
         &self,
         anchor: CharOffset,
@@ -1031,9 +1363,7 @@ impl LocalCodeEditorView {
         prefix: &str,
         ctx: &ViewContext<Self>,
     ) -> Option<Vec<lsp::CompletionItem>> {
-        if prefix.is_empty()
-            || self.file_path().and_then(lsp::LanguageId::from_path) != Some(lsp::LanguageId::Html)
-        {
+        if self.file_path().and_then(lsp::LanguageId::from_path) != Some(lsp::LanguageId::Html) {
             return None;
         }
 
@@ -1046,7 +1376,7 @@ impl LocalCodeEditorView {
         let after_cursor = editor.char_at(cursor, ctx);
         let safe_context = match before_anchor {
             None => true,
-            Some(ch) => ch.is_whitespace() || ch == '>' || ch == '/',
+            Some(ch) => ch.is_whitespace() || matches!(ch, '<' | '>' | '/'),
         } && !after_cursor
             .is_some_and(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_');
         if !safe_context {
@@ -1135,6 +1465,10 @@ impl LocalCodeEditorView {
     /// Close the completion popup (if any) and stop the editor from intercepting
     /// navigation keys. Returns whether anything was dismissed.
     pub(super) fn dismiss_completion(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        if let Some(handle) = self.completion_request_handle.take() {
+            handle.abort();
+        }
+        self.completion_request_generation = self.completion_request_generation.wrapping_add(1);
         if self.lsp_completion_state.clear() {
             self.set_editor_completion_active(false, ctx);
             ctx.notify();
@@ -1440,29 +1774,5 @@ impl LocalCodeEditorView {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::LocalCodeEditorView;
-    use string_offset::CharOffset;
-
-    #[test]
-    fn completion_range_extends_stale_server_edit_to_live_prefix() {
-        let range = LocalCodeEditorView::completion_replacement_range(
-            Some(CharOffset::from(0)..CharOffset::from(3)),
-            CharOffset::from(0),
-            CharOffset::from(4),
-        );
-
-        assert_eq!(range, CharOffset::from(0)..CharOffset::from(4));
-    }
-
-    #[test]
-    fn completion_range_uses_live_prefix_for_empty_cursor_edit() {
-        let range = LocalCodeEditorView::completion_replacement_range(
-            Some(CharOffset::from(4)..CharOffset::from(4)),
-            CharOffset::from(0),
-            CharOffset::from(4),
-        );
-
-        assert_eq!(range, CharOffset::from(0)..CharOffset::from(4));
-    }
-}
+#[path = "language_server_extension_tests.rs"]
+mod tests;

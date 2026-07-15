@@ -86,6 +86,15 @@ const FLOW_KEY_INTERVAL: Duration = Duration::from_millis(180);
 const FLOW_SETTLE_PERIOD: Duration = Duration::from_millis(2500);
 const FLOW_STREAK_THRESHOLD: u8 = 8;
 
+fn should_run_autosave(
+    scheduled_version: ContentVersion,
+    current_version: ContentVersion,
+    has_unsaved_changes: bool,
+    has_version_conflicts: bool,
+) -> bool {
+    scheduled_version == current_version && has_unsaved_changes && !has_version_conflicts
+}
+
 use warp_core::send_telemetry_from_ctx;
 
 use super::diff_viewer::DiffViewer;
@@ -265,7 +274,7 @@ impl LspHoverState {
 /// State for the LSP completion popup (classic, non-AI autocomplete).
 pub(super) enum LspCompletionState {
     None,
-    Loading(Option<AbortHandle>),
+    Loading,
     Active {
         /// All candidates returned by the server (kept in server/sort order).
         items: Vec<lsp::CompletionItem>,
@@ -285,14 +294,11 @@ pub(super) enum LspCompletionState {
 }
 
 impl LspCompletionState {
-    /// Clears the state, aborting any in-flight request. Returns whether
-    /// anything was cleared (so callers can decide to `notify`).
+    /// Clears the visible state. The owning editor aborts any in-flight request
+    /// before calling this. Returns whether anything was cleared.
     pub(super) fn clear(&mut self) -> bool {
         if matches!(self, LspCompletionState::None) {
             return false;
-        }
-        if let Self::Loading(Some(handle)) = self {
-            handle.abort();
         }
         *self = LspCompletionState::None;
         true
@@ -340,6 +346,11 @@ pub struct LocalCodeEditorView {
     pub(super) lsp_hover_state: LspHoverState,
     /// State for the LSP completion popup (classic, non-AI autocomplete).
     pub(super) lsp_completion_state: LspCompletionState,
+    /// Monotonically increasing ID used to ignore completion responses for an
+    /// older cursor/prefix after the user has already typed something else.
+    pub(super) completion_request_generation: u64,
+    /// The one in-flight completion request. Starting a newer request aborts it.
+    pub(super) completion_request_handle: Option<AbortHandle>,
     /// Pending scroll position to apply after the file is loaded. This is used when
     /// `set_pending_scroll` is called before the file content has finished loading
     /// (e.g., in the GlobalBuffer path where content loads asynchronously).
@@ -399,11 +410,13 @@ impl LocalCodeEditorView {
                     // language trigger char (`.`, `<`, ...) or while typing an
                     // identifier, keeps the popup filtered as the user types, and
                     // dismisses it when the context no longer applies.
-                    if me.is_lsp_server_available(ctx) {
-                        me.handle_completion_trigger(ctx);
-                    }
+                    me.handle_completion_trigger(ctx);
 
                     me.schedule_autosave(ctx);
+                } else {
+                    // A file-watcher reload (for example `git restore`) must
+                    // invalidate a timer created for the previous disk state.
+                    me.cancel_autosave();
                 }
             }
             CodeEditorEvent::VimEscapeInNormalMode => {
@@ -564,6 +577,8 @@ impl LocalCodeEditorView {
             hover_debounce_tx,
             lsp_hover_state: LspHoverState::None,
             lsp_completion_state: LspCompletionState::None,
+            completion_request_generation: 0,
+            completion_request_handle: None,
             pending_scroll_on_load: None,
             processed_diagnostics: Vec::new(),
             diagnostic_decorations: Vec::new(),
@@ -600,18 +615,27 @@ impl LocalCodeEditorView {
             return;
         }
 
+        let scheduled_version = self.editor.as_ref(ctx).version(ctx);
+
         let handle = ctx.spawn(
             async move {
                 Timer::after(Duration::from_millis(700)).await;
             },
-            |me, _, ctx| {
+            move |me, _, ctx| {
                 me.autosave_handle = None;
 
-                if !me.autosave_enabled(ctx) || me.has_version_conflicts(ctx) {
+                if !me.autosave_enabled(ctx)
+                    || !should_run_autosave(
+                        scheduled_version,
+                        me.editor.as_ref(ctx).version(ctx),
+                        me.has_unsaved_changes(ctx),
+                        me.has_version_conflicts(ctx),
+                    )
+                {
                     return;
                 }
 
-                if let Err(ImmediateSaveError::FailedToSave(err)) = me.save_local(ctx) {
+                if let Err(ImmediateSaveError::FailedToSave(err)) = me.autosave_local(ctx) {
                     log::error!("Autosave failed: {err:?}");
                     ctx.emit(LocalCodeEditorEvent::FailedToSave {
                         error: Rc::new(err),
@@ -620,6 +644,22 @@ impl LocalCodeEditorView {
             },
         );
         self.autosave_handle = Some(handle);
+    }
+
+    /// Autosave only persists the current buffer. Formatting is intentionally
+    /// reserved for an explicit save: formatter edits are user-visible changes,
+    /// create undo entries, and used to re-arm autosave in a loop.
+    fn autosave_local(&mut self, ctx: &mut ViewContext<Self>) -> Result<(), ImmediateSaveError> {
+        if self.is_remote_disconnected(ctx) {
+            return Err(ImmediateSaveError::RemoteDisconnected);
+        }
+
+        let Some(file_id) = self.file_id() else {
+            return Err(ImmediateSaveError::NoFileId);
+        };
+
+        self.perform_save(file_id, ctx);
+        Ok(())
     }
 
     fn register_flow_keystroke(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1745,6 +1785,7 @@ impl LocalCodeEditorView {
                 GlobalBufferModelEvent::BufferLoaded {
                     content_version, ..
                 } => {
+                    me.cancel_autosave();
                     // For a reopen (discard), base_content_version is already
                     // set from the initial load. Accept the new version and
                     // clear any conflict flag.
@@ -1772,6 +1813,7 @@ impl LocalCodeEditorView {
                     content_version,
                     ..
                 } => {
+                    me.cancel_autosave();
                     if !*success {
                         ctx.notify();
                     } else {
@@ -1789,6 +1831,7 @@ impl LocalCodeEditorView {
                     });
                 }
                 GlobalBufferModelEvent::RemoteBufferConflict { .. } => {
+                    me.cancel_autosave();
                     me.has_remote_conflict = true;
                     ctx.notify();
                 }
@@ -2856,3 +2899,7 @@ impl ShowFindReferencesCardProvider for ShowFindReferencesCard {
         upper_right_in || lower_left_in
     }
 }
+
+#[cfg(test)]
+#[path = "local_code_editor_tests.rs"]
+mod tests;

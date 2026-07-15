@@ -16,8 +16,8 @@ use vec1::{vec1, Vec1};
 use vim::vim::{Direction, InsertPosition, VimMode, VimModel, VimState, VimSubscriber};
 use warp_core::platform::SessionPlatform;
 use warp_editor::content::buffer::{
-    Buffer, BufferEditAction, EditOrigin, InitialBufferState, ToBufferCharOffset as _,
-    ToBufferPoint,
+    AutoScrollBehavior, Buffer, BufferEditAction, EditOrigin, InitialBufferState, SelectionOffsets,
+    ToBufferCharOffset as _, ToBufferPoint,
 };
 use warp_editor::content::text::IndentUnit;
 use warp_editor::content::version::BufferVersion;
@@ -1738,6 +1738,21 @@ impl CodeEditorView {
         let offset = point.to_buffer_char_offset(self.model.as_ref(ctx).content().as_ref(ctx));
         self.model.update(ctx, |model, ctx| {
             model.cursor_at(offset, ctx);
+        });
+    }
+
+    /// Select a buffer range directly. Used by snippet completion so the first
+    /// placeholder is ready to be replaced by the user's next keystroke.
+    pub fn select_char_offset_range(&self, range: Range<CharOffset>, ctx: &mut ViewContext<Self>) {
+        self.model.update(ctx, |model, ctx| {
+            model.vim_set_selections(
+                Vec1::new(SelectionOffsets {
+                    head: range.end,
+                    tail: range.start,
+                }),
+                AutoScrollBehavior::Selection,
+                ctx,
+            );
         });
     }
 
