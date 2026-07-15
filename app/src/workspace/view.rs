@@ -1062,6 +1062,7 @@ pub struct Workspace {
     local_ai_panel: ViewHandle<LocalAiChatView>,
     genesi_vibe_mode: bool,
     genesi_tools_panel_open: bool,
+    genesi_canvas_open: bool,
     // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
     // sidebar's "New Chat" button. These MUST live in the view (not be
     // `MouseStateHandle::default()` rebuilt each render): a button tracks the
@@ -3350,6 +3351,7 @@ impl Workspace {
             working_directories_model,
             genesi_vibe_mode: false,
             genesi_tools_panel_open: false,
+            genesi_canvas_open: false,
             genesi_vibe_button_mouse_state: Default::default(),
             genesi_ide_button_mouse_state: Default::default(),
             genesi_new_chat_button_mouse_state: Default::default(),
@@ -21339,7 +21341,7 @@ impl Workspace {
                 WorkspaceAction::OpenGenesiCanvasTool,
                 "Project Canvas".to_owned(),
                 None,
-                self.genesi_tools_panel_open,
+                self.genesi_canvas_open,
                 false,
             )
             .finish(),
@@ -22198,6 +22200,16 @@ impl Workspace {
         terminal_view: Box<dyn Element>,
         hide_vertical_tabs: bool,
     ) -> Box<dyn Element> {
+        if self.genesi_canvas_open {
+            let appearance = Appearance::as_ref(app);
+            return self.wrap_in_main_surface(
+                appearance,
+                self.local_ai_panel
+                    .as_ref(app)
+                    .render_project_canvas_workspace(appearance),
+            );
+        }
+
         if self.genesi_vibe_mode {
             return self.render_genesi_vibe_layout(app);
         }
@@ -24355,16 +24367,19 @@ impl TypedActionView for Workspace {
                 );
             }
             ToggleLocalAi => {
+                self.genesi_canvas_open = false;
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
                 self.toggle_local_ai_panel(ctx);
             }
             ToggleGenesiToolsPanel => {
+                self.genesi_canvas_open = false;
                 self.genesi_tools_panel_open = !self.genesi_tools_panel_open;
                 ctx.notify();
             }
             OpenGenesiReviewTool => {
+                self.genesi_canvas_open = false;
                 self.genesi_tools_panel_open = true;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.open_review_tool(ctx));
@@ -24389,23 +24404,63 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             OpenGenesiCanvasTool => {
+                if self.genesi_canvas_open {
+                    self.genesi_canvas_open = false;
+                    ctx.notify();
+                    return;
+                }
                 let project_root = self.focused_project_root(ctx);
-                self.genesi_tools_panel_open = true;
+                self.genesi_canvas_open = true;
+                self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.open_project_canvas(project_root, ctx)
                 });
                 ctx.notify();
             }
+            CloseGenesiCanvas => {
+                self.genesi_canvas_open = false;
+                ctx.notify();
+            }
             RefreshGenesiCanvas => {
                 let project_root = self.focused_project_root(ctx);
-                self.genesi_tools_panel_open = true;
+                self.genesi_canvas_open = true;
+                self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.refresh_project_canvas(project_root, ctx)
                 });
                 ctx.notify();
             }
+            AutoArrangeGenesiCanvas => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.auto_arrange_project_canvas(ctx));
+            }
+            FitGenesiCanvas => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.fit_project_canvas(ctx));
+            }
+            ZoomGenesiCanvas(delta) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.zoom_project_canvas(*delta, ctx));
+            }
+            PanGenesiCanvas(delta) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.pan_project_canvas(*delta, ctx));
+            }
+            BeginGenesiCanvasDrag { node_id, pointer } => {
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.begin_project_canvas_drag(node_id.clone(), *pointer, ctx)
+                });
+            }
+            UpdateGenesiCanvasDrag(pointer) => {
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.update_project_canvas_drag(*pointer, ctx)
+                });
+            }
+            EndGenesiCanvasDrag => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.end_project_canvas_drag(ctx));
+            }
             SelectGenesiCanvasNode(id) => {
-                self.genesi_tools_panel_open = true;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.select_project_canvas_node(id, ctx));
                 ctx.notify();

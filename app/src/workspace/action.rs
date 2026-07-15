@@ -313,7 +313,18 @@ pub enum WorkspaceAction {
     OpenGenesiFilesTool,
     OpenGenesiTerminalTool,
     OpenGenesiCanvasTool,
+    CloseGenesiCanvas,
     RefreshGenesiCanvas,
+    AutoArrangeGenesiCanvas,
+    FitGenesiCanvas,
+    ZoomGenesiCanvas(f32),
+    PanGenesiCanvas(Vector2F),
+    BeginGenesiCanvasDrag {
+        node_id: Option<String>,
+        pointer: Vector2F,
+    },
+    UpdateGenesiCanvasDrag(Vector2F),
+    EndGenesiCanvasDrag,
     SelectGenesiCanvasNode(String),
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
@@ -1000,7 +1011,15 @@ impl WorkspaceAction {
             | OpenGenesiFilesTool
             | OpenGenesiTerminalTool
             | OpenGenesiCanvasTool
+            | CloseGenesiCanvas
             | RefreshGenesiCanvas
+            | AutoArrangeGenesiCanvas
+            | FitGenesiCanvas
+            | ZoomGenesiCanvas(_)
+            | PanGenesiCanvas(_)
+            | BeginGenesiCanvasDrag { .. }
+            | UpdateGenesiCanvasDrag(_)
+            | EndGenesiCanvasDrag
             | SelectGenesiCanvasNode(_)
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits

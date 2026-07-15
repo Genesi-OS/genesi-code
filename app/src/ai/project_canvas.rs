@@ -52,7 +52,7 @@ impl ProjectKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanvasNodeKind {
     Page,
     Router,

@@ -7,6 +7,7 @@
 //! story lives in one place: no account, no cloud.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,14 +17,19 @@ use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, Form
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, ChangeTag, TextDiff};
+use warp_core::ui::color::blend::Blend;
+use warp_core::ui::icons::Icon as CoreIcon;
+use warp_core::ui::theme::Fill as ThemeFill;
 use warpui::clipboard::ClipboardContent;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Fill, Flex,
-    FormattedTextElement, Icon, MainAxisAlignment, MainAxisSize, ParentElement, Radius,
-    ScrollbarWidth, SelectableArea, SelectionHandle, Shrinkable,
+    Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler,
+    Expanded, Fill, Flex, FormattedTextElement, Icon, MainAxisAlignment, MainAxisSize,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth,
+    SelectableArea, SelectionHandle, Shrinkable, Stack,
 };
+use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::keymap::FixedBinding;
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
@@ -43,6 +49,10 @@ use super::local_chat::{
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
+};
+use super::project_canvas_view::{
+    ProjectGraphCanvas, ProjectGraphColors, ProjectGraphMinimap, ProjectGraphNodeElement,
+    FORGE_NODE_HEIGHT, FORGE_NODE_WIDTH,
 };
 use crate::appearance::Appearance;
 use crate::code::local_code_editor::LocalCodeEditorView;
@@ -248,6 +258,19 @@ enum ProjectCanvasState {
     Loading(PathBuf),
     Ready(ProjectCanvasGraph),
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+enum ProjectCanvasDragState {
+    Pan {
+        pointer: Vector2F,
+        pan: Vector2F,
+    },
+    Node {
+        id: String,
+        pointer: Vector2F,
+        position: Vector2F,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -495,6 +518,12 @@ pub struct LocalAiChatView {
     project_canvas_state: ProjectCanvasState,
     project_canvas_generation: u64,
     selected_canvas_node: Option<String>,
+    project_canvas_positions: HashMap<String, Vector2F>,
+    project_canvas_pan: Vector2F,
+    project_canvas_zoom: f32,
+    project_canvas_drag: Option<ProjectCanvasDragState>,
+    project_canvas_palette_scroll: ClippedScrollStateHandle,
+    project_canvas_inspector_scroll: ClippedScrollStateHandle,
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -554,6 +583,12 @@ impl LocalAiChatView {
             project_canvas_state: ProjectCanvasState::NoProject,
             project_canvas_generation: 0,
             selected_canvas_node: None,
+            project_canvas_positions: HashMap::new(),
+            project_canvas_pan: vec2f(42., 42.),
+            project_canvas_zoom: 1.,
+            project_canvas_drag: None,
+            project_canvas_palette_scroll: ClippedScrollStateHandle::default(),
+            project_canvas_inspector_scroll: ClippedScrollStateHandle::default(),
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -1623,6 +1658,1075 @@ impl LocalAiChatView {
             .finish()
     }
 
+    fn project_graph_colors(&self, appearance: &Appearance) -> ProjectGraphColors {
+        let theme = appearance.theme();
+        ProjectGraphColors {
+            background: theme.background().into(),
+            grid: theme.outline().with_opacity(72).into(),
+            page: theme.terminal_colors().normal.blue.into(),
+            router: theme.terminal_colors().normal.magenta.into(),
+            endpoint: theme.terminal_colors().normal.green.into(),
+        }
+    }
+
+    fn canvas_node_icon(kind: CanvasNodeKind) -> CoreIcon {
+        match kind {
+            CanvasNodeKind::Page => CoreIcon::LayoutAlt01,
+            CanvasNodeKind::Router => CoreIcon::Dataflow04,
+            CanvasNodeKind::Endpoint => CoreIcon::Globe,
+        }
+    }
+
+    fn render_forge_canvas_node(
+        &self,
+        appearance: &Appearance,
+        node: &CanvasNode,
+        selected: bool,
+        zoom: f32,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent = self.canvas_node_accent(appearance, node.kind);
+        let background = theme
+            .surface_1()
+            .blend(&ThemeFill::Solid(accent).with_opacity(if selected { 34 } else { 14 }));
+        let icon_background = theme
+            .surface_1()
+            .blend(&ThemeFill::Solid(accent).with_opacity(44));
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let title = self.label_text(
+            appearance,
+            node.title.clone(),
+            (14. * zoom).clamp(10., 17.),
+            theme.main_text_color(theme.background()).into(),
+            false,
+        );
+        let icon = ConstrainedBox::new(
+            Container::new(
+                Self::canvas_node_icon(node.kind)
+                    .to_warpui_icon(ThemeFill::Solid(accent))
+                    .finish(),
+            )
+            .with_uniform_padding((7. * zoom).clamp(5., 9.))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9. * zoom)))
+            .with_background(icon_background)
+            .with_border(
+                Border::all(1.).with_border_fill(ThemeFill::Solid(accent).with_opacity(36)),
+            )
+            .finish(),
+        )
+        .with_width(32. * zoom)
+        .with_height(32. * zoom)
+        .finish();
+        let detail = match node.kind {
+            CanvasNodeKind::Page => node
+                .estimated_load_ms
+                .map(|load| format!("~{load} ms estimated load"))
+                .unwrap_or_else(|| "Frontend page".to_string()),
+            CanvasNodeKind::Router => {
+                format!("{} route handlers", self.canvas_connection_count(node))
+            }
+            CanvasNodeKind::Endpoint => format!(
+                "{} request · {}",
+                node.method.as_deref().unwrap_or("ANY"),
+                node.source.display()
+            ),
+        };
+        let status = match node.kind {
+            CanvasNodeKind::Page => "Page",
+            CanvasNodeKind::Router => "Router",
+            CanvasNodeKind::Endpoint => node.method.as_deref().unwrap_or("Endpoint"),
+        };
+        let content = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(icon)
+                    .with_child(
+                        Container::new(Expanded::new(1., title).finish())
+                            .with_margin_left(10. * zoom)
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            ConstrainedBox::new(
+                                Container::new(Empty::new().finish())
+                                    .with_background_color(accent)
+                                    .with_corner_radius(CornerRadius::with_all(Radius::Percentage(
+                                        50.,
+                                    )))
+                                    .finish(),
+                            )
+                            .with_width(5. * zoom)
+                            .with_height(5. * zoom)
+                            .finish(),
+                        )
+                        .with_child(
+                            Container::new(self.label_text(
+                                appearance,
+                                detail,
+                                (11. * zoom).clamp(8., 13.),
+                                muted,
+                                false,
+                            ))
+                            .with_margin_left(7. * zoom)
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_margin_top(9. * zoom)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    status.to_string(),
+                    (10. * zoom).clamp(8., 12.),
+                    accent,
+                    false,
+                ))
+                .with_margin_top(8. * zoom)
+                .with_uniform_padding(4. * zoom)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7. * zoom)))
+                .with_background(
+                    theme
+                        .surface_1()
+                        .blend(&ThemeFill::Solid(accent).with_opacity(34)),
+                )
+                .finish(),
+            )
+            .finish();
+
+        ConstrainedBox::new(
+            Container::new(content)
+                .with_uniform_padding(14. * zoom)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14. * zoom)))
+                .with_background(background)
+                .with_border(
+                    Border::all(if selected { 2. } else { 1.5 }).with_border_fill(
+                        ThemeFill::Solid(accent).with_opacity(if selected { 90 } else { 50 }),
+                    ),
+                )
+                .finish(),
+        )
+        .with_width(FORGE_NODE_WIDTH * zoom)
+        .with_height(FORGE_NODE_HEIGHT * zoom)
+        .finish()
+    }
+
+    fn canvas_connection_count(&self, node: &CanvasNode) -> usize {
+        match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) => graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node.id || edge.to == node.id)
+                .count(),
+            _ => 0,
+        }
+    }
+
+    fn render_canvas_palette_item(
+        &self,
+        appearance: &Appearance,
+        node: &CanvasNode,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent = self.canvas_node_accent(appearance, node.kind);
+        let selected = self.selected_canvas_node.as_deref() == Some(node.id.as_str());
+        let subtitle = match node.kind {
+            CanvasNodeKind::Endpoint => node.method.as_deref().unwrap_or("ANY").to_string(),
+            _ => node.kind.label().to_string(),
+        };
+        let action = WorkspaceAction::SelectGenesiCanvasNode(node.id.clone());
+        EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        ConstrainedBox::new(
+                            Container::new(
+                                Self::canvas_node_icon(node.kind)
+                                    .to_warpui_icon(ThemeFill::Solid(accent))
+                                    .finish(),
+                            )
+                            .with_uniform_padding(6.)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+                            .with_background(
+                                theme
+                                    .surface_1()
+                                    .blend(&ThemeFill::Solid(accent).with_opacity(42)),
+                            )
+                            .finish(),
+                        )
+                        .with_width(28.)
+                        .with_height(28.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(
+                            Flex::column()
+                                .with_child(self.label_text(
+                                    appearance,
+                                    node.title.clone(),
+                                    12.,
+                                    theme.main_text_color(theme.background()).into(),
+                                    false,
+                                ))
+                                .with_child(self.label_text(
+                                    appearance,
+                                    subtitle,
+                                    9.,
+                                    theme.disabled_text_color(theme.background()).into(),
+                                    false,
+                                ))
+                                .finish(),
+                        )
+                        .with_margin_left(9.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_uniform_padding(8.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_background(if selected {
+                theme
+                    .surface_1()
+                    .blend(&ThemeFill::Solid(accent).with_opacity(30))
+            } else {
+                theme.surface_1()
+            })
+            .with_border(Border::all(1.).with_border_fill(if selected {
+                ThemeFill::Solid(accent).with_opacity(63)
+            } else {
+                theme.outline()
+            }))
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    fn render_project_canvas_palette(
+        &self,
+        appearance: &Appearance,
+        graph: &ProjectCanvasGraph,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut nodes = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for (kind, section) in [
+            (CanvasNodeKind::Page, "FRONTEND PAGES"),
+            (CanvasNodeKind::Router, "BACKEND ROUTERS"),
+            (CanvasNodeKind::Endpoint, "API ENDPOINTS"),
+        ] {
+            let section_nodes = graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == kind)
+                .collect::<Vec<_>>();
+            if section_nodes.is_empty() {
+                continue;
+            }
+            nodes.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    section.to_string(),
+                    9.,
+                    theme.disabled_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_margin_top(12.)
+                .with_margin_bottom(5.)
+                .finish(),
+            );
+            for node in section_nodes {
+                nodes.add_child(
+                    Container::new(self.render_canvas_palette_item(appearance, node))
+                        .with_margin_bottom(6.)
+                        .finish(),
+                );
+            }
+        }
+
+        Container::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    "Nodes".to_string(),
+                    16.,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        "Explore the architecture discovered from source".to_string(),
+                        11.,
+                        theme.disabled_text_color(theme.background()).into(),
+                        true,
+                    ))
+                    .with_margin_top(4.)
+                    .finish(),
+                )
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        ClippedScrollable::vertical(
+                            self.project_canvas_palette_scroll.clone(),
+                            nodes.finish(),
+                            ScrollbarWidth::Auto,
+                            theme.disabled_ui_text_color().into(),
+                            theme.active_ui_text_color().into(),
+                            Fill::None,
+                        )
+                        .finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(self.workspace_chip(
+                        appearance,
+                        "Auto-arrange".to_string(),
+                        None,
+                        WorkspaceAction::AutoArrangeGenesiCanvas,
+                        false,
+                    ))
+                    .with_margin_top(8.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(14.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_canvas_inspector_field(
+        &self,
+        appearance: &Appearance,
+        label: &str,
+        value: String,
+        monospace: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let value = if monospace {
+            self.mono_text(
+                appearance,
+                value,
+                12.,
+                theme.main_text_color(theme.background()).into(),
+                true,
+            )
+        } else {
+            self.label_text(
+                appearance,
+                value,
+                12.,
+                theme.main_text_color(theme.background()).into(),
+                true,
+            )
+        };
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.label_text(
+                appearance,
+                label.to_string(),
+                11.,
+                theme.disabled_text_color(theme.background()).into(),
+                false,
+            ))
+            .with_child(
+                Container::new(value)
+                    .with_uniform_padding(10.)
+                    .with_margin_top(6.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_background(theme.background())
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .finish(),
+            )
+            .finish()
+    }
+
+    fn render_project_canvas_inspector(
+        &self,
+        appearance: &Appearance,
+        graph: &ProjectCanvasGraph,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let selected = self
+            .selected_canvas_node
+            .as_deref()
+            .and_then(|id| graph.node(id));
+        let mut content = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        if let Some(node) = selected {
+            let accent = self.canvas_node_accent(appearance, node.kind);
+            content.add_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        ConstrainedBox::new(
+                            Container::new(
+                                Self::canvas_node_icon(node.kind)
+                                    .to_warpui_icon(ThemeFill::Solid(accent))
+                                    .finish(),
+                            )
+                            .with_uniform_padding(8.)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                            .with_background(
+                                theme
+                                    .surface_1()
+                                    .blend(&ThemeFill::Solid(accent).with_opacity(42)),
+                            )
+                            .finish(),
+                        )
+                        .with_width(36.)
+                        .with_height(36.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(
+                            Flex::column()
+                                .with_child(self.label_text(
+                                    appearance,
+                                    node.title.clone(),
+                                    16.,
+                                    theme.main_text_color(theme.background()).into(),
+                                    false,
+                                ))
+                                .with_child(self.label_text(
+                                    appearance,
+                                    format!(
+                                        "Configure this {} node",
+                                        node.kind.label().to_lowercase()
+                                    ),
+                                    11.,
+                                    theme.disabled_text_color(theme.background()).into(),
+                                    false,
+                                ))
+                                .finish(),
+                        )
+                        .with_margin_left(10.)
+                        .finish(),
+                    )
+                    .finish(),
+            );
+            content.add_child(
+                Container::new(
+                    Flex::row()
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceEvenly)
+                        .with_child(self.label_text(
+                            appearance,
+                            "Config".to_string(),
+                            12.,
+                            accent,
+                            false,
+                        ))
+                        .with_child(self.label_text(
+                            appearance,
+                            "Source".to_string(),
+                            12.,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                )
+                .with_padding_top(14.)
+                .with_padding_bottom(10.)
+                .with_margin_top(8.)
+                .with_border(Border::bottom(2.).with_border_color(accent))
+                .finish(),
+            );
+
+            if let Some(route) = &node.route {
+                content.add_child(
+                    Container::new(self.render_canvas_inspector_field(
+                        appearance,
+                        "Route",
+                        route.clone(),
+                        true,
+                    ))
+                    .with_margin_top(14.)
+                    .finish(),
+                );
+            }
+            if let Some(method) = &node.method {
+                content.add_child(
+                    Container::new(self.render_canvas_inspector_field(
+                        appearance,
+                        "HTTP method",
+                        method.clone(),
+                        true,
+                    ))
+                    .with_margin_top(12.)
+                    .finish(),
+                );
+            }
+            content.add_child(
+                Container::new(self.render_canvas_inspector_field(
+                    appearance,
+                    "Source location",
+                    format!("{}:{}", node.source.display(), node.line),
+                    true,
+                ))
+                .with_margin_top(12.)
+                .finish(),
+            );
+            if let Some(load) = node.estimated_load_ms {
+                content.add_child(
+                    Container::new(self.render_canvas_inspector_field(
+                        appearance,
+                        "Estimated load",
+                        format!("~{load} ms · static estimate"),
+                        false,
+                    ))
+                    .with_margin_top(12.)
+                    .finish(),
+                );
+            }
+            if let Some(body) = &node.request_body {
+                content.add_child(
+                    Container::new(self.render_canvas_inspector_field(
+                        appearance,
+                        "Required request body",
+                        body.clone(),
+                        true,
+                    ))
+                    .with_margin_top(12.)
+                    .finish(),
+                );
+            }
+            let dependencies = if node.dependencies.is_empty() {
+                "No direct imports detected".to_string()
+            } else {
+                node.dependencies.join("\n")
+            };
+            content.add_child(
+                Container::new(self.render_canvas_inspector_field(
+                    appearance,
+                    "Dependencies",
+                    dependencies,
+                    true,
+                ))
+                .with_margin_top(12.)
+                .finish(),
+            );
+
+            let connections = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node.id || edge.to == node.id)
+                .collect::<Vec<_>>();
+            if !connections.is_empty() {
+                content.add_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        "Connections".to_string(),
+                        11.,
+                        theme.disabled_text_color(theme.background()).into(),
+                        false,
+                    ))
+                    .with_margin_top(14.)
+                    .with_margin_bottom(6.)
+                    .finish(),
+                );
+                for edge in connections {
+                    let target_id = if edge.from == node.id {
+                        edge.to.clone()
+                    } else {
+                        edge.from.clone()
+                    };
+                    let target_title = graph
+                        .node(&target_id)
+                        .map(|target| target.title.clone())
+                        .unwrap_or(target_id.clone());
+                    content.add_child(
+                        Container::new(self.workspace_chip(
+                            appearance,
+                            format!("{}  ·  {target_title}", edge.kind.label()),
+                            None,
+                            WorkspaceAction::SelectGenesiCanvasNode(target_id),
+                            false,
+                        ))
+                        .with_margin_bottom(6.)
+                        .finish(),
+                    );
+                }
+            }
+        } else {
+            content.add_child(self.render_canvas_message(
+                appearance,
+                "No node selected",
+                "Select a page, router, or endpoint to inspect its configuration.",
+            ));
+        }
+
+        Container::new(
+            ClippedScrollable::vertical(
+                self.project_canvas_inspector_scroll.clone(),
+                Container::new(content.finish())
+                    .with_uniform_padding(14.)
+                    .finish(),
+                ScrollbarWidth::Auto,
+                theme.disabled_ui_text_color().into(),
+                theme.active_ui_text_color().into(),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_project_graph_surface(
+        &self,
+        appearance: &Appearance,
+        graph: &ProjectCanvasGraph,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let colors = self.project_graph_colors(appearance);
+        let nodes = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let position = self.project_canvas_positions.get(&node.id).copied()?;
+                Some(ProjectGraphNodeElement::new(
+                    node.id.clone(),
+                    position,
+                    self.render_forge_canvas_node(
+                        appearance,
+                        node,
+                        self.selected_canvas_node.as_deref() == Some(node.id.as_str()),
+                        self.project_canvas_zoom,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let canvas = ProjectGraphCanvas::new(
+            graph.clone(),
+            nodes,
+            self.project_canvas_pan,
+            self.project_canvas_zoom,
+            self.project_canvas_drag.is_some(),
+            colors,
+        )
+        .finish();
+        let minimap = Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    "Canvas Mini-map".to_string(),
+                    10.,
+                    theme.disabled_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            ProjectGraphMinimap::new(
+                                graph.clone(),
+                                self.project_canvas_positions.clone(),
+                                colors,
+                            )
+                            .finish(),
+                        )
+                        .with_width(168.)
+                        .with_height(86.)
+                        .finish(),
+                    )
+                    .with_margin_top(6.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(10.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish();
+        let zoom_controls = Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.workspace_chip(
+                    appearance,
+                    "Fit".to_string(),
+                    None,
+                    WorkspaceAction::FitGenesiCanvas,
+                    false,
+                ))
+                .with_child(
+                    Container::new(self.workspace_chip(
+                        appearance,
+                        "+".to_string(),
+                        None,
+                        WorkspaceAction::ZoomGenesiCanvas(0.1),
+                        false,
+                    ))
+                    .with_margin_top(6.)
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(self.workspace_chip(
+                        appearance,
+                        "−".to_string(),
+                        None,
+                        WorkspaceAction::ZoomGenesiCanvas(-0.1),
+                        false,
+                    ))
+                    .with_margin_top(6.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .finish();
+
+        let mut stack = Stack::new();
+        stack.add_child(canvas);
+        stack.add_positioned_child(
+            minimap,
+            OffsetPositioning::offset_from_parent(
+                vec2f(16., -16.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomLeft,
+                ChildAnchor::BottomLeft,
+            ),
+        );
+        stack.add_positioned_child(
+            zoom_controls,
+            OffsetPositioning::offset_from_parent(
+                vec2f(-16., -16.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomRight,
+                ChildAnchor::BottomRight,
+            ),
+        );
+
+        Container::new(Clipped::new(stack.finish()).finish())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .with_background(theme.background())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .finish()
+    }
+
+    fn render_project_canvas_header(
+        &self,
+        appearance: &Appearance,
+        graph: Option<&ProjectCanvasGraph>,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let project_name = graph
+            .map(|graph| graph.project_name.clone())
+            .unwrap_or_else(|| "Project".to_string());
+        let subtitle = graph
+            .map(|graph| {
+                format!(
+                    "Visual architecture of {project_name} · {}",
+                    graph.kind.label()
+                )
+            })
+            .unwrap_or_else(|| "Visual architecture from project source".to_string());
+        let project_summary = graph
+            .map(|graph| {
+                let stacks = if graph.stacks.is_empty() {
+                    "Source detected".to_string()
+                } else {
+                    graph.stacks.join(" · ")
+                };
+                format!("{project_name}  ·  {stacks}")
+            })
+            .unwrap_or(project_name);
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ConstrainedBox::new(
+                    Container::new(
+                        CoreIcon::Lightning
+                            .to_warpui_icon(ThemeFill::Solid(
+                                theme.terminal_colors().normal.green.into(),
+                            ))
+                            .finish(),
+                    )
+                    .with_uniform_padding(8.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                    .with_background(
+                        theme.surface_1().blend(
+                            &ThemeFill::Solid(theme.terminal_colors().normal.green.into())
+                                .with_opacity(42),
+                        ),
+                    )
+                    .finish(),
+                )
+                .with_width(34.)
+                .with_height(34.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_child(self.label_text(
+                            appearance,
+                            "Project Canvas".to_string(),
+                            18.,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .with_child(self.label_text(
+                            appearance,
+                            subtitle,
+                            11.,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                )
+                .with_margin_left(12.)
+                .finish(),
+            )
+            .with_child(Expanded::new(1., Empty::new().finish()).finish())
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    project_summary,
+                    12.,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_uniform_padding(10.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_background(theme.surface_1())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Auto-arrange".to_string(),
+                    None,
+                    WorkspaceAction::AutoArrangeGenesiCanvas,
+                    false,
+                ))
+                .with_margin_left(10.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Refresh".to_string(),
+                    None,
+                    WorkspaceAction::RefreshGenesiCanvas,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Close".to_string(),
+                    None,
+                    WorkspaceAction::CloseGenesiCanvas,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .finish()
+    }
+
+    pub fn render_project_canvas_workspace(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let graph = match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) => Some(graph),
+            _ => None,
+        };
+        let mut root = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(self.render_project_canvas_header(appearance, graph))
+                    .with_padding_left(16.)
+                    .with_padding_right(16.)
+                    .with_padding_top(12.)
+                    .with_padding_bottom(12.)
+                    .finish(),
+            );
+
+        match &self.project_canvas_state {
+            ProjectCanvasState::NoProject => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "No project detected",
+                        "Open a project folder or focus a source file, then refresh Project Canvas.",
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            ProjectCanvasState::Loading(path) => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "Analyzing project…",
+                        &format!(
+                            "Scanning {} for pages, routers, endpoints, and source connections. Project code is never executed.",
+                            path.display()
+                        ),
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            ProjectCanvasState::Error(error) => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "Project analysis failed",
+                        error,
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            ProjectCanvasState::Ready(graph) if graph.kind == ProjectKind::Unknown => {
+                root.add_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(self.render_canvas_message(
+                            appearance,
+                            "No recognized project structure",
+                            &format!(
+                                "Scanned {} source files in {} but found no supported pages or endpoints.",
+                                graph.files_scanned,
+                                graph.root.display()
+                            ),
+                        ))
+                        .with_uniform_padding(120.)
+                        .finish(),
+                    )
+                    .finish(),
+                );
+            }
+            ProjectCanvasState::Ready(graph) => {
+                root.add_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(
+                            Flex::row()
+                                .with_main_axis_size(MainAxisSize::Max)
+                                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                                .with_child(
+                                    ConstrainedBox::new(
+                                        self.render_project_canvas_palette(appearance, graph),
+                                    )
+                                    .with_width(232.)
+                                    .finish(),
+                                )
+                                .with_child(
+                                    Container::new(
+                                        Expanded::new(
+                                            1.,
+                                            self.render_project_graph_surface(appearance, graph),
+                                        )
+                                        .finish(),
+                                    )
+                                    .with_margin_left(12.)
+                                    .finish(),
+                                )
+                                .with_child(
+                                    Container::new(
+                                        ConstrainedBox::new(
+                                            self.render_project_canvas_inspector(appearance, graph),
+                                        )
+                                        .with_width(300.)
+                                        .finish(),
+                                    )
+                                    .with_margin_left(12.)
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_padding_left(16.)
+                        .with_padding_right(16.)
+                        .finish(),
+                    )
+                    .finish(),
+                );
+
+                let ready: ColorU = theme.terminal_colors().normal.green.into();
+                root.add_child(
+                    Container::new(
+                        Flex::row()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_child(
+                                ConstrainedBox::new(
+                                    Container::new(Empty::new().finish())
+                                        .with_background_color(ready)
+                                        .with_corner_radius(CornerRadius::with_all(
+                                            Radius::Percentage(50.),
+                                        ))
+                                        .finish(),
+                                )
+                                .with_width(8.)
+                                .with_height(8.)
+                                .finish(),
+                            )
+                            .with_child(
+                                Container::new(self.label_text(
+                                    appearance,
+                                    "Project status:  Ready".to_string(),
+                                    12.,
+                                    ready,
+                                    false,
+                                ))
+                                .with_margin_left(8.)
+                                .finish(),
+                            )
+                            .with_child(Expanded::new(1., Empty::new().finish()).finish())
+                            .with_child(self.label_text(
+                                appearance,
+                                format!(
+                                    "{} nodes  ·  {} connections  ·  source-only analysis",
+                                    graph.nodes.len(),
+                                    graph.edges.len()
+                                ),
+                                11.,
+                                theme.disabled_text_color(theme.background()).into(),
+                                false,
+                            ))
+                            .finish(),
+                    )
+                    .with_uniform_padding(14.)
+                    .finish(),
+                );
+            }
+        }
+
+        Container::new(root.finish())
+            .with_background(theme.background())
+            .finish()
+    }
+
     fn canvas_node_accent(&self, appearance: &Appearance, kind: CanvasNodeKind) -> ColorU {
         let colors = &appearance.theme().terminal_colors().normal;
         match kind {
@@ -2136,6 +3240,158 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    fn auto_arranged_project_canvas_positions(
+        graph: &ProjectCanvasGraph,
+    ) -> HashMap<String, Vector2F> {
+        const ROWS_PER_COLUMN: usize = 5;
+        const COLUMN_GAP: f32 = 270.;
+        const ROW_GAP: f32 = 170.;
+        const START_X: f32 = 70.;
+        const START_Y: f32 = 80.;
+
+        let page_count = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == CanvasNodeKind::Page)
+            .count();
+        let router_count = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == CanvasNodeKind::Router)
+            .count();
+        let columns_for = |count: usize| count.max(1).div_ceil(ROWS_PER_COLUMN) as f32;
+        let page_base = START_X;
+        let router_base = page_base
+            + if page_count > 0 {
+                columns_for(page_count) * COLUMN_GAP
+            } else {
+                0.
+            };
+        let endpoint_base = router_base
+            + if router_count > 0 {
+                columns_for(router_count) * COLUMN_GAP
+            } else if page_count > 0 {
+                COLUMN_GAP
+            } else {
+                0.
+            };
+        let mut indexes = HashMap::<CanvasNodeKind, usize>::new();
+        let mut positions = HashMap::new();
+        for node in &graph.nodes {
+            let index = indexes.entry(node.kind).or_default();
+            let base_x = match node.kind {
+                CanvasNodeKind::Page => page_base,
+                CanvasNodeKind::Router => router_base,
+                CanvasNodeKind::Endpoint => endpoint_base,
+            };
+            let column = *index / ROWS_PER_COLUMN;
+            let row = *index % ROWS_PER_COLUMN;
+            positions.insert(
+                node.id.clone(),
+                vec2f(
+                    base_x + column as f32 * COLUMN_GAP,
+                    START_Y + row as f32 * ROW_GAP,
+                ),
+            );
+            *index += 1;
+        }
+        positions
+    }
+
+    pub fn auto_arrange_project_canvas(&mut self, ctx: &mut ViewContext<Self>) {
+        if let ProjectCanvasState::Ready(graph) = &self.project_canvas_state {
+            self.project_canvas_positions = Self::auto_arranged_project_canvas_positions(graph);
+            self.project_canvas_pan = vec2f(42., 42.);
+            self.project_canvas_drag = None;
+            ctx.notify();
+        }
+    }
+
+    pub fn fit_project_canvas(&mut self, ctx: &mut ViewContext<Self>) {
+        let node_count = match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) => graph.nodes.len(),
+            _ => 0,
+        };
+        self.project_canvas_zoom = if node_count > 24 {
+            0.6
+        } else if node_count > 14 {
+            0.75
+        } else if node_count > 8 {
+            0.85
+        } else {
+            1.
+        };
+        self.project_canvas_pan = vec2f(42., 42.);
+        self.project_canvas_drag = None;
+        ctx.notify();
+    }
+
+    pub fn zoom_project_canvas(&mut self, delta: f32, ctx: &mut ViewContext<Self>) {
+        self.project_canvas_zoom = (self.project_canvas_zoom + delta).clamp(0.45, 1.6);
+        ctx.notify();
+    }
+
+    pub fn pan_project_canvas(&mut self, delta: Vector2F, ctx: &mut ViewContext<Self>) {
+        self.project_canvas_pan += delta;
+        ctx.notify();
+    }
+
+    pub fn begin_project_canvas_drag(
+        &mut self,
+        node_id: Option<String>,
+        pointer: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.project_canvas_drag = if let Some(id) = node_id {
+            let position = self
+                .project_canvas_positions
+                .get(&id)
+                .copied()
+                .unwrap_or_default();
+            self.selected_canvas_node = Some(id.clone());
+            Some(ProjectCanvasDragState::Node {
+                id,
+                pointer,
+                position,
+            })
+        } else {
+            Some(ProjectCanvasDragState::Pan {
+                pointer,
+                pan: self.project_canvas_pan,
+            })
+        };
+        ctx.notify();
+    }
+
+    pub fn update_project_canvas_drag(&mut self, pointer: Vector2F, ctx: &mut ViewContext<Self>) {
+        match &self.project_canvas_drag {
+            Some(ProjectCanvasDragState::Pan {
+                pointer: start,
+                pan,
+            }) => {
+                self.project_canvas_pan = *pan + pointer - *start;
+            }
+            Some(ProjectCanvasDragState::Node {
+                id,
+                pointer: start,
+                position,
+            }) => {
+                let delta = (pointer - *start) / self.project_canvas_zoom;
+                let next = *position + delta;
+                self.project_canvas_positions
+                    .insert(id.clone(), vec2f(next.x().max(0.), next.y().max(0.)));
+            }
+            None => return,
+        }
+        ctx.notify();
+    }
+
+    pub fn end_project_canvas_drag(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.project_canvas_drag.take().is_some() {
+            ctx.notify();
+        }
+    }
+
     pub fn open_project_canvas(
         &mut self,
         project_root: Option<PathBuf>,
@@ -2155,6 +3411,8 @@ impl LocalAiChatView {
         let Some(root) = project_root else {
             self.project_canvas_state = ProjectCanvasState::NoProject;
             self.selected_canvas_node = None;
+            self.project_canvas_positions.clear();
+            self.project_canvas_drag = None;
             ctx.notify();
             return;
         };
@@ -2184,6 +3442,11 @@ impl LocalAiChatView {
                             })
                             .or_else(|| graph.nodes.first())
                             .map(|node| node.id.clone());
+                        me.project_canvas_positions =
+                            Self::auto_arranged_project_canvas_positions(&graph);
+                        me.project_canvas_pan = vec2f(42., 42.);
+                        me.project_canvas_zoom = if graph.nodes.len() > 14 { 0.75 } else { 1. };
+                        me.project_canvas_drag = None;
                         me.project_canvas_state = ProjectCanvasState::Ready(graph);
                     }
                     Err(error) => {
@@ -2191,6 +3454,8 @@ impl LocalAiChatView {
                             "The background analyzer stopped unexpectedly: {error}"
                         ));
                         me.selected_canvas_node = None;
+                        me.project_canvas_positions.clear();
+                        me.project_canvas_drag = None;
                     }
                 }
                 ctx.notify();

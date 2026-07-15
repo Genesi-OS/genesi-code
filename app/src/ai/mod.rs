@@ -39,6 +39,7 @@ pub mod onboarding;
 pub(crate) mod persisted_workspace;
 pub(crate) mod predict;
 pub(crate) mod project_canvas;
+pub(crate) mod project_canvas_view;
 pub mod request_usage_model;
 pub(crate) mod restored_conversations;
 pub(crate) mod skills;
