@@ -335,11 +335,13 @@ impl Element for ProjectGraphCanvas {
         ctx: &mut EventContext,
         app: &AppContext,
     ) -> bool {
-        for node in self.nodes.iter_mut().rev().filter(|node| node.visible) {
-            if node.child.dispatch_event(event, ctx, app) {
-                return true;
-            }
-        }
+        // Node children are pure visuals — containers, text and icons, with no
+        // handler anywhere inside them — and the canvas hit-tests nodes itself
+        // against `screen_bounds` below. Walking every visible node's subtree
+        // here therefore found nothing, but it ran for *every* event, including
+        // the mouse-move stream, which starved the queue and left clicks
+        // landing seconds late.
+        let _ = app;
 
         if self.drag_active {
             match event.raw_event() {

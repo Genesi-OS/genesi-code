@@ -31,9 +31,6 @@ pub mod harness_availability;
 pub(crate) mod harness_display;
 pub(crate) mod component_hover;
 pub(crate) mod live_preview;
-pub(crate) mod live_preview_panel;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) mod live_preview_server;
 pub(crate) mod live_preview_view;
 pub(crate) mod llms;
 pub(crate) mod local_agent;

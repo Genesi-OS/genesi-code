@@ -14,5 +14,3 @@ publish.workspace = true
 [dependencies]
 html5ever.workspace = true
 markup5ever_rcdom = "0.35.0"
-serde_json.workspace = true
-walkdir.workspace = true

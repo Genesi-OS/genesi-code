@@ -448,35 +448,6 @@ fn unresolved_child_components_render_as_placeholders() {
     assert!(collect_text(&document.root).contains("<Missing />"));
 }
 
-// ── dev server detection ────────────────────────────────────────────────────
-
-#[test]
-fn reads_the_first_url_a_server_prints() {
-    assert_eq!(
-        extract_server_url("  ➜  Local:   http://localhost:5173/"),
-        Some("http://localhost:5173/".to_string())
-    );
-    assert_eq!(
-        extract_server_url("started server on 0.0.0.0:3000, url: http://0.0.0.0:3000"),
-        Some("http://localhost:3000".to_string())
-    );
-    assert_eq!(extract_server_url("compiling..."), None);
-}
-
-#[test]
-fn dev_server_plan_renders_its_command() {
-    let plan = DevServerPlan {
-        manager: "npm".to_string(),
-        script: "dev".to_string(),
-        command: "npm".to_string(),
-        args: vec!["run".to_string(), "dev".to_string()],
-        default_port: 5173,
-        framework: "Vite".to_string(),
-    };
-    assert_eq!(plan.display_command(), "npm run dev");
-    assert_eq!(plan.default_url(), "http://localhost:5173");
-}
-
 // ── budgets ─────────────────────────────────────────────────────────────────
 
 /// Depth of the deepest chain of boxes in the tree.

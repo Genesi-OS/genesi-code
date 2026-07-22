@@ -9,20 +9,17 @@
 //!   * an HTML → [`PreviewNode`] compiler that resolves the cascade and folds
 //!     phrasing content into wrappable inline runs;
 //!   * a JSX/TSX compiler that reaches the same [`PreviewNode`] tree, so React
-//!     components can be previewed without a bundler — and a [`DevServerPlan`]
-//!     for the cases where the user wants the project's own server.
+//!     components can be previewed without a bundler.
 //!
-//! Project code is never executed while building a preview. The dev server is
-//! the one exception and it only ever starts from an explicit user action.
+//! Project code is never executed while building a preview.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use html5ever::tendril::TendrilSink;
 use html5ever::{parse_document, ParseOpts};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
-use walkdir::WalkDir;
 
 /// Root font size used to resolve `rem`, and the fallback viewport used to
 /// resolve `vw`/`vh` — the preview surface is a desktop-sized sheet.
@@ -30,8 +27,6 @@ const ROOT_FONT_SIZE: f32 = 16.;
 const VIEWPORT_WIDTH: f32 = 1280.;
 const VIEWPORT_HEIGHT: f32 = 800.;
 
-const MAX_PREVIEW_FILES: usize = 2_500;
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 /// How deep component-in-component resolution goes before a child component is
 /// drawn as a labelled placeholder instead of being expanded.
 const MAX_COMPONENT_DEPTH: usize = 3;
@@ -42,24 +37,6 @@ const MAX_COMPONENT_DEPTH: usize = 3;
 /// the stack instead of producing a preview. Real pages sit far below this.
 const MAX_NESTING_DEPTH: usize = 64;
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "out",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".venv",
-    "venv",
-    "vendor",
-    "coverage",
-    "__pycache__",
-    ".idea",
-    ".vscode",
-];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Colors and lengths
@@ -2803,354 +2780,9 @@ fn shorten_expression(expression: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Project discovery
+// Fragment and stylesheet entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewPageKind {
-    Html,
-    Jsx,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewPage {
-    pub title: String,
-    pub route: String,
-    pub path: PathBuf,
-    pub kind: PreviewPageKind,
-    /// For JSX pages, the component in `path` that renders the route.
-    pub component: Option<String>,
-}
-
-/// How a project's own dev server would be started. Nothing here runs until the
-/// user asks for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DevServerPlan {
-    pub manager: String,
-    pub script: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub default_port: u16,
-    pub framework: String,
-}
-
-impl DevServerPlan {
-    pub fn display_command(&self) -> String {
-        format!("{} {}", self.command, self.args.join(" "))
-    }
-
-    pub fn default_url(&self) -> String {
-        format!("http://localhost:{}", self.default_port)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PreviewProject {
-    pub root: PathBuf,
-    pub name: String,
-    pub pages: Vec<PreviewPage>,
-    pub components: Vec<JsxComponentSource>,
-    pub global_css: Vec<PathBuf>,
-    pub dev_server: Option<DevServerPlan>,
-    pub files_scanned: usize,
-}
-
-impl PreviewProject {
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty() && self.components.is_empty()
-    }
-
-    pub fn component_index(&self) -> HashMap<String, JsxComponentSource> {
-        self.components
-            .iter()
-            .map(|component| (component.name.clone(), component.clone()))
-            .collect()
-    }
-
-    /// The project-wide stylesheet every preview starts from.
-    pub fn global_stylesheet(&self) -> Stylesheet {
-        let mut sheet = Stylesheet::default();
-        for path in &self.global_css {
-            if let Ok(text) = fs::read_to_string(path) {
-                sheet.extend(Stylesheet::parse(&text));
-            }
-        }
-        sheet
-    }
-}
-
-/// Walks a project and collects everything the preview can render. Read-only.
-pub fn scan_preview_project(root: &Path) -> PreviewProject {
-    let mut project = PreviewProject {
-        root: root.to_path_buf(),
-        name: root
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.display().to_string()),
-        ..PreviewProject::default()
-    };
-
-    let mut html_files: Vec<PathBuf> = Vec::new();
-    let mut seen_components: HashSet<String> = HashSet::new();
-
-    for entry in WalkDir::new(root)
-        .max_depth(8)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !(entry.file_type().is_dir()
-                && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') && name != "."))
-        })
-        .filter_map(Result::ok)
-        .take(MAX_PREVIEW_FILES)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        project.files_scanned += 1;
-        let path = entry.path();
-        let Some(extension) = path
-            .extension()
-            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-        else {
-            continue;
-        };
-        if entry.metadata().map(|meta| meta.len()).unwrap_or(0) > MAX_SOURCE_BYTES {
-            continue;
-        }
-
-        match extension.as_str() {
-            "html" | "htm" => html_files.push(path.to_path_buf()),
-            "css" => {
-                // Global stylesheets are the ones not scoped to a component.
-                let name = path.file_stem().unwrap_or_default().to_string_lossy();
-                if matches!(
-                    name.as_ref(),
-                    "index" | "style" | "styles" | "global" | "globals" | "main" | "app" | "reset"
-                ) {
-                    project.global_css.push(path.to_path_buf());
-                }
-            }
-            "jsx" | "tsx" => {
-                let Ok(source) = fs::read_to_string(path) else {
-                    continue;
-                };
-                for component in extract_jsx_components(root, path, &source) {
-                    if seen_components.insert(component.name.clone()) {
-                        project.components.push(component);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    html_files.sort_by_key(|path| (html_entry_rank(root, path), path.clone()));
-    for path in html_files {
-        let route = route_for_html(root, &path);
-        project.pages.push(PreviewPage {
-            title: html_title(&path).unwrap_or_else(|| file_title(&path)),
-            route,
-            path,
-            kind: PreviewPageKind::Html,
-            component: None,
-        });
-    }
-
-    // A React app with no HTML page of its own still gets a page: its root
-    // component is what the dev server would mount.
-    if project.pages.is_empty() {
-        for name in ["App", "Home", "Index", "Page", "Root", "Main"] {
-            if let Some(component) = project
-                .components
-                .iter()
-                .find(|component| component.name == name)
-            {
-                project.pages.push(PreviewPage {
-                    title: component.name.clone(),
-                    route: "/".to_string(),
-                    path: component.path.clone(),
-                    kind: PreviewPageKind::Jsx,
-                    component: Some(component.name.clone()),
-                });
-                break;
-            }
-        }
-    }
-
-    project.components.sort_by(|a, b| a.name.cmp(&b.name));
-    project.dev_server = detect_dev_server(root);
-    project
-}
-
-/// The entry page sorts first; everything else keeps alphabetical order.
-fn html_entry_rank(root: &Path, path: &Path) -> u8 {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let depth = relative.components().count();
-    let name = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    match (name.as_str(), depth) {
-        ("index", 1) => 0,
-        ("index", _) => 1,
-        ("home", _) => 2,
-        _ => 3,
-    }
-}
-
-fn route_for_html(root: &Path, path: &Path) -> String {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let mut route = relative
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches(".html")
-        .trim_end_matches(".htm")
-        .to_string();
-    if route == "index" {
-        return "/".to_string();
-    }
-    route = route.trim_end_matches("/index").to_string();
-    format!("/{route}")
-}
-
-fn html_title(path: &Path) -> Option<String> {
-    let html = fs::read_to_string(path).ok()?;
-    let lower = html.to_ascii_lowercase();
-    let start = lower.find("<title>")? + "<title>".len();
-    let end = lower[start..].find("</title>")? + start;
-    let title = html[start..end].trim().to_string();
-    (!title.is_empty()).then_some(title)
-}
-
-/// Reads `package.json` and works out how this project would be served.
-pub fn detect_dev_server(root: &Path) -> Option<DevServerPlan> {
-    let manifest = fs::read_to_string(root.join("package.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&manifest).ok()?;
-    let scripts = json.get("scripts")?.as_object()?;
-
-    let script = ["dev", "start", "serve", "preview"]
-        .into_iter()
-        .find(|candidate| scripts.contains_key(*candidate))?
-        .to_string();
-
-    let dependency_names: HashSet<String> = ["dependencies", "devDependencies"]
-        .into_iter()
-        .filter_map(|key| json.get(key)?.as_object())
-        .flat_map(|table| table.keys().cloned())
-        .collect();
-    let script_body = scripts
-        .get(&script)
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    let (framework, default_port) = if dependency_names.contains("next") {
-        ("Next.js", 3000)
-    } else if dependency_names.contains("vite") || script_body.contains("vite") {
-        ("Vite", 5173)
-    } else if dependency_names.contains("@angular/core") {
-        ("Angular", 4200)
-    } else if dependency_names.contains("nuxt") {
-        ("Nuxt", 3000)
-    } else if dependency_names.contains("@sveltejs/kit") {
-        ("SvelteKit", 5173)
-    } else if dependency_names.contains("react-scripts") || script_body.contains("react-scripts") {
-        ("Create React App", 3000)
-    } else if script_body.contains("astro") {
-        ("Astro", 4321)
-    } else {
-        ("Node", 3000)
-    };
-
-    let manager = detect_package_manager(root);
-    let (command, args) = match manager.as_str() {
-        "yarn" => ("yarn".to_string(), vec![script.clone()]),
-        "pnpm" => ("pnpm".to_string(), vec!["run".to_string(), script.clone()]),
-        "bun" => ("bun".to_string(), vec!["run".to_string(), script.clone()]),
-        _ => ("npm".to_string(), vec!["run".to_string(), script.clone()]),
-    };
-
-    Some(DevServerPlan {
-        manager,
-        script,
-        command,
-        args,
-        default_port,
-        framework: framework.to_string(),
-    })
-}
-
-fn detect_package_manager(root: &Path) -> String {
-    if root.join("pnpm-lock.yaml").is_file() {
-        "pnpm".to_string()
-    } else if root.join("yarn.lock").is_file() {
-        "yarn".to_string()
-    } else if root.join("bun.lockb").is_file() || root.join("bun.lock").is_file() {
-        "bun".to_string()
-    } else {
-        "npm".to_string()
-    }
-}
-
-/// Pulls the first `http://…` URL out of a dev server's console output, so the
-/// preview follows the port the server actually chose.
-pub fn extract_server_url(line: &str) -> Option<String> {
-    let start = line.find("http://").or_else(|| line.find("https://"))?;
-    let rest = &line[start..];
-    let end = rest
-        .find(|character: char| character.is_whitespace() || character == '"' || character == '\'')
-        .unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches(['.', ',', ')', ']']).to_string();
-    // Servers print `0.0.0.0` / `[::]` bindings that a client cannot always use.
-    let url = url
-        .replace("0.0.0.0", "localhost")
-        .replace("[::1]", "localhost")
-        .replace("[::]", "localhost");
-    (url.len() > "http://".len()).then_some(url)
-}
-
-/// Compiles whichever page the caller selected. Kept here so the view layer
-/// never touches the filesystem.
-pub fn compile_page(project: &PreviewProject, page: &PreviewPage) -> PreviewDocument {
-    match page.kind {
-        PreviewPageKind::Html => compile_html_file(&project.root, &page.path),
-        PreviewPageKind::Jsx => {
-            let index = project.component_index();
-            let Some(component) = page
-                .component
-                .as_ref()
-                .and_then(|name| index.get(name))
-            else {
-                return PreviewDocument::empty(
-                    page.title.clone(),
-                    "The page's root component could not be located.",
-                );
-            };
-            compile_jsx_component(
-                &project.root,
-                component,
-                &index,
-                &project.global_stylesheet(),
-            )
-        }
-    }
-}
-
-/// Compiles a single component for the hover card.
-pub fn compile_component(project: &PreviewProject, name: &str) -> Option<PreviewDocument> {
-    let index = project.component_index();
-    let component = index.get(name)?;
-    Some(compile_jsx_component(
-        &project.root,
-        component,
-        &index,
-        &project.global_stylesheet(),
-    ))
-}
-
-/// Compiles an arbitrary HTML fragment (an element pulled out of a page) so a
-/// static project gets hover previews too.
 pub fn compile_html_fragment(
     project_root: &Path,
     page_path: &Path,

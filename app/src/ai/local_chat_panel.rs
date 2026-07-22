@@ -51,7 +51,6 @@ use super::local_chat::{
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
 };
-use super::live_preview_panel::LivePreviewPanelState;
 use super::project_canvas_view::{
     CanvasViewport, ProjectGraphCanvas, ProjectGraphColors, ProjectGraphMinimap,
     ProjectGraphNodeElement, FORGE_NODE_HEIGHT, FORGE_NODE_WIDTH,
@@ -534,9 +533,6 @@ pub struct LocalAiChatView {
     /// Size of the graph surface, measured by the canvas element during layout
     /// and read back here so off-screen nodes are never even built.
     pub(super) project_canvas_viewport: CanvasViewport,
-    /// Everything the Live Preview workspace needs. Lives in its own type so
-    /// the preview's rendering can sit in [`super::live_preview_panel`].
-    pub(super) preview: LivePreviewPanelState,
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -606,7 +602,6 @@ impl LocalAiChatView {
             project_canvas_palette_scroll: ClippedScrollStateHandle::default(),
             project_canvas_inspector_scroll: ClippedScrollStateHandle::default(),
             project_canvas_viewport: CanvasViewport::default(),
-            preview: LivePreviewPanelState::default(),
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -1701,6 +1696,9 @@ impl LocalAiChatView {
         node: &CanvasNode,
         selected: bool,
         zoom: f32,
+        // Edge degree per node id, computed once per render. Deriving it here
+        // meant rescanning every edge for every node drawn.
+        degrees: &HashMap<&str, usize>,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let accent = self.canvas_node_accent(appearance, node.kind);
@@ -1741,7 +1739,8 @@ impl LocalAiChatView {
                 .map(|load| format!("~{load} ms estimated load"))
                 .unwrap_or_else(|| "Frontend page".to_string()),
             CanvasNodeKind::Router => {
-                format!("{} route handlers", self.canvas_connection_count(node))
+                let count = degrees.get(node.id.as_str()).copied().unwrap_or(0);
+                format!("{count} route handlers")
             }
             CanvasNodeKind::Endpoint => format!(
                 "{} request · {}",
@@ -1835,17 +1834,6 @@ impl LocalAiChatView {
         .with_width(FORGE_NODE_WIDTH * zoom)
         .with_height(FORGE_NODE_HEIGHT * zoom)
         .finish()
-    }
-
-    fn canvas_connection_count(&self, node: &CanvasNode) -> usize {
-        match &self.project_canvas_state {
-            ProjectCanvasState::Ready(graph) => graph
-                .edges
-                .iter()
-                .filter(|edge| edge.from == node.id || edge.to == node.id)
-                .count(),
-            _ => 0,
-        }
     }
 
     fn render_canvas_palette_item(
@@ -2319,6 +2307,12 @@ impl LocalAiChatView {
         // element already skips laying out and painting off-screen nodes, but
         // constructing their text and icons was still costing a full pass per
         // frame — which is what made dragging a large graph crawl.
+        let mut degrees: HashMap<&str, usize> = HashMap::new();
+        for edge in &graph.edges {
+            *degrees.entry(edge.from.as_str()).or_default() += 1;
+            *degrees.entry(edge.to.as_str()).or_default() += 1;
+        }
+
         let viewport = self.project_canvas_viewport.get();
         let node_size = vec2f(FORGE_NODE_WIDTH, FORGE_NODE_HEIGHT) * self.project_canvas_zoom;
         // One node of slack on every side, so a node that is only just outside
@@ -2347,6 +2341,7 @@ impl LocalAiChatView {
                         node,
                         self.selected_canvas_node.as_deref() == Some(node.id.as_str()),
                         self.project_canvas_zoom,
+                        &degrees,
                     ),
                 ))
             })
