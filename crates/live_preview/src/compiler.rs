@@ -457,7 +457,7 @@ pub struct ElementSnapshot {
 impl Stylesheet {
     pub fn parse(source: &str) -> Self {
         let mut sheet = Self::default();
-        sheet.parse_into(&strip_comments(source), 0);
+        sheet.apply_block(&strip_comments(source), &[], 0);
         sheet
     }
 
@@ -471,55 +471,42 @@ impl Stylesheet {
         }
     }
 
-    fn parse_into(&mut self, source: &str, depth: usize) {
-        if depth > 4 {
+    /// Applies a rule body to `selectors`: its own declarations first, then any
+    /// rules nested inside it.
+    ///
+    /// Nesting is what makes `.scss` files usable at all, and plain CSS has it
+    /// now too. Expressing the top level as a body with no selectors lets one
+    /// routine cover the whole grammar.
+    fn apply_block(&mut self, block: &str, selectors: &[String], depth: usize) {
+        if depth > 8 {
             return;
         }
-        let bytes = source.as_bytes();
-        let mut cursor = 0usize;
-        while cursor < bytes.len() {
-            let Some(brace) = source[cursor..].find('{') else {
-                break;
-            };
-            let prelude = source[cursor..cursor + brace].trim().to_string();
-            let block_start = cursor + brace + 1;
-            let Some(block_end) = matching_brace(source, block_start) else {
-                break;
-            };
-            let block = &source[block_start..block_end];
-
-            if prelude.starts_with('@') {
-                let at_rule = prelude
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                // Media and supports blocks hold ordinary rules; the preview is a
-                // desktop-width sheet, so honour them rather than dropping them.
-                // Print-only blocks would fight the screen styles, so skip those.
-                if (at_rule == "@media" && !prelude.to_ascii_lowercase().contains("print"))
-                    || at_rule == "@supports"
-                    || at_rule == "@layer"
-                {
-                    self.parse_into(block, depth + 1);
-                }
-            } else {
-                let declarations = parse_declarations(block);
-                if !declarations.is_empty() {
-                    for selector_text in split_top_level(&prelude, ',') {
-                        if let Some(selector) = parse_selector(&selector_text) {
-                            let order = self.rules.len();
-                            self.rules.push(StyleRule {
-                                selector,
-                                declarations: declarations.clone(),
-                                order,
-                            });
-                        }
-                    }
+        let (declaration_text, nested) = split_block(block);
+        let declarations = parse_declarations(&declaration_text);
+        if !declarations.is_empty() && !selectors.is_empty() {
+            for text in selectors {
+                if let Some(selector) = parse_selector(text) {
+                    let order = self.rules.len();
+                    self.rules.push(StyleRule {
+                        selector,
+                        declarations: declarations.clone(),
+                        order,
+                    });
                 }
             }
+        }
 
-            cursor = block_end + 1;
+        for (prelude, inner) in nested {
+            if prelude.starts_with('@') {
+                // The block holds ordinary rules (or, nested inside a rule, the
+                // parent's own declarations), so carry the selectors through.
+                if at_rule_applies(&prelude) {
+                    self.apply_block(&inner, selectors, depth + 1);
+                }
+            } else {
+                let expanded = expand_selectors(&prelude, selectors);
+                self.apply_block(&inner, &expanded, depth + 1);
+            }
         }
     }
 
@@ -571,6 +558,64 @@ fn selector_matches(
         remaining = &remaining[..remaining.len() - 1];
     }
     true
+}
+
+/// Splits a rule body into its own declaration text and the rules nested in it.
+fn split_block(block: &str) -> (String, Vec<(String, String)>) {
+    let mut declarations = String::new();
+    let mut nested = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < block.len() {
+        let Some(relative) = block[cursor..].find('{') else {
+            declarations.push_str(&block[cursor..]);
+            break;
+        };
+        let brace = cursor + relative;
+        let segment = &block[cursor..brace];
+        // Whatever precedes the last `;` belongs to this rule; the tail is the
+        // nested rule's prelude.
+        let split = segment.rfind(';').map(|index| index + 1).unwrap_or(0);
+        declarations.push_str(&segment[..split]);
+        let prelude = segment[split..].trim().to_string();
+        let Some(end) = matching_brace(block, brace + 1) else {
+            break;
+        };
+        nested.push((prelude, block[brace + 1..end].to_string()));
+        cursor = end + 1;
+    }
+    (declarations, nested)
+}
+
+/// Resolves a nested prelude against its parents, honouring `&`.
+fn expand_selectors(prelude: &str, parents: &[String]) -> Vec<String> {
+    let parts = split_top_level(prelude, ',');
+    if parents.is_empty() {
+        return parts;
+    }
+    let mut out = Vec::new();
+    for parent in parents {
+        for part in &parts {
+            out.push(if part.contains('&') {
+                part.replace('&', parent)
+            } else {
+                format!("{parent} {part}")
+            });
+        }
+    }
+    out
+}
+
+/// Whether an at-rule's body is in effect for the preview. The sheet is a
+/// desktop-width screen, so print-only blocks would fight the screen styles.
+fn at_rule_applies(prelude: &str) -> bool {
+    let lower = prelude.to_ascii_lowercase();
+    let name = lower.split_whitespace().next().unwrap_or_default();
+    match name {
+        "@media" => !lower.contains("print"),
+        "@supports" | "@layer" | "@scope" | "@container" => true,
+        _ => false,
+    }
 }
 
 fn matching_brace(source: &str, start: usize) -> Option<usize> {
@@ -2131,6 +2176,20 @@ pub fn extract_jsx_components(
             .get(index + 1)
             .map(|(next, _)| *next)
             .unwrap_or(source.len());
+        // `const Button = styled.button` has no JSX at all; its markup is the
+        // base element carrying the template literal's declarations.
+        if let Some((tag, css)) = styled_component_at(source, *body_start) {
+            let declarations = styled_declarations(&css);
+            components.push(JsxComponentSource {
+                name: name.clone(),
+                path: path.to_path_buf(),
+                line: line_of(source, *body_start),
+                markup: format!("<{tag} style=\"{}\">{name}</{tag}>", declarations.replace('"', "'")),
+                stylesheets: stylesheets.clone(),
+            });
+            continue;
+        }
+
         let Some(window) = source.get(*body_start..end) else {
             continue;
         };
@@ -2151,6 +2210,98 @@ pub fn extract_jsx_components(
 /// 1-based line containing `offset`.
 fn line_of(source: &str, offset: usize) -> usize {
     source[..offset.min(source.len())].lines().count().max(1)
+}
+
+/// A `styled.button` / `styled(Card)` declaration, as its base tag and the CSS
+/// in its template literal.
+///
+/// CSS-in-JS keeps a component's styles in the source rather than in any
+/// stylesheet, so without this a styled-components or emotion project previews
+/// completely unstyled.
+fn styled_component_at(source: &str, from: usize) -> Option<(String, String)> {
+    let rest = source.get(from..)?;
+    let head: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+    let after_equals = rest.trim_start().strip_prefix('=')?.trim_start();
+    let _ = head;
+
+    let styled = after_equals.strip_prefix("styled")?;
+    // `styled.button` names the tag; `styled(Card)` wraps another component,
+    // which has no tag of its own to draw.
+    let (tag, remainder) = if let Some(dotted) = styled.strip_prefix('.') {
+        let tag: String = dotted
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect();
+        if tag.is_empty() {
+            return None;
+        }
+        let remainder = &dotted[tag.len()..];
+        (tag, remainder)
+    } else if styled.starts_with('(') {
+        ("div".to_string(), styled)
+    } else {
+        return None;
+    };
+
+    // Skip `.attrs(...)` and the wrapped-component parentheses.
+    let backtick = remainder.find('`')?;
+    let body = &remainder[backtick + 1..];
+    let end = body.find('`')?;
+    Some((tag, body[..end].to_string()))
+}
+
+/// Flattens a CSS-in-JS template literal into inline declarations: `${…}`
+/// interpolations depend on props the preview does not have, and nested blocks
+/// are states or descendants that the resting render does not show.
+fn styled_declarations(css: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut chars = css.chars().peekable();
+    let mut buffer = String::new();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut nested = 1usize;
+                for next in chars.by_ref() {
+                    match next {
+                        '{' => nested += 1,
+                        '}' => {
+                            nested -= 1;
+                            if nested == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Drop the declaration this interpolation was part of.
+                buffer.clear();
+            }
+            '{' => {
+                depth += 1;
+                buffer.clear();
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                buffer.clear();
+            }
+            ';' if depth == 0 => {
+                if buffer.contains(':') {
+                    out.push_str(buffer.trim());
+                    out.push(';');
+                }
+                buffer.clear();
+            }
+            _ => buffer.push(character),
+        }
+    }
+    if depth == 0 && buffer.contains(':') {
+        out.push_str(buffer.trim());
+        out.push(';');
+    }
+    out
 }
 
 /// Every capitalised declaration that could be a component, as
@@ -2431,12 +2582,7 @@ fn parse_jsx_node(markup: &str, cursor: &mut usize) -> Option<DomElement> {
         classes: attrs
             .get("classname")
             .or_else(|| attrs.get("class"))
-            .map(|value| {
-                value
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
+            .map(|value| class_names_from_expression(value))
             .unwrap_or_default(),
         attrs: normalize_jsx_attrs(attrs, &tag),
         children: Vec::new(),
@@ -2496,6 +2642,110 @@ fn parse_jsx_node(markup: &str, cursor: &mut usize) -> Option<DomElement> {
         element.children.push(DomNode::Text(text));
     }
     Some(element)
+}
+
+/// The class names a `className` yields.
+///
+/// A plain list is the easy case. The rest is CSS Modules and its neighbours:
+/// `styles.card`, `styles['card']`, template literals combining several, and
+/// `clsx(...)`-style calls. The rule is that quoted and template text
+/// contributes its words, and a member access contributes the member — while a
+/// bare identifier (`clsx`, `styles`, `props`) contributes nothing.
+///
+/// A module's source selector is the plain name; the build step's hashing
+/// happens well after anything the preview reads.
+fn class_names_from_expression(value: &str) -> Vec<String> {
+    let looks_like_code = value.contains(['.', '$', '(', '`', '\'', '"', '[']);
+    if !looks_like_code {
+        return value.split_whitespace().map(str::to_string).collect();
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+
+    let push_words = |names: &mut Vec<String>, text: &str| {
+        names.extend(text.split_whitespace().map(str::to_string));
+    };
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' => {
+                let quote = bytes[index];
+                index += 1;
+                let start = index;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+                push_words(&mut names, value.get(start..index).unwrap_or_default());
+                index += 1;
+            }
+            b'`' => {
+                index += 1;
+                let mut text_start = index;
+                while index < bytes.len() && bytes[index] != b'`' {
+                    if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'{') {
+                        push_words(&mut names, value.get(text_start..index).unwrap_or_default());
+                        index += 2;
+                        let start = index;
+                        let mut depth = 1usize;
+                        while index < bytes.len() {
+                            match bytes[index] {
+                                b'{' => depth += 1,
+                                b'}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            index += 1;
+                        }
+                        // The substitution is an expression in its own right.
+                        names.extend(class_names_from_expression(
+                            value.get(start..index).unwrap_or_default(),
+                        ));
+                        index += 1;
+                        text_start = index;
+                        continue;
+                    }
+                    index += 1;
+                }
+                push_words(&mut names, value.get(text_start..index).unwrap_or_default());
+                index += 1;
+            }
+            b'.' | b'[' => {
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'\'' | b'"' | b' ')
+                {
+                    index += 1;
+                }
+                let start = index;
+                while index < bytes.len() {
+                    let next = bytes[index] as char;
+                    if next.is_alphanumeric() || next == '_' || next == '-' {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(name) = value.get(start..index) {
+                    if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+
+    if names.is_empty() {
+        return value.split_whitespace().map(str::to_string).collect();
+    }
+    names.dedup();
+    names
 }
 
 fn read_jsx_attribute_value(markup: &str, cursor: &mut usize) -> String {

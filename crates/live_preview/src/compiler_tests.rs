@@ -167,6 +167,74 @@ fn var_falls_back_when_undefined() {
 }
 
 #[test]
+fn nested_rules_resolve_against_their_parent() {
+    // SCSS, and plain CSS since nesting landed. Without this the inner rule
+    // was parsed as garbage and the whole file after it could be lost.
+    let document = compile(
+        r#"<html><head><style>
+            .card {
+                color: #111111;
+                .title { color: #00ff00; }
+            }
+        </style></head><body>
+            <div class="card"><p class="title">hi</p></div>
+        </body></html>"#,
+    );
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.color, Some(Rgba::new(0x11, 0x11, 0x11, 255)));
+    let title = find_box(&document.root, "p").expect("title");
+    assert_eq!(title.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
+
+#[test]
+fn ampersand_nesting_attaches_to_the_parent_itself() {
+    let document = compile(
+        r#"<html><head><style>
+            .btn {
+                color: #111111;
+                &.primary { color: #0000ff; }
+            }
+        </style></head><body><div class="btn primary">go</div></body></html>"#,
+    );
+    let button = find_box(&document.root, "div").expect("div");
+    assert_eq!(button.style.color, Some(Rgba::new(0, 0, 255, 255)));
+}
+
+#[test]
+fn nested_state_rules_still_never_apply() {
+    let document = compile(
+        r#"<html><head><style>
+            .btn { color: #111111; &:hover { color: #ff0000; } }
+        </style></head><body><div class="btn">go</div></body></html>"#,
+    );
+    let button = find_box(&document.root, "div").expect("div");
+    assert_eq!(button.style.color, Some(Rgba::new(0x11, 0x11, 0x11, 255)));
+}
+
+#[test]
+fn a_rule_after_a_nested_block_is_not_lost() {
+    let document = compile(
+        r#"<html><head><style>
+            .a { .inner { color: #00ff00; } }
+            .b { color: #0000ff; }
+        </style></head><body><div class="b">hi</div></body></html>"#,
+    );
+    let node = find_box(&document.root, "div").expect("div");
+    assert_eq!(node.style.color, Some(Rgba::new(0, 0, 255, 255)));
+}
+
+#[test]
+fn media_nested_inside_a_rule_applies_to_that_rule() {
+    let document = compile(
+        r#"<html><head><style>
+            .hero { color: #111111; @media (min-width: 600px) { color: #00ff00; } }
+        </style></head><body><div class="hero">hi</div></body></html>"#,
+    );
+    let hero = find_box(&document.root, "div").expect("div");
+    assert_eq!(hero.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
+
+#[test]
 fn media_blocks_contribute_their_rules() {
     let document = compile(
         r#"<html><head><style>
@@ -570,4 +638,130 @@ fn deeply_nested_markup_stays_within_the_node_budget() {
         "nesting not bounded: {}",
         tree_depth(&document.root)
     );
+}
+
+// ── CSS Modules and friends ─────────────────────────────────────────────────
+
+#[test]
+fn css_module_member_access_becomes_a_class() {
+    let component = JsxComponentSource {
+        name: "Card".to_string(),
+        path: "/project/src/Card.jsx".into(),
+        line: 1,
+        markup: "<div className={styles.card}>hi</div>".to_string(),
+        stylesheets: Vec::new(),
+    };
+    // A module's source selector is the plain name; hashing happens later.
+    let sheet = Stylesheet::parse(".card { background: #101418; }");
+    let document =
+        compile_jsx_component(Path::new("/project"), &component, &HashMap::new(), &sheet);
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.background, Some(Rgba::new(0x10, 0x14, 0x18, 255)));
+}
+
+#[test]
+fn template_literals_combining_classes_all_apply() {
+    let component = JsxComponentSource {
+        name: "Card".to_string(),
+        path: "/project/src/Card.jsx".into(),
+        line: 1,
+        markup: "<div className={`${styles.card} ${styles.active}`}>hi</div>".to_string(),
+        stylesheets: Vec::new(),
+    };
+    let sheet = Stylesheet::parse(".card { padding: 8px; } .active { color: #00ff00; }");
+    let document =
+        compile_jsx_component(Path::new("/project"), &component, &HashMap::new(), &sheet);
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.padding.top, 8.);
+    assert_eq!(card.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
+
+#[test]
+fn clsx_style_calls_pick_up_literals_and_members() {
+    let component = JsxComponentSource {
+        name: "Card".to_string(),
+        path: "/project/src/Card.jsx".into(),
+        line: 1,
+        markup: "<div className={clsx('base', styles.card)}>hi</div>".to_string(),
+        stylesheets: Vec::new(),
+    };
+    let sheet = Stylesheet::parse(".base { padding: 4px; } .card { color: #0000ff; }");
+    let document =
+        compile_jsx_component(Path::new("/project"), &component, &HashMap::new(), &sheet);
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.padding.top, 4.);
+    assert_eq!(card.style.color, Some(Rgba::new(0, 0, 255, 255)));
+}
+
+#[test]
+fn a_plain_class_list_still_works() {
+    let component = JsxComponentSource {
+        name: "Card".to_string(),
+        path: "/project/src/Card.jsx".into(),
+        line: 1,
+        markup: r#"<div className="card wide">hi</div>"#.to_string(),
+        stylesheets: Vec::new(),
+    };
+    let sheet = Stylesheet::parse(".card { color: #ff0000; } .wide { padding: 12px; }");
+    let document =
+        compile_jsx_component(Path::new("/project"), &component, &HashMap::new(), &sheet);
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.color, Some(Rgba::new(255, 0, 0, 255)));
+    assert_eq!(card.style.padding.top, 12.);
+}
+
+// ── CSS-in-JS ───────────────────────────────────────────────────────────────
+
+#[test]
+fn styled_components_carry_their_template_literal_css() {
+    let source = r#"
+        import styled from 'styled-components';
+        const Button = styled.button`
+          background: #0000ff;
+          padding: 12px;
+        `;
+    "#;
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/Button.jsx"),
+        source,
+    );
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0].name, "Button");
+
+    let document = compile_jsx_component(
+        Path::new("/project"),
+        &components[0],
+        &HashMap::new(),
+        &Stylesheet::default(),
+    );
+    let button = find_box(&document.root, "button").expect("button");
+    assert_eq!(button.style.background, Some(Rgba::new(0, 0, 255, 255)));
+    assert_eq!(button.style.padding.top, 12.);
+}
+
+#[test]
+fn styled_interpolations_and_nested_states_are_dropped() {
+    let source = r#"
+        const Button = styled.button`
+          color: #111111;
+          background: ${props => props.bg};
+          &:hover { color: #ff0000; }
+        `;
+    "#;
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/Button.jsx"),
+        source,
+    );
+    let document = compile_jsx_component(
+        Path::new("/project"),
+        &components[0],
+        &HashMap::new(),
+        &Stylesheet::default(),
+    );
+    let button = find_box(&document.root, "button").expect("button");
+    assert_eq!(button.style.color, Some(Rgba::new(0x11, 0x11, 0x11, 255)));
+    // The prop-dependent background and the hover state must not be guessed at.
+    assert_eq!(button.style.background, None);
 }

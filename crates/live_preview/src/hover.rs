@@ -21,6 +21,9 @@ use crate::compiler::{
 /// Extensions the hover card knows how to render.
 const JSX_EXTENSIONS: &[&str] = &["jsx", "tsx", "js", "ts", "mjs"];
 const HTML_EXTENSIONS: &[&str] = &["html", "htm"];
+/// Single-file components: markup and styles live in the same file, which is
+/// exactly the shape the HTML path already handles.
+const SFC_EXTENSIONS: &[&str] = &["vue", "svelte", "astro"];
 
 /// Module specifiers a component import might use, in resolution order.
 const MODULE_SUFFIXES: &[&str] = &[
@@ -117,12 +120,40 @@ pub fn preview_at_offset(
         .unwrap_or_default();
 
     if HTML_EXTENSIONS.contains(&extension.as_str()) {
-        return html_preview(project_root, file_path, source, byte_offset);
+        return html_preview(project_root, file_path, source, byte_offset, None);
+    }
+    if SFC_EXTENSIONS.contains(&extension.as_str()) {
+        // The file carries its own <style>, so it needs no page stylesheet.
+        let sheet = sfc_stylesheet(source);
+        return html_preview(project_root, file_path, source, byte_offset, Some(sheet));
     }
     if JSX_EXTENSIONS.contains(&extension.as_str()) {
         return component_preview(project_root, file_path, source, byte_offset);
     }
     None
+}
+
+/// The stylesheet from a single-file component's own `<style>` blocks.
+fn sfc_stylesheet(source: &str) -> Stylesheet {
+    let mut sheet = Stylesheet::default();
+    let lower = source.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("<style") {
+        let open = cursor + relative;
+        let Some(content_start) = lower[open..].find('>').map(|offset| open + offset + 1) else {
+            break;
+        };
+        let Some(close) = lower[content_start..].find("</style>") else {
+            break;
+        };
+        if let Some(text) = source.get(content_start..content_start + close) {
+            // `lang="scss"` is common here and the parser handles nesting, so
+            // the block needs no special casing.
+            sheet.extend(Stylesheet::parse(text));
+        }
+        cursor = content_start + close;
+    }
+    sheet
 }
 
 /// The target at `byte_offset`, without compiling it. Split out so the editor
@@ -133,7 +164,9 @@ pub fn target_at_offset(file_path: &Path, source: &str, byte_offset: usize) -> O
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    if HTML_EXTENSIONS.contains(&extension.as_str()) {
+    if HTML_EXTENSIONS.contains(&extension.as_str())
+        || SFC_EXTENSIONS.contains(&extension.as_str())
+    {
         let (start, end) = html_element_range_at(source, byte_offset)?;
         return Some(HoverTarget::HtmlElement { start, end });
     }
@@ -378,10 +411,16 @@ fn html_preview(
     file_path: &Path,
     source: &str,
     byte_offset: usize,
+    // Supplied for single-file components, whose styles are in the file itself
+    // rather than behind a `<link>`.
+    own_sheet: Option<Stylesheet>,
 ) -> Option<HoverPreview> {
     let (start, end) = html_element_range_at(source, byte_offset)?;
     let markup = source.get(start..end)?;
-    let sheet = page_stylesheet(project_root, file_path);
+    let sheet = match own_sheet {
+        Some(sheet) => sheet,
+        None => page_stylesheet(project_root, file_path),
+    };
     let document = compile_html_fragment(project_root, file_path, markup, &sheet);
     if document.is_blank() {
         return None;
@@ -406,7 +445,8 @@ const VOID_TAGS: &[&str] = &[
 /// dropped by the compiler (it has no vector renderer), so targeting them
 /// produced a card that was titled `path` and completely blank.
 const NON_TARGET_TAGS: &[&str] = &[
-    "html", "head", "body", "script", "style", "title", "meta", "link", "base", "svg", "path",
+    "html", "head", "body", "script", "style", "title", "meta", "link", "base", "template",
+    "svg", "path",
     "g", "circle", "ellipse", "rect", "line", "polyline", "polygon", "defs", "use", "symbol",
     "clippath", "mask", "filter", "lineargradient", "radialgradient", "stop", "tspan",
 ];

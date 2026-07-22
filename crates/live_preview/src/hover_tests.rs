@@ -237,3 +237,90 @@ fn a_target_with_only_a_background_is_not_blank() {
     );
     assert!(!document.is_blank());
 }
+
+// ── single-file components ──────────────────────────────────────────────────
+
+fn sfc(path: &str, source: &str, anchor: &str) -> Option<HoverTarget> {
+    let offset = source.find(anchor).expect("anchor present");
+    target_at_offset(Path::new(path), source, offset)
+}
+
+#[test]
+fn vue_template_elements_are_targets() {
+    let source = r#"
+<template>
+  <section class="hero"><p>hi</p></section>
+</template>
+<script>export default {}</script>
+<style>.hero { background: #101418; }</style>
+"#;
+    let Some(HoverTarget::HtmlElement { start, end }) =
+        sfc("/project/src/Hero.vue", source, "<section")
+    else {
+        panic!("expected an element");
+    };
+    assert!(source[start..end].contains("<p>hi</p>"));
+}
+
+#[test]
+fn the_template_wrapper_itself_is_not_a_target() {
+    let source = "<template>
+  <p>hi</p>
+</template>";
+    assert_eq!(sfc("/project/src/A.vue", source, "<template"), None);
+}
+
+#[test]
+fn svelte_markup_is_a_target() {
+    let source = r#"
+<script>let name = 'world';</script>
+<h1 class="title">hello</h1>
+<style>.title { color: #00ff00; }</style>
+"#;
+    assert!(matches!(
+        sfc("/project/src/App.svelte", source, "<h1"),
+        Some(HoverTarget::HtmlElement { .. })
+    ));
+}
+
+#[test]
+fn a_single_file_component_is_styled_by_its_own_style_block() {
+    let source = r#"
+<template>
+  <section class="hero">hi</section>
+</template>
+<style>.hero { background: #0000ff; padding: 16px; }</style>
+"#;
+    let offset = source.find("<section").expect("anchor");
+    let preview = preview_at_offset(
+        Path::new("/project"),
+        Path::new("/project/src/Hero.vue"),
+        source,
+        offset,
+    )
+    .expect("a preview");
+    assert_eq!(preview.label, "section.hero");
+    // The style block travels with the file, so no stylesheet lookup is needed.
+    assert!(!preview.document.is_blank());
+}
+
+#[test]
+fn scoped_and_scss_style_blocks_are_read_too() {
+    let source = r#"
+<template>
+  <div class="card"><span class="tag">hi</span></div>
+</template>
+<style lang="scss" scoped>
+.card { color: #111111; .tag { color: #00ff00; } }
+</style>
+"#;
+    let offset = source.find("<div").expect("anchor");
+    let preview = preview_at_offset(
+        Path::new("/project"),
+        Path::new("/project/src/Card.vue"),
+        source,
+        offset,
+    )
+    .expect("a preview");
+    assert!(!preview.document.is_blank());
+}
