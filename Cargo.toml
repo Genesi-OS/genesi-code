@@ -54,6 +54,7 @@ jsonrpc = { path = "crates/jsonrpc" }
 languages = { path = "crates/languages" }
 local_control = { path = "crates/local_control" }
 lsp = { path = "crates/lsp" }
+live_preview = { path = "crates/live_preview" }
 markdown_parser = { path = "crates/markdown_parser" }
 mcp = { path = "crates/mcp" }
 natural_language_detection = { path = "crates/natural_language_detection" }

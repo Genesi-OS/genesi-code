@@ -1,0 +1,18 @@
+[package]
+name = "live_preview"
+version = "0.0.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Everything here is UI-free on purpose: turning project source into a
+# renderable tree has no business depending on the window toolkit, and keeping
+# it in its own crate means its tests link a small binary instead of the whole
+# app (which does not fit in memory on every machine).
+
+[dependencies]
+html5ever.workspace = true
+markup5ever_rcdom = "0.35.0"
+serde_json.workspace = true
+walkdir.workspace = true

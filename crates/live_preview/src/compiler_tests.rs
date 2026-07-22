@@ -479,6 +479,21 @@ fn dev_server_plan_renders_its_command() {
 
 // ── budgets ─────────────────────────────────────────────────────────────────
 
+/// Depth of the deepest chain of boxes in the tree.
+fn tree_depth(node: &PreviewNode) -> usize {
+    match node {
+        PreviewNode::Box(preview_box) => {
+            1 + preview_box
+                .children
+                .iter()
+                .map(tree_depth)
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 1,
+    }
+}
+
 #[test]
 fn deeply_nested_markup_stays_within_the_node_budget() {
     let mut html = String::from("<html><body>");
@@ -495,5 +510,12 @@ fn deeply_nested_markup_stays_within_the_node_budget() {
         document.root.node_count() <= 1_600,
         "budget exceeded: {}",
         document.root.node_count()
+    );
+    // The budget alone does not bound recursion; without a depth cap this
+    // input overflows the stack rather than producing a truncated tree.
+    assert!(
+        tree_depth(&document.root) <= 70,
+        "nesting not bounded: {}",
+        tree_depth(&document.root)
     );
 }
