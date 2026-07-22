@@ -492,7 +492,7 @@ fn deeply_nested_markup_stays_within_the_node_budget() {
     html.push_str("</body></html>");
     let document = compile(&html);
     assert!(
-        document.root.node_count() <= 4_100,
+        document.root.node_count() <= 1_600,
         "budget exceeded: {}",
         document.root.node_count()
     );

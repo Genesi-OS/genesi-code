@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::icons::Icon as CoreIcon;
@@ -21,6 +22,7 @@ use warpui::elements::{
     Stack,
 };
 use warpui::geometry::vector::vec2f;
+use warpui::r#async::Timer;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ViewContext;
 
@@ -84,6 +86,22 @@ impl PreviewPart {
     }
 }
 
+/// A snapshot of the dev server, cheap enough to read every frame.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DevServerStatus {
+    pub(crate) running: bool,
+    pub(crate) url: Option<String>,
+    pub(crate) exited: Option<i32>,
+    /// Only the tail the panel actually shows, so the full log never gets
+    /// cloned into the render path.
+    pub(crate) log_tail: Vec<String>,
+}
+
+/// How many log lines the panel keeps for display.
+const SERVER_LOG_TAIL: usize = 6;
+/// How often the cached server status refreshes while a server is alive.
+const SERVER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub(crate) struct LivePreviewPanelState {
     pub(crate) state: LivePreviewState,
@@ -110,6 +128,11 @@ pub(crate) struct LivePreviewPanelState {
     pub(crate) from_source: bool,
     pub(crate) server_document: Option<Arc<PreviewDocument>>,
     pub(crate) server_error: Option<String>,
+    /// Cached view of the dev server. Rendering used to ask the handle
+    /// directly, which meant a `waitpid` and two clones of the log buffer on
+    /// every single frame; now a 1s poll refreshes this and rendering is a
+    /// plain field read.
+    pub(crate) server_status: DevServerStatus,
     #[cfg(not(target_family = "wasm"))]
     pub(crate) server: Option<DevServerHandle>,
 }
@@ -386,10 +409,13 @@ impl LocalAiChatView {
                 self.preview.server = Some(handle);
                 self.preview.server_error = None;
                 self.preview.from_source = false;
+                self.refresh_server_status();
+                self.poll_server_status(ctx);
             }
             Err(error) => {
                 self.preview.server = None;
                 self.preview.server_error = Some(error);
+                self.refresh_server_status();
             }
         }
         ctx.notify();
@@ -409,6 +435,7 @@ impl LocalAiChatView {
         }
         self.preview.server_document = None;
         self.preview.from_source = true;
+        self.refresh_server_status();
         ctx.notify();
     }
 
@@ -481,56 +508,77 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    /// Rebuilds [`DevServerStatus`] from the live handle. This is the only
+    /// place that touches the process; everything else reads the cache.
     #[cfg(not(target_family = "wasm"))]
-    fn server_is_running(&self) -> bool {
-        self.preview
-            .server
-            .as_ref()
-            .is_some_and(|server| server.is_running())
+    fn refresh_server_status(&mut self) {
+        let Some(server) = self.preview.server.as_ref() else {
+            self.preview.server_status = DevServerStatus::default();
+            return;
+        };
+        let running = server.is_running();
+        let snapshot = server.snapshot();
+        let start = snapshot.lines.len().saturating_sub(SERVER_LOG_TAIL);
+        self.preview.server_status = DevServerStatus {
+            running,
+            // A server that already exited has no URL worth showing.
+            url: snapshot.exited.is_none().then_some(snapshot.url).flatten(),
+            exited: snapshot.exited,
+            log_tail: snapshot.lines[start..].to_vec(),
+        };
     }
 
     #[cfg(target_family = "wasm")]
-    fn server_is_running(&self) -> bool {
-        false
+    fn refresh_server_status(&mut self) {
+        self.preview.server_status = DevServerStatus::default();
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    /// Keeps the cached status fresh while a server is alive, then stops. The
+    /// panel is otherwise completely idle between user actions.
+    fn poll_server_status(&mut self, ctx: &mut ViewContext<Self>) {
+        let generation = self.preview.generation;
+        ctx.spawn(
+            async move {
+                Timer::after(SERVER_POLL_INTERVAL).await;
+            },
+            move |me, _, ctx| {
+                if me.preview.generation != generation {
+                    return;
+                }
+                let was = me.preview.server_status.clone();
+                me.refresh_server_status();
+                let status = &me.preview.server_status;
+                let changed = status.running != was.running
+                    || status.url != was.url
+                    || status.exited != was.exited
+                    || status.log_tail != was.log_tail;
+                let keep_polling = status.running || status.exited.is_none() && was.running;
+                if changed {
+                    ctx.notify();
+                }
+                if keep_polling {
+                    me.poll_server_status(ctx);
+                }
+            },
+        );
+    }
+
+    fn server_is_running(&self) -> bool {
+        self.preview.server_status.running
+    }
+
     fn server_url(&self) -> Option<String> {
-        let snapshot = self.preview.server.as_ref()?.snapshot();
-        // A server that already exited has no URL worth showing.
-        snapshot.exited.is_none().then_some(snapshot.url).flatten()
+        self.preview.server_status.url.clone()
     }
 
     /// The exit code of a dev server that stopped on its own, so the panel can
     /// say so instead of leaving a dead "running" state on screen.
-    #[cfg(not(target_family = "wasm"))]
     fn server_exit_code(&self) -> Option<i32> {
-        self.preview.server.as_ref()?.snapshot().exited
+        self.preview.server_status.exited
     }
 
-    #[cfg(target_family = "wasm")]
-    fn server_exit_code(&self) -> Option<i32> {
-        None
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn server_url(&self) -> Option<String> {
-        None
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    fn server_log_tail(&self, lines: usize) -> Vec<String> {
-        let Some(server) = self.preview.server.as_ref() else {
-            return Vec::new();
-        };
-        let snapshot = server.snapshot();
-        let start = snapshot.lines.len().saturating_sub(lines);
-        snapshot.lines[start..].to_vec()
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn server_log_tail(&self, _lines: usize) -> Vec<String> {
-        Vec::new()
+    fn server_log_tail(&self) -> &[String] {
+        &self.preview.server_status.log_tail
     }
 
     // ── rendering ───────────────────────────────────────────────────────────
@@ -1124,7 +1172,7 @@ impl LocalAiChatView {
             );
         }
 
-        let log = self.server_log_tail(6);
+        let log = self.server_log_tail();
         if !log.is_empty() {
             column.add_child(
                 Container::new(

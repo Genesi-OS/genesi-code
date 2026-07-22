@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -42,10 +43,10 @@ use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::path::to_relative_path;
 use warp_util::sync::Condition;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, DropShadow, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
-    Rect, Shrinkable, Stack, Text,
+    Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Flex, Hoverable, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
+    ParentOffsetBounds, Radius, Rect, Shrinkable, Stack, Text,
 };
 use warpui::keymap::macros::*;
 use warpui::keymap::FixedBinding;
@@ -60,6 +61,8 @@ use warpui::{
 };
 
 #[cfg(feature = "local_fs")]
+use crate::ai::component_hover::{self, HoverPreview};
+use crate::ai::live_preview_view::{render_document, sheet_background, PreviewScale};
 use crate::ai::persisted_workspace::{LSPInstallationStatus, LspRepoStatus};
 use crate::ai::persisted_workspace::{PersistedWorkspace, PersistedWorkspaceEvent};
 use crate::code::buffer_location::LocalOrRemotePath as BufferFileLocation;
@@ -82,9 +85,25 @@ const DROP_SHADOW_COLOR: ColorU = ColorU {
 };
 
 const HOVER_DEBOUNCE_PERIOD: Duration = Duration::from_millis(500);
+/// How long the pointer must rest on a component before its rendered preview
+/// appears. Deliberately longer than the LSP hover: the card is large, so it
+/// should only show up when the user clearly meant to ask for it.
+const COMPONENT_HOVER_PERIOD: Duration = Duration::from_millis(2000);
+const COMPONENT_HOVER_MAX_HEIGHT: f32 = 420.;
 const FLOW_KEY_INTERVAL: Duration = Duration::from_millis(180);
 const FLOW_SETTLE_PERIOD: Duration = Duration::from_millis(2500);
 const FLOW_STREAK_THRESHOLD: u8 = 8;
+
+/// `CharOffset` indexes characters; the hover resolver slices bytes. Returns
+/// `None` when the offset is past the end of the buffer.
+fn char_offset_to_byte_offset(source: &str, offset: CharOffset) -> Option<usize> {
+    let target = offset.as_usize();
+    source
+        .char_indices()
+        .nth(target)
+        .map(|(index, _)| index)
+        .or_else(|| (source.chars().count() == target).then_some(source.len()))
+}
 
 fn should_run_autosave(
     scheduled_version: ContentVersion,
@@ -229,6 +248,17 @@ pub(super) enum HoverContentSegment {
 }
 
 /// State for the LSP hover tooltip.
+/// The component preview card shown after the pointer rests on a component
+/// reference (or an HTML element) for [`COMPONENT_HOVER_PERIOD`].
+pub(super) struct ComponentHoverState {
+    /// The offset the card was resolved for. Re-entering the same token must
+    /// not recompile it.
+    pub(super) offset: CharOffset,
+    pub(super) preview: Arc<HoverPreview>,
+    /// Lets the pointer move onto the card itself without dismissing it.
+    pub(super) mouse_state: MouseStateHandle,
+}
+
 pub(super) enum LspHoverState {
     None,
     Loading(Option<AbortHandle>),
@@ -342,6 +372,12 @@ pub struct LocalCodeEditorView {
     context_menu_state: ContextMenuState,
     /// Channel for debouncing hover requests.
     hover_debounce_tx: async_channel::Sender<CharOffset>,
+    /// Channel for the slower, component-preview hover (see
+    /// [`COMPONENT_HOVER_PERIOD`]). Kept separate from the LSP hover so the
+    /// preview works with no language server running.
+    component_hover_tx: async_channel::Sender<CharOffset>,
+    /// The rendered component/element card currently on screen.
+    pub(super) component_hover: Option<ComponentHoverState>,
     /// State for the LSP hover tooltip.
     pub(super) lsp_hover_state: LspHoverState,
     /// State for the LSP completion popup (classic, non-AI autocomplete).
@@ -461,8 +497,15 @@ impl LocalCodeEditorView {
                             false
                         };
 
+                    // The pointer moving onto either card must keep that card up.
+                    let is_over_component_card = me
+                        .component_hover
+                        .as_ref()
+                        .and_then(|hover| hover.mouse_state.lock().ok())
+                        .is_some_and(|state| state.is_mouse_over_element());
+
                     // If the mouse is over the hover card, don't clear the hover state.
-                    if is_over_hover_card {
+                    if is_over_hover_card || is_over_component_card {
                         return;
                     }
 
@@ -470,6 +513,7 @@ impl LocalCodeEditorView {
                         .editor
                         .update(ctx, |editor, ctx| editor.clear_hovered_symbol_range(ctx));
                     updated = updated || me.lsp_hover_state.clear();
+                    updated = updated || me.component_hover.take().is_some();
 
                     if updated {
                         ctx.notify();
@@ -489,6 +533,22 @@ impl LocalCodeEditorView {
                             ctx.notify();
                         }
                     });
+
+                    // The component preview is independent of the language
+                    // server: it only needs the file's own text. Moving off the
+                    // token that produced the current card dismisses it.
+                    let stale_card = me
+                        .component_hover
+                        .as_ref()
+                        .is_some_and(|hover| hover.offset != *offset);
+                    if stale_card {
+                        me.component_hover = None;
+                        ctx.notify();
+                    }
+                    if me.component_hover.is_none() {
+                        let _ = me.component_hover_tx.try_send(*offset);
+                    }
+
                     // Queue hover request for documentation/type info (debounced).
                     if me.is_lsp_server_available(ctx) {
                         // Two conditions where we should early return:
@@ -556,6 +616,14 @@ impl LocalCodeEditorView {
             |_, _| {},
         );
 
+        // The component preview rides the same hover events on a longer fuse.
+        let (component_hover_tx, component_hover_rx) = async_channel::unbounded();
+        ctx.spawn_stream_local(
+            debounce(COMPONENT_HOVER_PERIOD, component_hover_rx),
+            |me, offset, ctx| me.component_preview_for_offset(offset, ctx),
+            |_, _| {},
+        );
+
         let model = Self {
             editor,
             diff_type,
@@ -575,6 +643,8 @@ impl LocalCodeEditorView {
             context_menu,
             context_menu_state: Default::default(),
             hover_debounce_tx,
+            component_hover_tx,
+            component_hover: None,
             lsp_hover_state: LspHoverState::None,
             lsp_completion_state: LspCompletionState::None,
             completion_request_generation: 0,
@@ -1039,6 +1109,143 @@ impl LocalCodeEditorView {
     }
 
     /// Get the positioning for the hover tooltip based on the hovered symbol position.
+    /// Resolves and compiles whatever the pointer settled on. Parsing and file
+    /// reads happen off the UI thread — the card is allowed to be late, never
+    /// to stall a frame.
+    fn component_preview_for_offset(&mut self, offset: CharOffset, ctx: &mut ViewContext<Self>) {
+        let Some(file_path) = self.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let source = self.editor.as_ref(ctx).text(ctx).into_string();
+        // `CharOffset` counts characters; the resolver works in bytes.
+        let Some(byte_offset) = char_offset_to_byte_offset(&source, offset) else {
+            return;
+        };
+
+        // Bail before spawning when there is plainly nothing under the cursor —
+        // this is the overwhelmingly common case on a settled hover.
+        if component_hover::target_at_offset(&file_path, &source, byte_offset).is_none() {
+            return;
+        }
+
+        ctx.spawn(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let project_root = component_hover::infer_project_root(&file_path);
+                    component_hover::preview_at_offset(
+                        &project_root,
+                        &file_path,
+                        &source,
+                        byte_offset,
+                    )
+                })
+                .await
+            },
+            move |me, result, ctx| {
+                let Ok(Some(preview)) = result else {
+                    return;
+                };
+                me.component_hover = Some(ComponentHoverState {
+                    offset,
+                    preview: Arc::new(preview),
+                    mouse_state: MouseStateHandle::default(),
+                });
+                ctx.notify();
+            },
+        );
+    }
+
+    fn component_hover_positioning(&self, app: &AppContext) -> Option<OffsetPositioning> {
+        let hover = self.component_hover.as_ref()?;
+        self.compute_card_positioning(hover.offset, COMPONENT_HOVER_MAX_HEIGHT, app)
+    }
+
+    /// The card itself: a titled surface wrapping the same renderer the Live
+    /// Preview page uses, so a component looks here exactly as it does there.
+    fn render_component_hover_card(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        let hover = self.component_hover.as_ref()?;
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let preview = hover.preview.clone();
+
+        let origin = preview
+            .origin
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let title = appearance
+            .ui_builder()
+            .wrappable_text(preview.label.clone(), false)
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.monospace_font_family()),
+                font_size: Some(12.),
+                font_color: Some(theme.main_text_color(theme.background()).into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        let subtitle = appearance
+            .ui_builder()
+            .wrappable_text(origin, false)
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.ui_font_family()),
+                font_size: Some(10.),
+                font_color: Some(theme.disabled_text_color(theme.background()).into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        let sheet = Container::new(render_document(
+            appearance,
+            &preview.document,
+            PreviewScale(0.9),
+        ))
+        .with_uniform_padding(10.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_background_color(sheet_background(&preview.document))
+        .finish();
+
+        let card = Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(
+                    Container::new(
+                        Flex::row()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_child(Expanded::new(1., title).finish())
+                            .with_child(subtitle)
+                            .finish(),
+                    )
+                    .with_margin_bottom(8.)
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(Clipped::new(sheet).finish())
+                        .with_max_height(COMPONENT_HOVER_MAX_HEIGHT)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(12.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish();
+
+        // Wrapping in a `Hoverable` is what lets the pointer travel onto the
+        // card (to scroll or read it) without the card dismissing itself.
+        Some(
+            ConstrainedBox::new(
+                Hoverable::new(hover.mouse_state.clone(), |_state| card).finish(),
+            )
+            .with_width(460.)
+            .finish(),
+        )
+    }
+
     fn hover_tooltip_positioning(&self, app: &AppContext) -> Option<OffsetPositioning> {
         let offset_start = match &self.lsp_hover_state {
             LspHoverState::Loaded {
@@ -2566,6 +2773,14 @@ impl View for LocalCodeEditorView {
             self.hover_tooltip_positioning(app),
         ) {
             stack.add_positioned_overlay_child(hover_tooltip, positioning);
+        }
+
+        // Rendered component/element preview, shown after a settled hover.
+        if let (Some(card), Some(positioning)) = (
+            self.render_component_hover_card(app),
+            self.component_hover_positioning(app),
+        ) {
+            stack.add_positioned_overlay_child(card, positioning);
         }
 
         // Render the classic (non-AI) LSP completion popup when active.

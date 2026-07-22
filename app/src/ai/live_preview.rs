@@ -1642,7 +1642,10 @@ pub fn compile_html(project_root: &Path, path: &Path, html: &str) -> PreviewDocu
         project_root: project_root.to_path_buf(),
         components: None,
         depth: 0,
-        budget: 4_000,
+        // The whole tree is rebuilt every frame, and the app crate is not
+        // optimised in dev builds, so this bound is what keeps a large page
+        // from dominating the frame. Pages past it are truncated, not dropped.
+        budget: 1_500,
     };
     let ancestry = Vec::new();
     let mut root_style = ComputedStyle::default();

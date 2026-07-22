@@ -29,6 +29,7 @@ pub(crate) mod document;
 pub(crate) mod get_relevant_files;
 pub mod harness_availability;
 pub(crate) mod harness_display;
+pub(crate) mod component_hover;
 pub(crate) mod live_preview;
 pub(crate) mod live_preview_panel;
 #[cfg(not(target_family = "wasm"))]
