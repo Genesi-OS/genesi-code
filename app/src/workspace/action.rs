@@ -326,6 +326,26 @@ pub enum WorkspaceAction {
     UpdateGenesiCanvasDrag(Vector2F),
     EndGenesiCanvasDrag,
     SelectGenesiCanvasNode(String),
+    /// Open (or close, when already open) the Live Preview workspace.
+    ToggleGenesiPreview,
+    CloseGenesiPreview,
+    /// Re-scan the project for pages and components.
+    RefreshGenesiPreview,
+    /// Render the page at this index of the project's page list.
+    SelectGenesiPreviewPage(usize),
+    /// Show the inline preview card for a component, or `None` to hide it.
+    HoverGenesiPreviewComponent(Option<String>),
+    /// Pin the hovered component so it stays open while the pointer moves away.
+    SelectGenesiPreviewComponent(String),
+    ZoomGenesiPreview(f32),
+    /// Start / stop the project's own dev server (the one action in the preview
+    /// that executes project code).
+    StartGenesiPreviewServer,
+    StopGenesiPreviewServer,
+    /// Re-fetch the served page and render whatever the server returned.
+    ReloadGenesiPreviewFromServer,
+    /// Switch between rendering project source and rendering the served page.
+    SetGenesiPreviewFromSource(bool),
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -1021,6 +1041,17 @@ impl WorkspaceAction {
             | UpdateGenesiCanvasDrag(_)
             | EndGenesiCanvasDrag
             | SelectGenesiCanvasNode(_)
+            | ToggleGenesiPreview
+            | CloseGenesiPreview
+            | RefreshGenesiPreview
+            | SelectGenesiPreviewPage(_)
+            | HoverGenesiPreviewComponent(_)
+            | SelectGenesiPreviewComponent(_)
+            | ZoomGenesiPreview(_)
+            | StartGenesiPreviewServer
+            | StopGenesiPreviewServer
+            | ReloadGenesiPreviewFromServer
+            | SetGenesiPreviewFromSource(_)
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

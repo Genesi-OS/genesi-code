@@ -40,6 +40,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) avatar_icon: MouseStateHandle,
     pub(super) header_dimming: MouseStateHandle,
     pub(super) right_panel_icon: MouseStateHandle,
+    /// Genesi: entrypoint button for the Live Preview workspace.
+    pub(super) live_preview_icon: MouseStateHandle,
     pub(super) notifications_mailbox: MouseStateHandle,
     pub(super) session_config_tab_config_chip_close: MouseStateHandle,
     pub(super) tools_panel_icon: MouseStateHandle,

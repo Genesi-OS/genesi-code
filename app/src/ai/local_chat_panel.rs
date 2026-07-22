@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
 use parking_lot::RwLock;
+use pathfinder_geometry::rect::RectF;
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use warp_core::ui::color::blend::Blend;
@@ -50,9 +51,10 @@ use super::local_chat::{
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
 };
+use super::live_preview_panel::LivePreviewPanelState;
 use super::project_canvas_view::{
-    ProjectGraphCanvas, ProjectGraphColors, ProjectGraphMinimap, ProjectGraphNodeElement,
-    FORGE_NODE_HEIGHT, FORGE_NODE_WIDTH,
+    CanvasViewport, ProjectGraphCanvas, ProjectGraphColors, ProjectGraphMinimap,
+    ProjectGraphNodeElement, FORGE_NODE_HEIGHT, FORGE_NODE_WIDTH,
 };
 use crate::appearance::Appearance;
 use crate::code::local_code_editor::LocalCodeEditorView;
@@ -529,6 +531,12 @@ pub struct LocalAiChatView {
     project_canvas_pending_drag_pointer: Option<Vector2F>,
     project_canvas_palette_scroll: ClippedScrollStateHandle,
     project_canvas_inspector_scroll: ClippedScrollStateHandle,
+    /// Size of the graph surface, measured by the canvas element during layout
+    /// and read back here so off-screen nodes are never even built.
+    pub(super) project_canvas_viewport: CanvasViewport,
+    /// Everything the Live Preview workspace needs. Lives in its own type so
+    /// the preview's rendering can sit in [`super::live_preview_panel`].
+    pub(super) preview: LivePreviewPanelState,
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -597,6 +605,8 @@ impl LocalAiChatView {
             project_canvas_pending_drag_pointer: None,
             project_canvas_palette_scroll: ClippedScrollStateHandle::default(),
             project_canvas_inspector_scroll: ClippedScrollStateHandle::default(),
+            project_canvas_viewport: CanvasViewport::default(),
+            preview: LivePreviewPanelState::default(),
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -2305,11 +2315,30 @@ impl LocalAiChatView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let colors = self.project_graph_colors(appearance);
+        // Build elements only for nodes that can land on screen. The canvas
+        // element already skips laying out and painting off-screen nodes, but
+        // constructing their text and icons was still costing a full pass per
+        // frame — which is what made dragging a large graph crawl.
+        let viewport = self.project_canvas_viewport.get();
+        let node_size = vec2f(FORGE_NODE_WIDTH, FORGE_NODE_HEIGHT) * self.project_canvas_zoom;
+        // One node of slack on every side, so a node that is only just outside
+        // is still built and scrolls in without a pop.
+        let cull_bounds = (viewport.x() > 0. && viewport.y() > 0.)
+            .then(|| RectF::new(-node_size, viewport + node_size * 2.));
         let nodes = graph
             .nodes
             .iter()
             .filter_map(|node| {
                 let position = self.project_canvas_positions.get(&node.id).copied()?;
+                let screen_origin = self.project_canvas_pan + position * self.project_canvas_zoom;
+                if let Some(bounds) = cull_bounds {
+                    if bounds
+                        .intersection(RectF::new(screen_origin, node_size))
+                        .is_none()
+                    {
+                        return None;
+                    }
+                }
                 Some(ProjectGraphNodeElement::new(
                     node.id.clone(),
                     position,
@@ -2329,6 +2358,8 @@ impl LocalAiChatView {
             self.project_canvas_zoom,
             self.project_canvas_drag.is_some(),
             colors,
+            self.project_canvas_viewport.clone(),
+            self.project_canvas_positions.clone(),
         )
         .finish();
         let minimap = ConstrainedBox::new(

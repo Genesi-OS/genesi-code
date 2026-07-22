@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{vec2f, Vector2F};
 use warp_core::ui::color::coloru_with_opacity;
@@ -23,6 +24,32 @@ use crate::workspace::WorkspaceAction;
 
 pub const FORGE_NODE_WIDTH: f32 = 214.;
 pub const FORGE_NODE_HEIGHT: f32 = 116.;
+
+/// Hard ceiling on grid dots per frame. The dot field is the single most
+/// expensive thing the canvas draws — it is one rect each — so the spacing is
+/// widened until the field fits inside the budget instead of scaling with the
+/// surface size. While dragging, the budget shrinks again so a pan stays at
+/// frame rate on large windows.
+const GRID_DOT_BUDGET: usize = 1_100;
+const GRID_DOT_BUDGET_WHILE_DRAGGING: usize = 320;
+
+/// The canvas is the only thing that knows how large the graph surface actually
+/// is, and it only learns that during layout. Handing the measurement back
+/// through this shared cell lets the panel skip *building* elements for nodes
+/// that are nowhere near the viewport — culling in [`Element::layout`] alone
+/// still pays for constructing every node's text and icons each frame.
+#[derive(Clone, Default)]
+pub struct CanvasViewport(Arc<Mutex<Vector2F>>);
+
+impl CanvasViewport {
+    pub fn get(&self) -> Vector2F {
+        *self.0.lock()
+    }
+
+    fn set(&self, size: Vector2F) {
+        *self.0.lock() = size;
+    }
+}
 
 pub struct ProjectGraphNodeElement {
     pub id: String,
@@ -64,6 +91,11 @@ pub struct ProjectGraphCanvas {
     colors: ProjectGraphColors,
     size: Vector2F,
     origin: Option<Point>,
+    viewport: CanvasViewport,
+    /// Every node's sheet position, including the ones culled out of `nodes`.
+    /// Connections are drawn from this, so an edge leaving the viewport still
+    /// reaches its off-screen endpoint instead of disappearing.
+    positions: Arc<HashMap<String, Vector2F>>,
 }
 
 impl ProjectGraphCanvas {
@@ -74,6 +106,8 @@ impl ProjectGraphCanvas {
         zoom: f32,
         drag_active: bool,
         colors: ProjectGraphColors,
+        viewport: CanvasViewport,
+        positions: Arc<HashMap<String, Vector2F>>,
     ) -> Self {
         Self {
             graph,
@@ -84,6 +118,8 @@ impl ProjectGraphCanvas {
             colors,
             size: Vector2F::zero(),
             origin: None,
+            viewport,
+            positions,
         }
     }
 
@@ -123,17 +159,59 @@ impl ProjectGraphCanvas {
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(1.)));
     }
 
+    /// Paints the dot field. The spacing is widened until the field fits inside
+    /// the frame's dot budget, so the cost is bounded by the budget rather than
+    /// by the window size — a maximised canvas used to draw thousands of
+    /// individually rounded rects every frame, which is what made panning and
+    /// node dragging stutter.
+    fn paint_grid(&self, origin: Vector2F, ctx: &mut PaintContext) {
+        let budget = if self.drag_active {
+            GRID_DOT_BUDGET_WHILE_DRAGGING
+        } else {
+            GRID_DOT_BUDGET
+        };
+        let mut spacing = (32. * self.zoom).clamp(24., 52.);
+        // Each widening step quarters the dot count, so this converges fast.
+        for _ in 0..6 {
+            let columns = (self.size.x() / spacing).ceil().max(1.) as usize;
+            let rows = (self.size.y() / spacing).ceil().max(1.) as usize;
+            if columns.saturating_mul(rows) <= budget {
+                break;
+            }
+            spacing *= 2.;
+        }
+
+        // Square dots: at 1–3 px a rounded rect is indistinguishable from a
+        // plain one, and the plain path skips the corner tessellation.
+        let dot = (1.6 * self.zoom).clamp(1., 2.4);
+        let start_x = origin.x() + self.pan.x().rem_euclid(spacing);
+        let start_y = origin.y() + self.pan.y().rem_euclid(spacing);
+        let end_x = origin.x() + self.size.x();
+        let end_y = origin.y() + self.size.y();
+
+        let mut x = start_x;
+        while x < end_x {
+            let mut y = start_y;
+            while y < end_y {
+                ctx.scene
+                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(dot, dot)))
+                    .with_background(self.colors.grid);
+                y += spacing;
+            }
+            x += spacing;
+        }
+    }
+
     fn draw_connection(
         &self,
         edge: &CanvasEdge,
         origin: Vector2F,
         viewport: RectF,
-        positions: &HashMap<&str, Vector2F>,
         ctx: &mut PaintContext,
     ) {
         let (Some(from), Some(to)) = (
-            positions.get(edge.from.as_str()),
-            positions.get(edge.to.as_str()),
+            self.positions.get(edge.from.as_str()),
+            self.positions.get(edge.to.as_str()),
         ) else {
             return;
         };
@@ -200,6 +278,7 @@ impl Element for ProjectGraphCanvas {
             width.max(constraint.min.x()),
             height.max(constraint.min.y()),
         );
+        self.viewport.set(self.size);
         let node_size = vec2f(FORGE_NODE_WIDTH, FORGE_NODE_HEIGHT) * self.zoom;
         let viewport = RectF::new(Vector2F::zero(), self.size);
         for node in &mut self.nodes {
@@ -232,30 +311,10 @@ impl Element for ProjectGraphCanvas {
             .draw_rect_with_hit_recording(bounds)
             .with_background(self.colors.background);
 
-        let spacing = (28. * self.zoom).clamp(18., 42.) * if self.drag_active { 2. } else { 1. };
-        let dot = (1.6 * self.zoom).clamp(1., 2.4);
-        let start_x = origin.x() + self.pan.x().rem_euclid(spacing);
-        let start_y = origin.y() + self.pan.y().rem_euclid(spacing);
-        let mut x = start_x;
-        while x < origin.x() + self.size.x() {
-            let mut y = start_y;
-            while y < origin.y() + self.size.y() {
-                ctx.scene
-                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(dot, dot)))
-                    .with_background(self.colors.grid)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)));
-                y += spacing;
-            }
-            x += spacing;
-        }
+        self.paint_grid(origin, ctx);
 
-        let positions = self
-            .nodes
-            .iter()
-            .map(|node| (node.id.as_str(), node.position))
-            .collect::<HashMap<_, _>>();
         for edge in &self.graph.edges {
-            self.draw_connection(edge, origin, bounds, &positions, ctx);
+            self.draw_connection(edge, origin, bounds, ctx);
         }
 
         for node in &mut self.nodes {

@@ -554,6 +554,10 @@ const LOCAL_AI_PANEL_MAX_WIDTH: f32 = 720.;
 const THEME_CHOOSER_RATIO: f32 = 3.5;
 const GENESI_SHELL_PANEL_GAP: f32 = 6.0;
 const GENESI_SHELL_PANEL_RADIUS: f32 = 8.0;
+/// Breathing room between the shell's panel surfaces and the window edges. The
+/// panels already leave [`GENESI_SHELL_PANEL_GAP`] between each other; without
+/// this they still ran flush into the top and side chrome.
+const GENESI_SHELL_WINDOW_PADDING: f32 = 8.0;
 
 /// Save position for the tab bar.
 pub(crate) const TAB_BAR_POSITION_ID: &str = "workspace_view:tab_bar";
@@ -1063,6 +1067,8 @@ pub struct Workspace {
     genesi_vibe_mode: bool,
     genesi_tools_panel_open: bool,
     genesi_canvas_open: bool,
+    /// Genesi Live Preview workspace, mutually exclusive with the canvas.
+    genesi_preview_open: bool,
     // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
     // sidebar's "New Chat" button. These MUST live in the view (not be
     // `MouseStateHandle::default()` rebuilt each render): a button tracks the
@@ -3352,6 +3358,7 @@ impl Workspace {
             genesi_vibe_mode: false,
             genesi_tools_panel_open: false,
             genesi_canvas_open: false,
+            genesi_preview_open: false,
             genesi_vibe_button_mouse_state: Default::default(),
             genesi_ide_button_mouse_state: Default::default(),
             genesi_new_chat_button_mouse_state: Default::default(),
@@ -20682,6 +20689,11 @@ impl Workspace {
                 .with_margin_left(4.)
                 .finish(),
         );
+        target.add_child(
+            Container::new(self.render_genesi_preview_entrypoint_button(appearance))
+                .with_margin_left(4.)
+                .finish(),
+        );
 
         // Legacy AI assistant button (non-agent-mode only)
         if is_online
@@ -21342,6 +21354,25 @@ impl Workspace {
                 "Project Canvas".to_owned(),
                 None,
                 self.genesi_canvas_open,
+                false,
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
+    /// Genesi: entrypoint for the Live Preview workspace — the project's own
+    /// pages and components, rendered inside the app.
+    fn render_genesi_preview_entrypoint_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Align::new(
+            self.render_tab_bar_icon_button(
+                appearance,
+                icons::Icon::LayoutAlt01,
+                &self.mouse_states.live_preview_icon,
+                WorkspaceAction::ToggleGenesiPreview,
+                "Live Preview".to_owned(),
+                None,
+                self.genesi_preview_open,
                 false,
             )
             .finish(),
@@ -22173,6 +22204,17 @@ impl Workspace {
             .finish()
     }
 
+    /// Insets the whole panel row from the window edges. Panels carry their own
+    /// rounded surfaces, and without this inset the top-left one sat flush
+    /// against the tab bar and the window frame instead of floating inside it.
+    fn inset_shell(panels_row: Box<dyn Element>) -> Box<dyn Element> {
+        Container::new(panels_row)
+            .with_horizontal_padding(GENESI_SHELL_WINDOW_PADDING)
+            .with_padding_top(GENESI_SHELL_WINDOW_PADDING)
+            .with_padding_bottom(GENESI_SHELL_WINDOW_PADDING)
+            .finish()
+    }
+
     fn render_panel_separator(_app: &AppContext) -> Box<dyn Element> {
         ConstrainedBox::new(Empty::new().finish())
             .with_width(GENESI_SHELL_PANEL_GAP)
@@ -22211,6 +22253,24 @@ impl Workspace {
                             self.local_ai_panel
                                 .as_ref(app)
                                 .render_project_canvas_workspace(appearance),
+                        ),
+                    )
+                    .finish(),
+                )
+                .finish();
+        }
+
+        if self.genesi_preview_open {
+            let appearance = Appearance::as_ref(app);
+            return Flex::row()
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.wrap_in_main_surface(
+                            appearance,
+                            self.local_ai_panel
+                                .as_ref(app)
+                                .render_live_preview_workspace(appearance),
                         ),
                     )
                     .finish(),
@@ -24419,6 +24479,7 @@ impl TypedActionView for Workspace {
                 }
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_canvas_open = true;
+                self.genesi_preview_open = false;
                 self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.open_project_canvas(project_root, ctx)
@@ -24472,6 +24533,70 @@ impl TypedActionView for Workspace {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.select_project_canvas_node(id, ctx));
                 ctx.notify();
+            }
+            ToggleGenesiPreview => {
+                if self.genesi_preview_open {
+                    self.genesi_preview_open = false;
+                    ctx.notify();
+                    return;
+                }
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_preview_open = true;
+                self.genesi_canvas_open = false;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.open_live_preview(project_root, ctx));
+                ctx.notify();
+            }
+            CloseGenesiPreview => {
+                self.genesi_preview_open = false;
+                ctx.notify();
+            }
+            RefreshGenesiPreview => {
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_preview_open = true;
+                self.genesi_canvas_open = false;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.refresh_live_preview(project_root, ctx)
+                });
+                ctx.notify();
+            }
+            SelectGenesiPreviewPage(index) => {
+                let index = *index;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.select_live_preview_page(index, ctx));
+            }
+            HoverGenesiPreviewComponent(key) => {
+                let key = key.clone();
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.hover_live_preview_part(key, ctx));
+            }
+            SelectGenesiPreviewComponent(key) => {
+                let key = key.clone();
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.pin_live_preview_part(key, ctx));
+            }
+            ZoomGenesiPreview(delta) => {
+                let delta = *delta;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.zoom_live_preview(delta, ctx));
+            }
+            StartGenesiPreviewServer => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.start_live_preview_server(ctx));
+            }
+            StopGenesiPreviewServer => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.stop_live_preview_server(ctx));
+            }
+            ReloadGenesiPreviewFromServer => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.reload_live_preview_from_server(ctx));
+            }
+            SetGenesiPreviewFromSource(from_source) => {
+                let from_source = *from_source;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.set_live_preview_from_source(from_source, ctx)
+                });
             }
             SelectGenesiReviewFile(path) => {
                 self.genesi_tools_panel_open = true;
@@ -25915,7 +26040,7 @@ impl View for Workspace {
             let content = self.render_banner_and_active_tab(app, appearance);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
-            outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
+            outer_column.add_child(Shrinkable::new(1.0, Self::inset_shell(panels_row)).finish());
             Container::new(outer_column.finish())
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()
@@ -25926,7 +26051,7 @@ impl View for Workspace {
             }
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
-            outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
+            outer_column.add_child(Shrinkable::new(1.0, Self::inset_shell(panels_row)).finish());
             Container::new(outer_column.finish())
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()

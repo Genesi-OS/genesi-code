@@ -117,6 +117,9 @@ fuzzy_match.workspace = true
 getset.workspace = true
 handlebars.workspace = true
 hex.workspace = true
+# Genesi Live Preview parses project HTML into a renderable tree.
+html5ever.workspace = true
+markup5ever_rcdom = "0.35.0"
 http.workspace = true
 http_client.workspace = true
 image.workspace = true
