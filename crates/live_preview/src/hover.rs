@@ -44,7 +44,16 @@ const GLOBAL_STYLESHEET_NAMES: &[&str] = &[
     "style.css",
     "app.css",
     "main.css",
+    // Where a Tailwind build usually lands. Reading it means a project with a
+    // customised theme gets its real colors rather than the defaults baked
+    // into `crate::tailwind`.
+    "output.css",
+    "tailwind.css",
 ];
+
+/// Build output directories probed for a generated stylesheet, relative to
+/// each directory on the way up to the project root.
+const STYLE_OUTPUT_DIRS: &[&str] = &["", "dist", "build", "public", "assets", "css", "styles"];
 
 /// How far up from the hovered file to look for a global stylesheet.
 const GLOBAL_STYLE_LOOKUP_DEPTH: usize = 4;
@@ -185,6 +194,9 @@ fn component_preview(
 
     let stylesheet = component_stylesheet(project_root, &component);
     let document = compile_jsx_component(project_root, &component, &index, &stylesheet);
+    if document.is_blank() {
+        return None;
+    }
     Some(HoverPreview {
         label: format!("<{name} />"),
         origin: Some(component.path.clone()),
@@ -308,10 +320,17 @@ fn nearest_global_stylesheets(project_root: &Path, file_path: &Path) -> Vec<Path
     // Outermost directory first: a stylesheet next to the component should be
     // able to override one at the project root.
     for directory in directories.into_iter().rev() {
-        for name in GLOBAL_STYLESHEET_NAMES {
-            let candidate = directory.join(name);
-            if candidate.is_file() {
-                found.push(candidate);
+        for subdirectory in STYLE_OUTPUT_DIRS {
+            let base = if subdirectory.is_empty() {
+                directory.clone()
+            } else {
+                directory.join(subdirectory)
+            };
+            for name in GLOBAL_STYLESHEET_NAMES {
+                let candidate = base.join(name);
+                if candidate.is_file() && !found.contains(&candidate) {
+                    found.push(candidate);
+                }
             }
         }
     }
@@ -364,6 +383,9 @@ fn html_preview(
     let markup = source.get(start..end)?;
     let sheet = page_stylesheet(project_root, file_path);
     let document = compile_html_fragment(project_root, file_path, markup, &sheet);
+    if document.is_blank() {
+        return None;
+    }
     Some(HoverPreview {
         label: element_label(markup),
         origin: Some(file_path.to_path_buf()),
@@ -378,17 +400,27 @@ const VOID_TAGS: &[&str] = &[
     "track", "wbr",
 ];
 
-/// Elements too broad to be a useful hover target — previewing the whole
-/// document is what the page view is for.
-const UNINTERESTING_TAGS: &[&str] = &["html", "head", "body", "script", "style", "title"];
-
-/// The byte range of the innermost element containing `byte_offset`.
+/// Elements that are never a useful hover target.
 ///
-/// Walks the source keeping a stack of open tags; the first element to close
-/// while still containing the offset is by construction the innermost one.
+/// The structural ones would preview the whole document. The SVG ones are
+/// dropped by the compiler (it has no vector renderer), so targeting them
+/// produced a card that was titled `path` and completely blank.
+const NON_TARGET_TAGS: &[&str] = &[
+    "html", "head", "body", "script", "style", "title", "meta", "link", "base", "svg", "path",
+    "g", "circle", "ellipse", "rect", "line", "polyline", "polygon", "defs", "use", "symbol",
+    "clippath", "mask", "filter", "lineargradient", "radialgradient", "stop", "tspan",
+];
+
+/// The byte range of the element whose *tag* sits under `byte_offset`.
+///
+/// Only the tags count, not the content between them: pointing anywhere inside
+/// a large element used to open its card, so a card appeared whenever the
+/// pointer merely rested somewhere on the line. Requiring the tag itself makes
+/// the pointer the reference.
 fn html_element_range_at(source: &str, byte_offset: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
-    let mut stack: Vec<(String, usize)> = Vec::new();
+    // (tag name, where the element starts, where its opening tag ends)
+    let mut stack: Vec<(String, usize, usize)> = Vec::new();
     let mut index = 0usize;
 
     while index < bytes.len() {
@@ -440,25 +472,25 @@ fn html_element_range_at(source: &str, byte_offset: usize) -> Option<(usize, usi
         if is_closing {
             // Unwind to the matching open tag; malformed markup just discards
             // the unmatched entries rather than aborting the walk.
-            if let Some(position) = stack.iter().rposition(|(open, _)| *open == name) {
-                let (_, open_start) = stack[position];
+            if let Some(position) = stack.iter().rposition(|(open, _, _)| *open == name) {
+                let (_, open_start, open_end) = stack[position];
                 stack.truncate(position);
-                if open_start <= byte_offset
-                    && byte_offset < tag_end
-                    && !UNINTERESTING_TAGS.contains(&name.as_str())
-                {
+                // The pointer has to be on this element's own opening or
+                // closing tag, not merely somewhere between them.
+                let on_open_tag = (open_start..open_end).contains(&byte_offset);
+                let on_close_tag = (tag_start..tag_end).contains(&byte_offset);
+                if (on_open_tag || on_close_tag) && !NON_TARGET_TAGS.contains(&name.as_str()) {
                     return Some((open_start, tag_end));
                 }
             }
         } else if self_closing || VOID_TAGS.contains(&name.as_str()) {
-            if tag_start <= byte_offset
-                && byte_offset < tag_end
-                && !UNINTERESTING_TAGS.contains(&name.as_str())
+            if (tag_start..tag_end).contains(&byte_offset)
+                && !NON_TARGET_TAGS.contains(&name.as_str())
             {
                 return Some((tag_start, tag_end));
             }
         } else {
-            stack.push((name, tag_start));
+            stack.push((name, tag_start, tag_end));
         }
 
         index = tag_end.max(index + 1);

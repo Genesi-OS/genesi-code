@@ -7,3 +7,4 @@
 
 pub mod compiler;
 pub mod hover;
+pub mod tailwind;

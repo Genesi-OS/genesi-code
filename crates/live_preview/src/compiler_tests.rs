@@ -323,6 +323,87 @@ fn extracts_a_function_component() {
 }
 
 #[test]
+fn extracts_a_component_whose_body_opens_with_hooks() {
+    // The shape that used to defeat extraction: walking back from `return`
+    // landed on `const [count, setCount]` and read `[count,` as the name.
+    let source = r#"
+        import { useState } from 'react';
+        export default function App() {
+          const [count, setCount] = useState(0);
+          const label = 'hi';
+          return (
+            <div className="app">
+              <Counter value={count} />
+            </div>
+          );
+        }
+    "#;
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/App.tsx"),
+        source,
+    );
+    assert_eq!(
+        components.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["App"]
+    );
+    assert!(components[0].markup.contains("<Counter"));
+}
+
+#[test]
+fn extracts_a_typed_arrow_component() {
+    let source = r#"
+        const Card: React.FC<Props> = ({ title }) => {
+          const cls = 'card';
+          return <div className={cls}>{title}</div>;
+        };
+    "#;
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/Card.tsx"),
+        source,
+    );
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0].name, "Card");
+}
+
+#[test]
+fn extracts_several_components_from_one_file() {
+    let source = r#"
+        export function Badge() {
+          return <span className="badge">new</span>;
+        }
+        export function Panel() {
+          const x = 1;
+          return <section className="panel"><Badge /></section>;
+        }
+    "#;
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/ui.tsx"),
+        source,
+    );
+    let names: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["Badge", "Panel"]);
+    // Each component must claim only its own markup.
+    assert!(components[0].markup.contains("badge"));
+    assert!(!components[0].markup.contains("panel"));
+    assert!(components[1].markup.contains("<Badge />"));
+}
+
+#[test]
+fn destructuring_declarations_are_not_components() {
+    let source = "const [Alpha, setAlpha] = useState(null);
+const { Beta } = props;";
+    let components = extract_jsx_components(
+        Path::new("/project"),
+        Path::new("/project/src/x.tsx"),
+        source,
+    );
+    assert!(components.is_empty(), "got {components:?}");
+}
+
+#[test]
 fn extracts_an_arrow_component() {
     let source = r#"const Badge = () => <span className="badge">new</span>;"#;
     let components = extract_jsx_components(

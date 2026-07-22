@@ -68,12 +68,42 @@ fn unknown_extensions_resolve_to_nothing() {
 // ── HTML element ranges ─────────────────────────────────────────────────────
 
 #[test]
-fn finds_the_innermost_enclosing_element() {
+fn finds_the_element_whose_tag_is_under_the_pointer() {
     let source = r#"<html><body><section class="hero"><p>hello</p></section></body></html>"#;
-    let Some(HoverTarget::HtmlElement { start, end }) = html(source, "hello") else {
+    let Some(HoverTarget::HtmlElement { start, end }) = html(source, "<p>") else {
         panic!("expected an element");
     };
     assert_eq!(&source[start..end], "<p>hello</p>");
+}
+
+#[test]
+fn pointing_at_text_content_is_not_a_target() {
+    // Resting anywhere inside an element used to open its card, which made the
+    // card appear whenever the pointer was merely somewhere on the line.
+    let source = r#"<html><body><section class="hero"><p>hello</p></section></body></html>"#;
+    assert_eq!(html(source, "hello"), None);
+}
+
+#[test]
+fn the_closing_tag_is_also_a_target() {
+    let source = "<div><p>hi</p></div>";
+    let Some(HoverTarget::HtmlElement { start, end }) = html(source, "</p>") else {
+        panic!("expected an element");
+    };
+    assert_eq!(&source[start..end], "<p>hi</p>");
+}
+
+#[test]
+fn svg_internals_are_never_targets() {
+    // These compile to nothing, so targeting them produced a blank card.
+    let source = r#"<button><svg viewBox="0 0 24 24"><path fill="none" d="M0 0h24"></path></svg>Text</button>"#;
+    assert_eq!(html(source, "<path"), None);
+    assert_eq!(html(source, "<svg"), None);
+    // The button around them is still a perfectly good target.
+    assert!(matches!(
+        html(source, "<button"),
+        Some(HoverTarget::HtmlElement { .. })
+    ));
 }
 
 #[test]
@@ -169,4 +199,41 @@ fn package_imports_are_not_resolved_to_source() {
         ),
         None
     );
+}
+
+// ── blank previews ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_target_that_compiles_to_nothing_yields_no_card() {
+    // An element made only of dropped children has nothing to draw; showing a
+    // titled, empty card for it reads as a bug rather than as a preview.
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        "<div><svg><path d=\"M0 0\"></path></svg></div>",
+        &Stylesheet::default(),
+    );
+    assert!(document.is_blank());
+}
+
+#[test]
+fn a_target_with_text_is_not_blank() {
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        "<div><span>hello</span></div>",
+        &Stylesheet::default(),
+    );
+    assert!(!document.is_blank());
+}
+
+#[test]
+fn a_target_with_only_a_background_is_not_blank() {
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        "<div style=\"background:#ff0000;height:40px\"></div>",
+        &Stylesheet::default(),
+    );
+    assert!(!document.is_blank());
 }

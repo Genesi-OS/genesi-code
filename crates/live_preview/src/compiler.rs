@@ -1353,6 +1353,13 @@ pub struct PreviewDocument {
 }
 
 impl PreviewDocument {
+    /// Whether this would draw nothing at all. A target the compiler discards
+    /// (SVG internals, an empty wrapper) otherwise yields a card that is
+    /// titled but blank, which reads as a bug.
+    pub fn is_blank(&self) -> bool {
+        !has_visible_content(&self.root)
+    }
+
     fn empty(title: impl Into<String>, note: impl Into<String>) -> Self {
         Self {
             title: title.into(),
@@ -1365,6 +1372,29 @@ impl PreviewDocument {
             color: None,
             stylesheets: Vec::new(),
             notes: vec![note.into()],
+        }
+    }
+}
+
+/// Whether a node paints anything a reader would notice.
+fn has_visible_content(node: &PreviewNode) -> bool {
+    match node {
+        PreviewNode::Inline { fragments, .. } => {
+            fragments.iter().any(|fragment| !fragment.text.trim().is_empty())
+        }
+        PreviewNode::Image { .. } | PreviewNode::Placeholder { .. } | PreviewNode::Rule { .. } => {
+            true
+        }
+        PreviewNode::Box(preview_box) => {
+            if preview_box.style.display == Display::None {
+                return false;
+            }
+            let painted = preview_box
+                .style
+                .background
+                .is_some_and(|color| !color.is_transparent())
+                || !preview_box.style.border.is_zero();
+            painted || preview_box.children.iter().any(has_visible_content)
         }
     }
 }
@@ -1825,6 +1855,11 @@ impl Compiler<'_> {
             .into_iter()
             .map(|(property, value)| (property.to_string(), value.to_string()))
             .collect();
+        // Utility classes come before the project's own rules, so a real
+        // stylesheet (including a compiled Tailwind output) always wins.
+        for class in &element.classes {
+            declarations.extend(crate::tailwind::declarations_for_class(class));
+        }
         declarations.extend(self.sheet.declarations_for(chain));
         if let Some(inline) = element.attrs.get("style") {
             declarations.extend(parse_declarations(inline));
@@ -2070,59 +2105,130 @@ pub struct JsxComponentSource {
     pub stylesheets: Vec<PathBuf>,
 }
 
-/// Finds every component in a `.jsx`/`.tsx`/`.js`/`.ts` file: a function or
-/// const whose body returns JSX.
-pub fn extract_jsx_components(project_root: &Path, path: &Path, source: &str) -> Vec<JsxComponentSource> {
+/// Finds every component in a `.jsx`/`.tsx`/`.js`/`.ts` file.
+///
+/// Components are located by their *declaration* rather than by walking back
+/// from a `return`: a component whose body opens with a hook (`const [x, setX]
+/// = useState()`) would otherwise resolve its name to the nearest preceding
+/// `const`, find `[x,` where a name should be, and be dropped — which is to say
+/// almost every real component.
+pub fn extract_jsx_components(
+    project_root: &Path,
+    path: &Path,
+    source: &str,
+) -> Vec<JsxComponentSource> {
     let stylesheets = jsx_imported_stylesheets(project_root, path, source);
-    let mut components = Vec::new();
-    let bytes = source.as_bytes();
+    let declarations = component_declarations(source);
+    let mut components: Vec<JsxComponentSource> = Vec::new();
 
-    // Two shapes reach JSX: a `return` inside a block body, and a concise arrow
-    // body (`const Badge = () => <span/>`) which has no `return` at all.
-    let mut anchors: Vec<(usize, usize)> = Vec::new();
-    for (index, _) in source.match_indices("return") {
-        // Only a `return` that begins a statement counts.
+    for (index, (body_start, name)) in declarations.iter().enumerate() {
+        if components.iter().any(|existing| existing.name == *name) {
+            continue;
+        }
+        // Search only up to the next component declaration, so one component
+        // cannot claim the markup of the one after it.
+        let end = declarations
+            .get(index + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(source.len());
+        let Some(window) = source.get(*body_start..end) else {
+            continue;
+        };
+        let Some(markup) = first_jsx_element(window) else {
+            continue;
+        };
+        components.push(JsxComponentSource {
+            name: name.clone(),
+            path: path.to_path_buf(),
+            line: line_of(source, *body_start),
+            markup,
+            stylesheets: stylesheets.clone(),
+        });
+    }
+    components
+}
+
+/// 1-based line containing `offset`.
+fn line_of(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())].lines().count().max(1)
+}
+
+/// Every capitalised declaration that could be a component, as
+/// `(offset just past the name, name)`, in source order.
+fn component_declarations(source: &str) -> Vec<(usize, String)> {
+    const KEYWORDS: &[&str] = &["function ", "const ", "let ", "var ", "class "];
+    let bytes = source.as_bytes();
+    let mut found = Vec::new();
+
+    for keyword in KEYWORDS {
+        for (index, _) in source.match_indices(keyword) {
+            // Must start a token: `myconst Foo` is not a declaration.
+            if index > 0 {
+                let previous = bytes[index - 1] as char;
+                if previous.is_alphanumeric() || previous == '_' || previous == '$' {
+                    continue;
+                }
+            }
+            let name_start = index + keyword.len();
+            let name: String = source[name_start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            // Capitalisation is the convention that separates a component from
+            // an ordinary helper or variable.
+            if name.is_empty() || !name.chars().next().is_some_and(char::is_uppercase) {
+                continue;
+            }
+            let after = name_start + name.len();
+            // `const Card =` and `const Card: FC<P> =` are components;
+            // `const Card` alone (or a destructuring pattern) is not.
+            if *keyword != "function " && *keyword != "class " {
+                let next = source[after..]
+                    .chars()
+                    .find(|c| !c.is_whitespace())
+                    .unwrap_or(' ');
+                if next != '=' && next != ':' {
+                    continue;
+                }
+            }
+            found.push((after, name));
+        }
+    }
+    found.sort_by_key(|(offset, _)| *offset);
+    found
+}
+
+/// The first JSX element in a declaration body, whether it is returned from a
+/// block or is the concise body of an arrow function.
+fn first_jsx_element(window: &str) -> Option<String> {
+    let bytes = window.as_bytes();
+    let mut anchors: Vec<usize> = Vec::new();
+    for (index, _) in window.match_indices("return") {
         if index > 0 {
             let previous = bytes[index - 1] as char;
             if previous.is_alphanumeric() || previous == '_' || previous == '.' {
                 continue;
             }
         }
-        anchors.push((index, index + "return".len()));
+        anchors.push(index + "return".len());
     }
-    for (index, _) in source.match_indices("=>") {
-        anchors.push((index, index + "=>".len()));
+    for (index, _) in window.match_indices("=>") {
+        anchors.push(index + "=>".len());
     }
     anchors.sort_unstable();
 
-    for (index, after) in anchors {
-        let Some(open) = find_jsx_open(source, after) else {
+    for anchor in anchors {
+        let Some(open) = find_jsx_open(window, anchor) else {
             continue;
         };
-        let Some((markup, _)) = read_jsx_element(source, open) else {
+        let Some((markup, _)) = read_jsx_element(window, open) else {
             continue;
         };
-        if markup.trim().is_empty() {
-            continue;
+        if !markup.trim().is_empty() {
+            return Some(markup);
         }
-        let Some((name, declaration_line)) = enclosing_component_name(source, index) else {
-            continue;
-        };
-        if components
-            .iter()
-            .any(|existing: &JsxComponentSource| existing.name == name)
-        {
-            continue;
-        }
-        components.push(JsxComponentSource {
-            name,
-            path: path.to_path_buf(),
-            line: declaration_line,
-            markup,
-            stylesheets: stylesheets.clone(),
-        });
     }
-    components
+    None
 }
 
 /// After `return`, skip whitespace and an optional wrapping `(` to find the
@@ -2139,41 +2245,6 @@ fn find_jsx_open(source: &str, from: usize) -> Option<usize> {
         }
     }
     None
-}
-
-/// Walks backwards from a `return` to the `function Name` / `const Name =`
-/// that declares it, and reports the 1-based line of that declaration.
-fn enclosing_component_name(source: &str, return_index: usize) -> Option<(String, usize)> {
-    let head = &source[..return_index];
-    let function = head.rfind("function ").map(|index| (index, 9usize));
-    let arrow = ["const ", "let ", "var "]
-        .iter()
-        .filter_map(|keyword| head.rfind(keyword).map(|index| (index, keyword.len())))
-        .max_by_key(|(index, _)| *index);
-    let (start, offset) = match (function, arrow) {
-        (Some(function), Some(arrow)) => {
-            if function.0 > arrow.0 {
-                function
-            } else {
-                arrow
-            }
-        }
-        (Some(function), None) => function,
-        (None, Some(arrow)) => arrow,
-        (None, None) => return None,
-    };
-
-    let name: String = source[start + offset..]
-        .chars()
-        .take_while(|character| character.is_alphanumeric() || *character == '_' || *character == '$')
-        .collect();
-    // React components are capitalised; that convention is what makes this
-    // heuristic safe against ordinary helper functions.
-    if name.is_empty() || !name.chars().next()?.is_uppercase() {
-        return None;
-    }
-    let line = source[..start].matches('\n').count() + 1;
-    Some((name, line))
 }
 
 /// Reads one balanced JSX element starting at `<`, returning its source text.
