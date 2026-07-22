@@ -830,3 +830,88 @@ fn non_cdn_and_bare_package_urls_resolve_to_nothing() {
     // No file named inside the package: nothing to read.
     assert_eq!(cdn_package_and_path("https://unpkg.com/bootstrap@5.3.3"), None);
 }
+
+// ── pseudo-elements ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_scrollbar_pseudo_element_does_not_paint_its_host() {
+    // Taken from a real stylesheet: treating `::-webkit-scrollbar-thumb` as its
+    // host painted the whole sidebar red with 99px corners.
+    let document = compile(
+        r#"<html><head><style>
+            #nav-content { background: #18283b; }
+            #nav-content::-webkit-scrollbar-thumb {
+                border-radius: 99px;
+                background-color: #D62929;
+            }
+        </style></head><body><div id="nav-content">hi</div></body></html>"#,
+    );
+    let nav = find_box(&document.root, "div").expect("nav");
+    assert_eq!(nav.style.background, Some(Rgba::new(0x18, 0x28, 0x3b, 255)));
+    assert_eq!(nav.style.radius, 0.);
+}
+
+#[test]
+fn before_and_after_never_style_their_host() {
+    let document = compile(
+        r#"<html><head><style>
+            .badge { color: #111111; }
+            .badge::before { color: #ff0000; content: "x"; }
+            .badge::after { background: #ff0000; }
+        </style></head><body><span class="badge">hi</span></body></html>"#,
+    );
+    let badge = find_box(&document.root, "span").expect("badge");
+    assert_eq!(badge.style.color, Some(Rgba::new(0x11, 0x11, 0x11, 255)));
+    assert_eq!(badge.style.background, None);
+}
+
+#[test]
+fn single_colon_legacy_pseudo_elements_are_dropped_too() {
+    let document = compile(
+        r#"<html><head><style>
+            .a { color: #111111; }
+            .a:-webkit-scrollbar { background: #ff0000; }
+        </style></head><body><div class="a">hi</div></body></html>"#,
+    );
+    let node = find_box(&document.root, "div").expect("div");
+    assert_eq!(node.style.background, None);
+}
+
+#[test]
+fn ordinary_structural_pseudo_classes_still_apply() {
+    // `:first-child` describes position, not state, so dropping it would lose
+    // styles the page really does show.
+    let document = compile(
+        r#"<html><head><style>
+            li:first-child { color: #00ff00; }
+        </style></head><body><ul><li>one</li></ul></body></html>"#,
+    );
+    let item = find_box(&document.root, "li").expect("li");
+    assert_eq!(item.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
+
+#[test]
+fn resolves_cdnjs_urls() {
+    // cdnjs does not use npm specifiers; font-awesome is routinely loaded here.
+    assert_eq!(
+        cdn_package_and_path(
+            "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css"
+        ),
+        Some(("font-awesome".to_string(), "css/all.min.css".to_string()))
+    );
+}
+
+#[test]
+fn a_blurred_element_is_drawn_faintly_rather_than_solid() {
+    let document = compile(
+        r#"<html><head><style>
+            .glow { background: #de004b; filter: blur(20px); opacity: 0.5; }
+        </style></head><body><div class="glow">x</div></body></html>"#,
+    );
+    let glow = find_box(&document.root, "div").expect("div");
+    assert!(
+        glow.style.opacity < 0.2,
+        "blurred decoration drawn too strongly: {}",
+        glow.style.opacity
+    );
+}

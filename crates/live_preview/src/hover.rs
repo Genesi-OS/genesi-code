@@ -14,8 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::compiler::{
-    compile_html_fragment, compile_jsx_component, extract_jsx_components, page_stylesheet,
-    JsxComponentSource, PreviewDocument, Stylesheet,
+    compile_html_fragment, compile_jsx_component, extract_jsx_components,
+    jsx_imported_stylesheets, page_stylesheet, read_jsx_element, JsxComponentSource,
+    PreviewDocument, Stylesheet,
 };
 
 /// Extensions the hover card knows how to render.
@@ -103,6 +104,8 @@ pub enum HoverTarget {
     Component(String),
     /// An element in an HTML file, as a byte range in the source.
     HtmlElement { start: usize, end: usize },
+    /// A plain JSX element (`<div className=…>`), as a byte range.
+    JsxElement { start: usize, end: usize },
 }
 
 /// Resolves and compiles whatever sits at `byte_offset`. Returns `None` when
@@ -171,12 +174,65 @@ pub fn target_at_offset(file_path: &Path, source: &str, byte_offset: usize) -> O
         return Some(HoverTarget::HtmlElement { start, end });
     }
     if JSX_EXTENSIONS.contains(&extension.as_str()) {
+        // A capitalised tag is a component reference worth resolving to its
+        // definition. Anything else is still an element the pointer can be on:
+        // most JSX is plain `<div>`/`<header>`, and requiring a capitalised
+        // name meant hovering a typical component file produced nothing at all.
+        if let Some((start, end)) = jsx_element_range_at(source, byte_offset) {
+            let tag = jsx_tag_name(&source[start..]);
+            if tag.chars().next().is_some_and(char::is_uppercase) {
+                return Some(HoverTarget::Component(tag));
+            }
+            return Some(HoverTarget::JsxElement { start, end });
+        }
+        // Not on a tag: an identifier still resolves if it names a component.
         let name = identifier_at(source, byte_offset)?;
-        // React components are capitalised; that is the whole signal that
-        // separates a component reference from an ordinary variable.
         if name.chars().next().is_some_and(char::is_uppercase) {
             return Some(HoverTarget::Component(name));
         }
+    }
+    None
+}
+
+/// The tag name that opens `markup`.
+fn jsx_tag_name(markup: &str) -> String {
+    markup
+        .trim_start_matches('<')
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect()
+}
+
+/// The byte range of the JSX element whose opening tag name is under
+/// `byte_offset`.
+fn jsx_element_range_at(source: &str, byte_offset: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    for (relative, _) in source.match_indices('<') {
+        let name_start = relative + 1;
+        let first = *bytes.get(name_start)? as char;
+        if !first.is_alphabetic() && first != '_' {
+            continue;
+        }
+        let mut name_end = name_start;
+        while name_end < bytes.len() {
+            let next = bytes[name_end] as char;
+            if next.is_alphanumeric() || next == '_' || next == '.' || next == '-' {
+                name_end += 1;
+            } else {
+                break;
+            }
+        }
+        // The pointer has to be on the tag name itself, which is what keeps the
+        // card tied to what is under it rather than to the line.
+        if !(relative..name_end).contains(&byte_offset) {
+            continue;
+        }
+        let tag = source.get(name_start..name_end)?.to_ascii_lowercase();
+        if NON_TARGET_TAGS.contains(&tag.as_str()) {
+            return None;
+        }
+        let (markup, _) = read_jsx_element(source, relative)?;
+        return Some((relative, relative + markup.len()));
     }
     None
 }
@@ -192,6 +248,29 @@ fn component_preview(
     let name = match target_at_offset(file_path, source, byte_offset)? {
         HoverTarget::Component(name) => name,
         HoverTarget::HtmlElement { .. } => return None,
+        // A plain element is compiled straight from the markup under the
+        // pointer, styled by whatever the file itself pulls in.
+        HoverTarget::JsxElement { start, end } => {
+            let markup = source.get(start..end)?;
+            let element = JsxComponentSource {
+                name: jsx_tag_name(markup),
+                path: file_path.to_path_buf(),
+                line: 0,
+                markup: markup.to_string(),
+                stylesheets: jsx_imported_stylesheets(project_root, file_path, source),
+            };
+            let sheet = component_stylesheet(project_root, &element);
+            let index = local_component_index(project_root, file_path, source);
+            let document = compile_jsx_component(project_root, &element, &index, &sheet);
+            if document.is_blank() {
+                return None;
+            }
+            return Some(HoverPreview {
+                label: element_label(markup),
+                origin: Some(file_path.to_path_buf()),
+                document,
+            });
+        }
     };
 
     // Components defined in the hovered file resolve without touching disk.
@@ -243,6 +322,19 @@ fn component_preview(
         origin: Some(component.path.clone()),
         document,
     })
+}
+
+/// The components defined in the hovered file, so a `<Card />` sitting inside
+/// the element under the pointer still expands in place.
+fn local_component_index(
+    project_root: &Path,
+    file_path: &Path,
+    source: &str,
+) -> HashMap<String, JsxComponentSource> {
+    extract_jsx_components(project_root, file_path, source)
+        .into_iter()
+        .map(|component| (component.name.clone(), component))
+        .collect()
 }
 
 /// `import Card from './Card'` / `import { Card } from "../ui/Card"`.
@@ -401,7 +493,7 @@ fn resolve_module(base_dir: &Path, specifier: &str) -> Option<PathBuf> {
 /// The CSS a component preview should be styled with: whatever its own file
 /// imports, plus the nearest global stylesheet above it.
 fn component_stylesheet(project_root: &Path, component: &JsxComponentSource) -> Stylesheet {
-    let mut sheet = Stylesheet::default();
+    let mut sheet = tailwind_config_stylesheet(project_root, &component.path);
     for path in nearest_global_stylesheets(project_root, &component.path) {
         if let Ok(text) = fs::read_to_string(&path) {
             sheet.extend(Stylesheet::parse(&text));
@@ -414,6 +506,34 @@ fn component_stylesheet(project_root: &Path, component: &JsxComponentSource) -> 
         }
     }
     sheet
+}
+
+/// The colors a project defines in its Tailwind config, as a stylesheet.
+///
+/// A customised theme names colors the built-in palette has never heard of, so
+/// `text-text-theme` resolved to nothing and the component came out unstyled.
+fn tailwind_config_stylesheet(project_root: &Path, file_path: &Path) -> Stylesheet {
+    const CONFIG_NAMES: &[&str] = &[
+        "tailwind.config.js",
+        "tailwind.config.cjs",
+        "tailwind.config.mjs",
+        "tailwind.config.ts",
+    ];
+    let mut current = file_path.parent();
+    for _ in 0..GLOBAL_STYLE_LOOKUP_DEPTH + 2 {
+        let Some(directory) = current else { break };
+        for name in CONFIG_NAMES {
+            let candidate = directory.join(name);
+            if let Ok(source) = fs::read_to_string(&candidate) {
+                return Stylesheet::parse(&crate::tailwind::config_color_stylesheet(&source));
+            }
+        }
+        if directory == project_root {
+            break;
+        }
+        current = directory.parent();
+    }
+    Stylesheet::default()
 }
 
 /// Walks up from the file toward the project root collecting global-looking
@@ -630,7 +750,9 @@ fn element_label(markup: &str) -> String {
         .take_while(|c| c.is_alphanumeric() || *c == '-')
         .collect();
 
-    for (attribute, prefix) in [("id=", "#"), ("class=", ".")] {
+    // `className=` is checked before `class=` so JSX elements get a selector
+    // in the card's title too, not just a bare tag name.
+    for (attribute, prefix) in [("id=", "#"), ("className=", "."), ("class=", ".")] {
         let Some(position) = open.find(attribute) else {
             continue;
         };

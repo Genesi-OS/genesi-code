@@ -40,9 +40,50 @@ fn lowercase_identifiers_are_not_components() {
 }
 
 #[test]
-fn plain_html_tags_in_jsx_are_not_components() {
+fn plain_jsx_tags_are_elements_rather_than_components() {
+    // Most JSX is lowercase elements. Requiring a capitalised name meant
+    // hovering a typical component file produced nothing at all.
     let source = "return <div className=\"row\" />;";
-    assert_eq!(jsx(source, "div"), None);
+    let Some(HoverTarget::JsxElement { start, end }) = jsx(source, "div") else {
+        panic!("expected an element, got {:?}", jsx(source, "div"));
+    };
+    assert_eq!(&source[start..end], "<div className=\"row\" />");
+}
+
+#[test]
+fn a_capitalised_jsx_tag_still_resolves_as_a_component() {
+    let source = "return <Card title=\"hi\" />;";
+    assert_eq!(
+        jsx(source, "Card"),
+        Some(HoverTarget::Component("Card".to_string()))
+    );
+}
+
+#[test]
+fn a_nested_jsx_element_is_taken_whole() {
+    let source = r#"return (
+        <div className="wrap">
+          <header className="bar"><span>hi</span></header>
+        </div>
+      );"#;
+    let Some(HoverTarget::JsxElement { start, end }) = jsx(source, "<header") else {
+        panic!("expected an element");
+    };
+    assert!(source[start..end].contains("<span>hi</span>"));
+    assert!(source[start..end].ends_with("</header>"));
+}
+
+#[test]
+fn jsx_attributes_and_expressions_are_not_tags() {
+    let source = "return <div onClick={() => setOpen(true)}>hi</div>;";
+    // `setOpen` is an identifier, not a tag, and is not capitalised.
+    assert_eq!(jsx(source, "setOpen"), None);
+}
+
+#[test]
+fn svg_tags_in_jsx_are_not_targets_either() {
+    let source = r#"return <svg viewBox="0 0 24 24"><path d="M0 0" /></svg>;"#;
+    assert_eq!(jsx(source, "<svg"), None);
 }
 
 #[test]
@@ -390,4 +431,63 @@ fn type_only_imports_do_not_shadow_a_value_import() {
         .find(|(clause, _)| import_clause_binds(clause, "Card"))
         .expect("Card is bound");
     assert_eq!(card.1, "./Card");
+}
+
+#[test]
+fn a_typed_arrow_component_with_hooks_previews_its_elements() {
+    // The exact shape of a real page component: `const X: React.FC = () => {`,
+    // a run of hooks, then JSX made entirely of lowercase tags. Hovering any of
+    // those tags used to produce nothing at all.
+    let source = r#"import React, { useState } from 'react';
+
+const Login: React.FC = () => {
+  const [email, setEmail] = useState('');
+  const [error, setError] = useState('');
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <header className="w-full flex items-center gap-3 py-8">
+        <span className="font-extrabold text-2xl">Corressay</span>
+      </header>
+    </div>
+  );
+};
+"#;
+    // The outer wrapper.
+    let offset = source.find("<div").expect("anchor");
+    assert!(matches!(
+        target_at_offset(Path::new("/p/src/Login.tsx"), source, offset),
+        Some(HoverTarget::JsxElement { .. })
+    ));
+
+    // And the header nested inside it.
+    let offset = source.find("<header").expect("anchor");
+    let preview = preview_at_offset(
+        Path::new("/p"),
+        Path::new("/p/src/Login.tsx"),
+        source,
+        offset,
+    )
+    .expect("a preview");
+    assert_eq!(preview.label, "header.w-full");
+    assert!(!preview.document.is_blank());
+}
+
+#[test]
+fn tailwind_utilities_on_a_hovered_jsx_element_are_applied() {
+    let source = r#"
+const Panel = () => (
+  <div className="flex items-center gap-2 p-4 bg-blue-500">hi</div>
+);
+"#;
+    let offset = source.find("<div").expect("anchor");
+    let preview = preview_at_offset(
+        Path::new("/p"),
+        Path::new("/p/src/Panel.tsx"),
+        source,
+        offset,
+    )
+    .expect("a preview");
+    // Utilities have to reach the element even though no CSS file defines them.
+    assert!(!preview.document.is_blank());
 }

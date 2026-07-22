@@ -94,3 +94,39 @@ fn rounded_and_border_shorthands() {
 fn opacity_becomes_a_fraction() {
     assert_eq!(value("opacity-50", "opacity").as_deref(), Some("0.5"));
 }
+
+// ── project config ──────────────────────────────────────────────────────────
+
+#[test]
+fn reads_custom_colors_from_a_tailwind_config() {
+    // The shape a real config has, including the surrounding theme/extend.
+    let config = r#"
+module.exports = {
+    content: ['./src/**/*.{ts,tsx}'],
+    theme: {
+        extend: {
+            colors: {
+                'blue-1': '#0EA5E9',
+                'text-theme': '#0F172A',
+                'muted': '#64748B',
+            },
+            boxShadow: {
+                'theme-base': '0 10px 20px rgba(15, 23, 42, 0.1)',
+            },
+        },
+    },
+}
+"#;
+    let css = config_color_stylesheet(config);
+    assert!(css.contains(".text-text-theme{color:#0F172A;}"), "got {css}");
+    assert!(css.contains(".bg-blue-1{background-color:#0EA5E9;}"));
+    assert!(css.contains(".border-muted{border-color:#64748B;}"));
+    // The shadow block sits outside `colors`, so it must not leak in.
+    assert!(!css.contains("theme-base"), "got {css}");
+}
+
+#[test]
+fn a_config_without_colors_yields_nothing() {
+    assert!(config_color_stylesheet("module.exports = { theme: {} }").is_empty());
+    assert!(config_color_stylesheet("").is_empty());
+}

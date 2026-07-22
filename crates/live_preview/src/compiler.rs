@@ -785,8 +785,10 @@ fn parse_compound(token: &str, specificity: &mut u32) -> Option<CompoundSelector
                 kind = '\0';
                 // Consume the pseudo name (and any `::`), then decide.
                 let mut name = String::new();
+                let mut is_pseudo_element = false;
                 if chars.peek() == Some(&':') {
                     chars.next();
+                    is_pseudo_element = true;
                 }
                 while let Some(next) = chars.peek() {
                     if next.is_ascii_alphanumeric() || *next == '-' {
@@ -811,6 +813,13 @@ fn parse_compound(token: &str, specificity: &mut u32) -> Option<CompoundSelector
                             _ => {}
                         }
                     }
+                }
+                // A pseudo-element is a separate box the preview does not draw.
+                // Treating one as its host is how a scrollbar thumb's colour
+                // (`#nav-content::-webkit-scrollbar-thumb`) ended up painting
+                // the whole sidebar red.
+                if is_pseudo_element || name.starts_with('-') {
+                    return None;
                 }
                 if STATEFUL_PSEUDOS.contains(&name.as_str()) {
                     return None;
@@ -938,6 +947,9 @@ pub struct ComputedStyle {
     pub opacity: f32,
     pub grow: f32,
     pub centered_block: bool,
+    /// `filter: blur(…)`. Softening is applied once the whole rule has been
+    /// read, so it does not depend on whether `opacity` came before or after.
+    pub blurred: bool,
 }
 
 impl Default for ComputedStyle {
@@ -969,6 +981,7 @@ impl Default for ComputedStyle {
             opacity: 1.,
             grow: 0.,
             centered_block: false,
+            blurred: false,
         }
     }
 }
@@ -1205,6 +1218,14 @@ fn apply_declaration(
         "opacity" => {
             if let Ok(opacity) = lower.parse::<f32>() {
                 style.opacity = opacity.clamp(0., 1.);
+            }
+        }
+        "filter" | "backdrop-filter" => {
+            // A blurred shape is a soft glow behind other content. Drawing it
+            // at full strength turned a decorative blob into a solid slab of
+            // colour sitting on top of the layout.
+            if lower.contains("blur(") {
+                style.blurred = true;
             }
         }
         "flex" | "flex-grow" => {
@@ -1649,6 +1670,20 @@ pub fn cdn_package_and_path(href: &str) -> Option<(String, String)> {
         "https://cdn.skypack.dev/",
         "https://esm.sh/",
     ];
+    // cdnjs uses `/ajax/libs/<name>/<version>/<path>` rather than an npm
+    // specifier, so it is unpacked separately.
+    for prefix in ["https://cdnjs.cloudflare.com/ajax/libs/", "http://cdnjs.cloudflare.com/ajax/libs/"] {
+        let Some(rest) = href.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let mut parts = rest.splitn(3, '/');
+        let name = parts.next()?;
+        let _version = parts.next()?;
+        let path = parts.next().unwrap_or_default();
+        return (!path.is_empty()).then(|| (name.to_string(), path.to_string()));
+    }
+
     let specifier = CDN_PREFIXES
         .iter()
         .find_map(|prefix| href.strip_prefix(prefix))?;
@@ -1995,6 +2030,11 @@ impl Compiler<'_> {
 
         if element.tag == "li" && style.display == Display::Block {
             style.padding.left = style.padding.left.max(2.);
+        }
+        // A blurred shape is a soft glow behind other content; drawing it at
+        // full strength turns a decorative blob into a solid slab of colour.
+        if style.blurred {
+            style.opacity *= 0.2;
         }
         (style, variables)
     }
@@ -2465,7 +2505,7 @@ fn find_jsx_open(source: &str, from: usize) -> Option<usize> {
 }
 
 /// Reads one balanced JSX element starting at `<`, returning its source text.
-fn read_jsx_element(source: &str, start: usize) -> Option<(String, usize)> {
+pub fn read_jsx_element(source: &str, start: usize) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     let mut index = start;
     let mut depth = 0i32;
@@ -2538,7 +2578,7 @@ fn read_jsx_element(source: &str, start: usize) -> Option<(String, usize)> {
 }
 
 /// `import './App.css'` / `import styles from "./x.module.css"`.
-fn jsx_imported_stylesheets(project_root: &Path, path: &Path, source: &str) -> Vec<PathBuf> {
+pub fn jsx_imported_stylesheets(project_root: &Path, path: &Path, source: &str) -> Vec<PathBuf> {
     let base_dir = path.parent().unwrap_or(project_root);
     let mut out = Vec::new();
     for line in source.lines().take(200) {

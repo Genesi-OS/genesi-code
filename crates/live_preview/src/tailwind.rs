@@ -282,3 +282,77 @@ const PALETTE: &[(&str, [&str; 11])] = &[
 #[cfg(test)]
 #[path = "tailwind_tests.rs"]
 mod tests;
+
+/// CSS for the colors a project defines in `tailwind.config.js`.
+///
+/// A customised theme names colors this module has never heard of
+/// (`text-text-theme`), so they would resolve to nothing. Emitting them as
+/// ordinary rules keeps the resolution in one place — the cascade — instead of
+/// threading a palette through the compiler.
+pub fn config_color_stylesheet(config_source: &str) -> String {
+    let mut css = String::new();
+    for (name, value) in config_colors(config_source) {
+        css.push_str(&format!(
+            ".text-{name}{{color:{value};}}.bg-{name}{{background-color:{value};}}\
+             .border-{name}{{border-color:{value};}}"
+        ));
+    }
+    css
+}
+
+/// The `colors: { … }` entries of a Tailwind config, as `(name, value)`.
+fn config_colors(source: &str) -> Vec<(String, String)> {
+    let Some(start) = source.find("colors:").map(|index| index + "colors:".len()) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let Some(open) = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+    else {
+        return Vec::new();
+    };
+
+    // Only this block: a config has several, and the next one is not colors.
+    let mut depth = 0usize;
+    let mut end = open;
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = index;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(block) = source.get(open + 1..end) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in block.split(',') {
+        let Some((key, value)) = entry.split_once(':') else {
+            continue;
+        };
+        let name = key.trim().trim_matches(['\'', '"', ' ']).to_string();
+        let value = value.trim().trim_matches(['\'', '"', ' ']).to_string();
+        // Nested palettes (`brand: { 500: '#fff' }`) are not a flat entry.
+        if name.is_empty() || value.is_empty() || value.starts_with('{') {
+            continue;
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            continue;
+        }
+        if crate::compiler::parse_color(&value).is_some() {
+            out.push((name, value));
+        }
+    }
+    out
+}
