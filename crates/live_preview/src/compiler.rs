@@ -1634,6 +1634,67 @@ fn resolve_local_asset(base_dir: &Path, project_root: &Path, href: &str) -> Opti
     normalized.is_file().then_some(normalized)
 }
 
+/// Splits a CDN URL into the npm package it names and the path inside it.
+///
+/// Pages routinely pull Bootstrap, Bulma or an icon font off jsDelivr or
+/// unpkg. Skipping those left the page without its reset and its utility
+/// classes, which is most of why a preview could look nothing like the real
+/// page — links kept the browser's underline, and utility classes did nothing.
+pub fn cdn_package_and_path(href: &str) -> Option<(String, String)> {
+    const CDN_PREFIXES: &[&str] = &[
+        "https://cdn.jsdelivr.net/npm/",
+        "http://cdn.jsdelivr.net/npm/",
+        "https://unpkg.com/",
+        "http://unpkg.com/",
+        "https://cdn.skypack.dev/",
+        "https://esm.sh/",
+    ];
+    let specifier = CDN_PREFIXES
+        .iter()
+        .find_map(|prefix| href.strip_prefix(prefix))?;
+    let specifier = specifier.split(['?', '#']).next().unwrap_or(specifier);
+
+    // `@scope/name@version/path` or `name@version/path`.
+    let (package, path) = if let Some(scoped) = specifier.strip_prefix('@') {
+        let mut parts = scoped.splitn(3, '/');
+        let scope = parts.next()?;
+        let name = parts.next()?;
+        let path = parts.next().unwrap_or_default();
+        (format!("@{scope}/{}", strip_version(name)), path.to_string())
+    } else {
+        let mut parts = specifier.splitn(2, '/');
+        let name = parts.next()?;
+        let path = parts.next().unwrap_or_default();
+        (strip_version(name).to_string(), path.to_string())
+    };
+    (!path.is_empty()).then_some((package, path))
+}
+
+/// `bootstrap@5.3.3` → `bootstrap`. A leading `@` is a scope, not a version.
+fn strip_version(name: &str) -> &str {
+    match name.rfind('@') {
+        Some(0) | None => name,
+        Some(index) => &name[..index],
+    }
+}
+
+/// The `node_modules` copy of a CDN stylesheet, read from disk rather than
+/// fetched — the package is almost always installed locally.
+fn resolve_cdn_stylesheet(project_root: &Path, href: &str) -> Option<PathBuf> {
+    let (package, path) = cdn_package_and_path(href)?;
+    // node_modules may sit above the page's own directory in a workspace.
+    let mut current = Some(project_root);
+    for _ in 0..4 {
+        let directory = current?;
+        let candidate = normalize_path(&directory.join("node_modules").join(&package).join(&path));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -1677,14 +1738,19 @@ pub fn compile_html(project_root: &Path, path: &Path, html: &str) -> PreviewDocu
         match source {
             StyleSource::Inline(text) => sheet.extend(Stylesheet::parse(&text)),
             StyleSource::Href(href) => {
-                match resolve_local_asset(&base_dir, project_root, &href) {
+                // A CDN link resolves to the installed copy, so a page that
+                // gets Bootstrap (or its icon font) off jsDelivr still previews
+                // with its reset and utilities applied.
+                let resolved = resolve_local_asset(&base_dir, project_root, &href)
+                    .or_else(|| resolve_cdn_stylesheet(project_root, &href));
+                match resolved {
                     Some(resolved) => {
                         if let Ok(text) = fs::read_to_string(&resolved) {
                             sheet.extend(Stylesheet::parse(&text));
                             stylesheet_paths.push(resolved);
                         }
                     }
-                    None => notes.push(format!("Remote stylesheet not loaded: {href}")),
+                    None => notes.push(format!("Stylesheet not found locally: {href}")),
                 }
             }
         }
@@ -3156,7 +3222,9 @@ pub fn page_stylesheet(project_root: &Path, path: &Path) -> Stylesheet {
         match source {
             StyleSource::Inline(text) => sheet.extend(Stylesheet::parse(&text)),
             StyleSource::Href(href) => {
-                if let Some(resolved) = resolve_local_asset(&base_dir, project_root, &href) {
+                let resolved = resolve_local_asset(&base_dir, project_root, &href)
+                    .or_else(|| resolve_cdn_stylesheet(project_root, &href));
+                if let Some(resolved) = resolved {
                     if let Ok(text) = fs::read_to_string(&resolved) {
                         sheet.extend(Stylesheet::parse(&text));
                     }

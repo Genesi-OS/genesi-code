@@ -765,3 +765,68 @@ fn styled_interpolations_and_nested_states_are_dropped() {
     // The prop-dependent background and the hover state must not be guessed at.
     assert_eq!(button.style.background, None);
 }
+
+// ── CDN stylesheets ─────────────────────────────────────────────────────────
+
+#[test]
+fn resolves_jsdelivr_urls_to_their_package() {
+    assert_eq!(
+        cdn_package_and_path(
+            "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        ),
+        Some((
+            "bootstrap".to_string(),
+            "dist/css/bootstrap.min.css".to_string()
+        ))
+    );
+}
+
+#[test]
+fn resolves_unpkg_urls() {
+    assert_eq!(
+        cdn_package_and_path("https://unpkg.com/bulma@0.9.4/css/bulma.min.css"),
+        Some(("bulma".to_string(), "css/bulma.min.css".to_string()))
+    );
+}
+
+#[test]
+fn resolves_scoped_packages_without_eating_the_scope() {
+    // The leading `@` is a scope, not a version.
+    assert_eq!(
+        cdn_package_and_path("https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css"),
+        Some((
+            "@fortawesome/fontawesome-free".to_string(),
+            "css/all.min.css".to_string()
+        ))
+    );
+}
+
+#[test]
+fn resolves_an_unversioned_package() {
+    assert_eq!(
+        cdn_package_and_path("https://unpkg.com/bootstrap-icons/font/bootstrap-icons.css"),
+        Some((
+            "bootstrap-icons".to_string(),
+            "font/bootstrap-icons.css".to_string()
+        ))
+    );
+}
+
+#[test]
+fn query_strings_do_not_become_part_of_the_path() {
+    assert_eq!(
+        cdn_package_and_path("https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.css?v=2"),
+        Some((
+            "bootstrap".to_string(),
+            "dist/css/bootstrap.css".to_string()
+        ))
+    );
+}
+
+#[test]
+fn non_cdn_and_bare_package_urls_resolve_to_nothing() {
+    assert_eq!(cdn_package_and_path("https://example.com/style.css"), None);
+    assert_eq!(cdn_package_and_path("./style.css"), None);
+    // No file named inside the package: nothing to read.
+    assert_eq!(cdn_package_and_path("https://unpkg.com/bootstrap@5.3.3"), None);
+}

@@ -362,7 +362,10 @@ pub fn init(app: &mut AppContext) {
             CodeEditorViewAction::MoveRight,
         )
         .with_context_predicate(text_entry.clone())
-        .with_key_binding("ctrl-f"),
+        // Mac-only: this is the emacs convention, and everywhere else ctrl-f is
+        // Find. Keeping it cross-platform meant ctrl-f moved the cursor one
+        // character instead of opening the find bar.
+        .with_mac_key_binding("ctrl-f"),
         EditableBinding::new(
             "editor_view:move_to_line_start",
             "Move to line start",
@@ -609,8 +612,21 @@ pub fn init(app: &mut AppContext) {
         "Find in code editor",
         CodeEditorViewAction::ShowFindBar,
     )
-    .with_key_binding(cmd_or_ctrl_shift("f"))
+    // cmd-f on mac, ctrl-f elsewhere: the near-universal binding for finding
+    // in a file. `cmd_or_ctrl_shift("f")` is kept below as a second entry so
+    // anyone used to it is not broken.
+    .with_mac_key_binding("cmd-f")
+    .with_linux_or_windows_key_binding("ctrl-f")
     .with_custom_action(CustomAction::Find)
+    .with_context_predicate(text_entry.clone() & id!("FindBarAvailable"))
+    .with_enabled(|| FeatureFlag::CodeFindReplace.is_enabled())]);
+
+    app.register_editable_bindings([EditableBinding::new(
+        "code_editor:find_alternate",
+        "Find in code editor (alternate)",
+        CodeEditorViewAction::ShowFindBar,
+    )
+    .with_key_binding(cmd_or_ctrl_shift("f"))
     .with_context_predicate(text_entry.clone() & id!("FindBarAvailable"))
     .with_enabled(|| FeatureFlag::CodeFindReplace.is_enabled())]);
 

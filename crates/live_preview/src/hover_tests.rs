@@ -324,3 +324,70 @@ fn scoped_and_scss_style_blocks_are_read_too() {
     .expect("a preview");
     assert!(!preview.document.is_blank());
 }
+
+// ── module resolution ───────────────────────────────────────────────────────
+
+#[test]
+fn multi_line_imports_still_bind_their_names() {
+    // Prettier splits an import as soon as the list is long enough, and a
+    // line-based scan never matched these.
+    let source = r#"
+import React from 'react';
+import {
+  Card,
+  Badge,
+} from './ui/components';
+"#;
+    let bindings = module_bindings(source, "import");
+    let card = bindings
+        .iter()
+        .find(|(clause, _)| import_clause_binds(clause, "Card"))
+        .expect("Card is bound");
+    assert_eq!(card.1, "./ui/components");
+
+    let badge = bindings
+        .iter()
+        .find(|(clause, _)| import_clause_binds(clause, "Badge"))
+        .expect("Badge is bound");
+    assert_eq!(badge.1, "./ui/components");
+}
+
+#[test]
+fn a_side_effect_import_binds_nothing() {
+    let source = "import './styles.css';\nimport Card from './Card';";
+    let bindings = module_bindings(source, "import");
+    assert!(bindings
+        .iter()
+        .any(|(clause, specifier)| import_clause_binds(clause, "Card") && specifier == "./Card"));
+}
+
+#[test]
+fn export_statements_are_read_the_same_way() {
+    let source = r#"
+export { default as Card } from './Card';
+export { Badge } from './Badge';
+export * from './misc';
+"#;
+    let bindings = module_bindings(source, "export");
+    assert!(bindings
+        .iter()
+        .any(|(clause, specifier)| import_clause_binds(clause, "Card") && specifier == "./Card"));
+    assert!(bindings
+        .iter()
+        .any(|(clause, specifier)| import_clause_binds(clause, "Badge") && specifier == "./Badge"));
+    // A wildcard names nothing, so it must not claim to bind a name.
+    assert!(bindings
+        .iter()
+        .any(|(clause, specifier)| clause.contains('*') && specifier == "./misc"));
+}
+
+#[test]
+fn type_only_imports_do_not_shadow_a_value_import() {
+    let source = "import type { Props } from './types';\nimport Card from './Card';";
+    let bindings = module_bindings(source, "import");
+    let card = bindings
+        .iter()
+        .find(|(clause, _)| import_clause_binds(clause, "Card"))
+        .expect("Card is bound");
+    assert_eq!(card.1, "./Card");
+}

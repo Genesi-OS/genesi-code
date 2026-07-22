@@ -209,9 +209,17 @@ fn component_preview(
         None => {
             // Not local: follow the file's own import for this name, and read
             // just that one module.
-            let resolved = resolve_import(project_root, file_path, source, &name)?;
-            let imported_source = fs::read_to_string(&resolved).ok()?;
-            let imported = extract_jsx_components(project_root, &resolved, &imported_source);
+            let module = resolve_import(project_root, file_path, source, &name)?;
+            let module_source = fs::read_to_string(&module).ok()?;
+            let mut imported = extract_jsx_components(project_root, &module, &module_source);
+
+            // The module may be a barrel that only re-exports; follow it once.
+            if !imported.iter().any(|component| component.name == name) {
+                let target = resolve_reexport(project_root, &module, &name)?;
+                let target_source = fs::read_to_string(&target).ok()?;
+                imported = extract_jsx_components(project_root, &target, &target_source);
+            }
+
             let component = imported
                 .iter()
                 .find(|component| component.name == name)?
@@ -238,6 +246,10 @@ fn component_preview(
 }
 
 /// `import Card from './Card'` / `import { Card } from "../ui/Card"`.
+///
+/// Scans statements rather than lines: a multi-line import (which prettier
+/// produces as soon as the list is long enough) would otherwise never match,
+/// and the component would silently have no preview.
 fn resolve_import(
     project_root: &Path,
     file_path: &Path,
@@ -245,24 +257,93 @@ fn resolve_import(
     name: &str,
 ) -> Option<PathBuf> {
     let base_dir = file_path.parent().unwrap_or(project_root);
-    for line in source.lines() {
-        let line = line.trim();
-        if !line.starts_with("import") {
+    for (clause, specifier) in module_bindings(source, "import") {
+        if !import_clause_binds(&clause, name) {
             continue;
         }
-        let Some((clause, specifier)) = line.split_once(" from ") else {
-            continue;
-        };
-        if !import_clause_binds(clause, name) {
-            continue;
-        }
-        let specifier = specifier.trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
         // Only relative specifiers point at project source; a bare specifier is
         // a package, which has no source to preview.
         if !specifier.starts_with('.') {
             return None;
         }
-        return resolve_module(base_dir, specifier);
+        return resolve_module(base_dir, &specifier);
+    }
+    None
+}
+
+/// Every `<keyword> … from "<specifier>"` statement, as `(clause, specifier)`.
+/// Statements may span any number of lines.
+fn module_bindings(source: &str, keyword: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    for (index, _) in source.match_indices(keyword) {
+        // Must begin a statement, not sit inside an identifier.
+        if index > 0 {
+            let previous = bytes[index - 1] as char;
+            if previous.is_alphanumeric() || previous == '_' || previous == '$' || previous == '.' {
+                continue;
+            }
+        }
+        let rest = &source[index + keyword.len()..];
+        // The clause runs to the ` from ` that introduces the specifier. Bail
+        // at the next statement keyword so a bare `import './x.css'` does not
+        // swallow the file.
+        let Some(from) = rest.find(" from ") else {
+            continue;
+        };
+        let clause = &rest[..from];
+        if clause.contains(';') || clause.contains('{') && !clause.contains('}') && clause.len() > 400
+        {
+            continue;
+        }
+        let after = &rest[from + " from ".len()..];
+        let trimmed = after.trim_start();
+        let Some(quote) = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let Some(end) = trimmed[1..].find(quote) else {
+            continue;
+        };
+        out.push((clause.to_string(), trimmed[1..1 + end].to_string()));
+    }
+    out
+}
+
+/// Follows a barrel file: `export { Card } from './Card'`, `export { default as
+/// Card } from './Card'`, or `export * from './ui'`. An `index.ts` that only
+/// re-exports is the usual way component directories are consumed, and without
+/// this the trail ended there.
+fn resolve_reexport(project_root: &Path, module_path: &Path, name: &str) -> Option<PathBuf> {
+    let source = fs::read_to_string(module_path).ok()?;
+    let base_dir = module_path.parent().unwrap_or(project_root);
+    let mut wildcards = Vec::new();
+
+    for (clause, specifier) in module_bindings(&source, "export") {
+        if !specifier.starts_with('.') {
+            continue;
+        }
+        if clause.contains('*') {
+            wildcards.push(specifier);
+            continue;
+        }
+        if import_clause_binds(&clause, name) {
+            return resolve_module(base_dir, &specifier);
+        }
+    }
+    // `export * from './Card'` names nothing, so each has to be looked into.
+    for specifier in wildcards {
+        let Some(candidate) = resolve_module(base_dir, &specifier) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        if extract_jsx_components(project_root, &candidate, &text)
+            .iter()
+            .any(|component| component.name == name)
+        {
+            return Some(candidate);
+        }
     }
     None
 }
