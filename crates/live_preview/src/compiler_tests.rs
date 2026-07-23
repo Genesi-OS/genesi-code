@@ -970,3 +970,64 @@ fn a_fragment_variable_falls_back_when_the_root_never_defines_it() {
     let node = find_box(&document.root, "div").expect("div");
     assert_eq!(node.style.color, Some(Rgba::new(0xab, 0xcd, 0xef, 255)));
 }
+
+// ── flex growth ─────────────────────────────────────────────────────────────
+
+#[test]
+fn a_growing_child_is_not_dropped_when_the_parent_has_no_height() {
+    // The sidebar shape: `height: calc(…)` is a length the preview cannot
+    // resolve, so the column is content-sized. A `flex: 1` child there has no
+    // leftover space to take and collapsed, taking the whole nav body with it.
+    let document = compile(
+        r#"<html><head><style>
+            #nav-bar { display: flex; flex-direction: column; height: calc(100% - 2vw); }
+            #nav-content { flex: 1; }
+        </style></head><body>
+            <div id="nav-bar"><div id="nav-content">Dashboard</div></div>
+        </body></html>"#,
+    );
+    let bar = find_box(&document.root, "div").expect("nav-bar");
+    let content = bar
+        .children
+        .iter()
+        .find_map(|child| find_box(child, "div"))
+        .expect("nav-content");
+    assert_eq!(content.style.grow, 0.);
+    assert!(collect_text(&document.root).contains("Dashboard"));
+}
+
+#[test]
+fn a_growing_child_keeps_growing_when_the_parent_is_sized() {
+    let document = compile(
+        r#"<html><head><style>
+            .col { display: flex; flex-direction: column; height: 400px; }
+            .body { flex: 1; }
+        </style></head><body>
+            <div class="col"><div class="body">hi</div></div>
+        </body></html>"#,
+    );
+    let column = find_box(&document.root, "div").expect("col");
+    let body = column
+        .children
+        .iter()
+        .find_map(|child| find_box(child, "div"))
+        .expect("body");
+    assert_eq!(body.style.grow, 1.);
+}
+
+#[test]
+fn a_row_uses_its_width_to_decide_whether_growth_is_satisfiable() {
+    let document = compile(
+        r#"<html><head><style>
+            .row { display: flex; flex-direction: row; width: 600px; }
+            .fill { flex: 1; }
+        </style></head><body><div class="row"><div class="fill">hi</div></div></body></html>"#,
+    );
+    let row = find_box(&document.root, "div").expect("row");
+    let fill = row
+        .children
+        .iter()
+        .find_map(|child| find_box(child, "div"))
+        .expect("fill");
+    assert_eq!(fill.style.grow, 1.);
+}

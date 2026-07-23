@@ -1442,6 +1442,33 @@ impl PreviewDocument {
     }
 }
 
+/// Clears `flex-grow` on children when the parent has no definite size along
+/// its main axis.
+///
+/// Growing means "take the leftover space", and there is no leftover space to
+/// take when the container is sized by its content — the child collapses to
+/// nothing instead. A sidebar declaring `height: calc(100% - 2vw)` (a length
+/// the preview cannot resolve) with a `flex: 1` body is the common shape, and
+/// it rendered as a thin strip with the whole body missing.
+fn drop_unsatisfiable_grow(style: &ComputedStyle, children: &mut [PreviewNode]) {
+    let definite_main_axis = match (style.display, style.direction) {
+        (Display::Flex, FlexDirection::Row) => style.width.is_some(),
+        (Display::Flex, FlexDirection::Column) => {
+            style.height.is_some() || style.min_height.is_some()
+        }
+        // A block container stacks vertically, same as a column.
+        _ => style.height.is_some() || style.min_height.is_some(),
+    };
+    if definite_main_axis {
+        return;
+    }
+    for child in children {
+        if let PreviewNode::Box(preview_box) = child {
+            preview_box.style.grow = 0.;
+        }
+    }
+}
+
 /// Whether a node paints anything a reader would notice.
 fn has_visible_content(node: &PreviewNode) -> bool {
     match node {
@@ -1978,7 +2005,8 @@ impl Compiler<'_> {
             _ => {}
         }
 
-        let children = self.compile_children(element, &style, &chain, &variables);
+        let mut children = self.compile_children(element, &style, &chain, &variables);
+        drop_unsatisfiable_grow(&style, &mut children);
         PreviewNode::Box(PreviewBox {
             tag: element.tag.clone(),
             style,
@@ -3188,6 +3216,7 @@ impl Compiler<'_> {
         if !inline_run.is_empty() {
             children.push(finish_inline_run(&mut inline_run, &style));
         }
+        drop_unsatisfiable_grow(&style, &mut children);
 
         PreviewNode::Box(PreviewBox {
             tag: element.tag.clone(),

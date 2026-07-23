@@ -43,10 +43,10 @@ use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::path::to_relative_path;
 use warp_util::sync::Condition;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Flex, Hoverable, MainAxisAlignment,
-    MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, Radius, Rect, Shrinkable, Stack, Text,
+    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Fill, Flex,
+    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, Radius, Rect, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::keymap::macros::*;
 use warpui::keymap::FixedBinding;
@@ -257,6 +257,9 @@ pub(super) struct ComponentHoverState {
     pub(super) preview: Arc<HoverPreview>,
     /// Lets the pointer move onto the card itself without dismissing it.
     pub(super) mouse_state: MouseStateHandle,
+    /// Tall subjects — a whole sidebar, say — do not fit the card, so its body
+    /// scrolls rather than being silently cut off at the bottom.
+    pub(super) scroll: ClippedScrollStateHandle,
 }
 
 pub(super) enum LspHoverState {
@@ -1149,6 +1152,7 @@ impl LocalCodeEditorView {
                     offset,
                     preview: Arc::new(preview),
                     mouse_state: MouseStateHandle::default(),
+                    scroll: ClippedScrollStateHandle::default(),
                 });
                 ctx.notify();
             },
@@ -1223,9 +1227,19 @@ impl LocalCodeEditorView {
                     .finish(),
                 )
                 .with_child(
-                    ConstrainedBox::new(Clipped::new(sheet).finish())
-                        .with_max_height(COMPONENT_HOVER_MAX_HEIGHT)
+                    ConstrainedBox::new(
+                        ClippedScrollable::vertical(
+                            hover.scroll.clone(),
+                            sheet,
+                            ScrollbarWidth::Auto,
+                            theme.disabled_ui_text_color().into(),
+                            theme.active_ui_text_color().into(),
+                            Fill::None,
+                        )
                         .finish(),
+                    )
+                    .with_max_height(COMPONENT_HOVER_MAX_HEIGHT)
+                    .finish(),
                 )
                 .finish(),
         )

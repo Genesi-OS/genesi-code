@@ -615,18 +615,24 @@ pub fn init(app: &mut AppContext) {
     // cmd-f on mac, ctrl-f elsewhere: the near-universal binding for finding
     // in a file. `cmd_or_ctrl_shift("f")` is kept below as a second entry so
     // anyone used to it is not broken.
+    // No `with_custom_action` here on purpose: a custom action's keystroke is
+    // resolved from the shared table in `util::bindings`, which maps
+    // `CustomAction::Find` to cmd/ctrl-shift-f and would overwrite the binding
+    // set just above — which is why plain ctrl-f never reached the find bar.
     .with_mac_key_binding("cmd-f")
     .with_linux_or_windows_key_binding("ctrl-f")
-    .with_custom_action(CustomAction::Find)
     .with_context_predicate(text_entry.clone() & id!("FindBarAvailable"))
     .with_enabled(|| FeatureFlag::CodeFindReplace.is_enabled())]);
 
+    // The shift variant keeps the custom action, so the Edit menu item and any
+    // user remapping still resolve to a real binding.
     app.register_editable_bindings([EditableBinding::new(
         "code_editor:find_alternate",
         "Find in code editor (alternate)",
         CodeEditorViewAction::ShowFindBar,
     )
     .with_key_binding(cmd_or_ctrl_shift("f"))
+    .with_custom_action(CustomAction::Find)
     .with_context_predicate(text_entry.clone() & id!("FindBarAvailable"))
     .with_enabled(|| FeatureFlag::CodeFindReplace.is_enabled())]);
 
