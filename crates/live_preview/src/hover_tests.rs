@@ -81,9 +81,13 @@ fn jsx_attributes_and_expressions_are_not_tags() {
 }
 
 #[test]
-fn svg_tags_in_jsx_are_not_targets_either() {
+fn an_svg_in_jsx_is_a_target_but_its_innards_are_not() {
     let source = r#"return <svg viewBox="0 0 24 24"><path d="M0 0" /></svg>;"#;
-    assert_eq!(jsx(source, "<svg"), None);
+    assert!(matches!(
+        jsx(source, "<svg"),
+        Some(HoverTarget::JsxElement { .. })
+    ));
+    assert_eq!(jsx(source, "<path"), None);
 }
 
 #[test]
@@ -135,12 +139,15 @@ fn the_closing_tag_is_also_a_target() {
 }
 
 #[test]
-fn svg_internals_are_never_targets() {
-    // These compile to nothing, so targeting them produced a blank card.
+fn svg_internals_are_not_targets_but_the_svg_itself_is() {
+    // A lone `<path>` has no viewBox and rasterises to nothing, so it stays a
+    // non-target. The `<svg>` around it draws, so it is worth hovering.
     let source = r#"<button><svg viewBox="0 0 24 24"><path fill="none" d="M0 0h24"></path></svg>Text</button>"#;
     assert_eq!(html(source, "<path"), None);
-    assert_eq!(html(source, "<svg"), None);
-    // The button around them is still a perfectly good target.
+    assert!(matches!(
+        html(source, "<svg"),
+        Some(HoverTarget::HtmlElement { .. })
+    ));
     assert!(matches!(
         html(source, "<button"),
         Some(HoverTarget::HtmlElement { .. })
@@ -251,10 +258,23 @@ fn a_target_that_compiles_to_nothing_yields_no_card() {
     let document = compile_html_fragment(
         Path::new("/project"),
         Path::new("/project/index.html"),
-        "<div><svg><path d=\"M0 0\"></path></svg></div>",
+        "<div><script>var x = 1;</script></div>",
         &Stylesheet::default(),
     );
     assert!(document.is_blank());
+}
+
+#[test]
+fn an_svg_is_something_to_draw() {
+    // Icons and logos are inline SVG; they used to be dropped, which made a
+    // card holding one look empty.
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        r#"<div><svg viewBox="0 0 24 24"><path d="M0 0h24"/></svg></div>"#,
+        &Stylesheet::default(),
+    );
+    assert!(!document.is_blank());
 }
 
 #[test]

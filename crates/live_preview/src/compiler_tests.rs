@@ -41,6 +41,7 @@ fn collect_text(node: &PreviewNode) -> String {
         PreviewNode::Placeholder { label, .. } => label.clone(),
         PreviewNode::Image { alt, .. } => alt.clone(),
         PreviewNode::Rule { .. } => String::new(),
+        PreviewNode::Svg { .. } => String::new(),
     }
 }
 
@@ -1119,4 +1120,115 @@ fn a_fallback_literal_renders_as_text() {
     let text = collect_text(&document.root);
     assert!(text.contains("Usuário"), "got {text}");
     assert!(!text.contains("userName"), "raw source leaked: {text}");
+}
+
+// ── inline SVG ──────────────────────────────────────────────────────────────
+
+fn svg_source(node: &PreviewNode) -> Option<&str> {
+    match node {
+        PreviewNode::Svg { source, .. } => Some(source),
+        PreviewNode::Box(preview_box) => preview_box.children.iter().find_map(svg_source),
+        _ => None,
+    }
+}
+
+#[test]
+fn an_inline_svg_is_kept_as_renderable_source() {
+    let document = compile(
+        r#"<html><body><div><svg viewBox="0 0 24 24"><path d="M0 0h24"></path></svg></div></body></html>"#,
+    );
+    let svg = svg_source(&document.root).expect("svg kept");
+    assert!(svg.starts_with("<svg"), "got {svg}");
+    assert!(svg.contains("viewBox=\"0 0 24 24\""), "viewBox lost: {svg}");
+    assert!(svg.contains("<path"), "got {svg}");
+    assert!(svg.contains("xmlns="), "a standalone svg needs its namespace: {svg}");
+}
+
+#[test]
+fn jsx_camel_case_svg_names_are_restored() {
+    // JSX writes `strokeWidth` and `clipPath`; SVG needs `stroke-width` and
+    // `clipPath`. Serialising the flattened names produces markup a rasteriser
+    // silently ignores.
+    let component = JsxComponentSource {
+        name: "Logo".to_string(),
+        path: "/p/src/Logo.tsx".into(),
+        line: 1,
+        markup: r#"<svg viewBox="0 0 200 200"><defs><clipPath id="e"><rect height={30} width={30} /></clipPath></defs><circle strokeWidth={2} strokeLinecap="round" r={70} /></svg>"#.to_string(),
+        stylesheets: Vec::new(),
+    };
+    let document = compile_jsx_component(
+        Path::new("/p"),
+        &component,
+        &HashMap::new(),
+        &Stylesheet::default(),
+    );
+    let svg = svg_source(&document.root).expect("svg kept");
+    assert!(svg.contains("stroke-width=\"2\""), "got {svg}");
+    assert!(svg.contains("stroke-linecap=\"round\""), "got {svg}");
+    assert!(svg.contains("<clipPath"), "got {svg}");
+    assert!(svg.contains("viewBox="), "got {svg}");
+}
+
+#[test]
+fn current_color_is_resolved_against_the_element() {
+    // A standalone rasteriser has no notion of `currentColor`.
+    let document = compile(
+        r#"<html><head><style>.icon { color: #ff0000; }</style></head>
+           <body><svg class="icon"><path stroke="currentColor" d="M0 0"/></svg></body></html>"#,
+    );
+    let svg = svg_source(&document.root).expect("svg kept");
+    assert!(svg.contains("#ff0000"), "currentColor not resolved: {svg}");
+    assert!(!svg.contains("currentColor"), "got {svg}");
+}
+
+// ── box-shadow ──────────────────────────────────────────────────────────────
+
+#[test]
+fn a_box_shadow_is_resolved() {
+    let document = compile(
+        r#"<html><head><style>
+            .card { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        </style></head><body><div class="card">hi</div></body></html>"#,
+    );
+    let card = find_box(&document.root, "div").expect("card");
+    let shadow = card.style.shadow.expect("a shadow");
+    assert_eq!(shadow.offset_x, 0.);
+    assert_eq!(shadow.offset_y, 4.);
+    assert_eq!(shadow.blur, 12.);
+    assert_eq!(shadow.color, Rgba::new(0, 0, 0, 25));
+}
+
+#[test]
+fn a_spread_radius_is_kept() {
+    let document = compile(
+        r#"<html><head><style>.a { box-shadow: 1px 2px 3px 4px #000000; }</style></head>
+           <body><div class="a">hi</div></body></html>"#,
+    );
+    let node = find_box(&document.root, "div").expect("div");
+    let shadow = node.style.shadow.expect("a shadow");
+    assert_eq!(shadow.spread, 4.);
+}
+
+#[test]
+fn inset_and_none_shadows_are_not_drawn() {
+    for value in ["inset 0 2px 4px #000000", "none"] {
+        let document = compile(&format!(
+            r#"<html><head><style>.a {{ box-shadow: {value}; }}</style></head>
+               <body><div class="a">hi</div></body></html>"#
+        ));
+        let node = find_box(&document.root, "div").expect("div");
+        assert!(node.style.shadow.is_none(), "{value} should not draw");
+    }
+}
+
+#[test]
+fn only_the_first_of_a_shadow_list_is_used() {
+    let document = compile(
+        r#"<html><head><style>
+            .a { box-shadow: 0 1px 2px #ff0000, 0 8px 24px #00ff00; }
+        </style></head><body><div class="a">hi</div></body></html>"#,
+    );
+    let node = find_box(&document.root, "div").expect("div");
+    let shadow = node.style.shadow.expect("a shadow");
+    assert_eq!(shadow.color, Rgba::new(255, 0, 0, 255));
 }

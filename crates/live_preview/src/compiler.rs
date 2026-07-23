@@ -950,6 +950,18 @@ pub struct ComputedStyle {
     /// `filter: blur(…)`. Softening is applied once the whole rule has been
     /// read, so it does not depend on whether `opacity` came before or after.
     pub blurred: bool,
+    pub shadow: Option<BoxShadow>,
+}
+
+/// A resolved `box-shadow`. Only the first, outer shadow is kept — that is the
+/// one carrying the elevation a reader perceives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
 }
 
 impl Default for ComputedStyle {
@@ -982,6 +994,7 @@ impl Default for ComputedStyle {
             grow: 0.,
             centered_block: false,
             blurred: false,
+            shadow: None,
         }
     }
 }
@@ -1220,6 +1233,7 @@ fn apply_declaration(
                 style.opacity = opacity.clamp(0., 1.);
             }
         }
+        "box-shadow" => style.shadow = parse_box_shadow(value),
         "filter" | "backdrop-filter" => {
             // A blurred shape is a soft glow behind other content. Drawing it
             // at full strength turned a decorative blob into a solid slab of
@@ -1241,6 +1255,37 @@ fn apply_declaration(
         }
         _ => {}
     }
+}
+
+/// `0 4px 12px rgba(0,0,0,.1)` → an outer shadow. `inset` shadows describe an
+/// inner edge the preview does not draw, and only the first of a comma list is
+/// kept: it is the one that reads as elevation.
+fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
+    let first = split_top_level(value, ',').into_iter().next()?;
+    let lower = first.to_ascii_lowercase();
+    if lower.contains("inset") || lower.trim() == "none" {
+        return None;
+    }
+
+    let mut lengths = Vec::new();
+    let mut color = None;
+    for token in split_top_level(&first, ' ') {
+        if let Some(parsed) = parse_length(&token, ROOT_FONT_SIZE, None) {
+            lengths.push(parsed);
+        } else if color.is_none() {
+            color = parse_color(&token);
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(BoxShadow {
+        offset_x: lengths[0],
+        offset_y: lengths[1],
+        blur: lengths.get(2).copied().unwrap_or(0.),
+        spread: lengths.get(3).copied().unwrap_or(0.),
+        color: color.unwrap_or(Rgba::new(0, 0, 0, 60)),
+    })
 }
 
 fn parse_edges(value: &str, font_size: f32) -> Edges {
@@ -1384,6 +1429,12 @@ pub enum PreviewNode {
     Placeholder { label: String, style: ComputedStyle },
     /// `<hr>` and friends.
     Rule { style: ComputedStyle },
+    /// An inline `<svg>`, kept as source so it can be rasterised. Icons and
+    /// logos are drawn this way and were previously dropped entirely.
+    Svg {
+        source: String,
+        style: ComputedStyle,
+    },
 }
 
 impl PreviewNode {
@@ -1394,6 +1445,7 @@ impl PreviewNode {
             Self::Image { style, .. } => style,
             Self::Placeholder { style, .. } => style,
             Self::Rule { style } => style,
+            Self::Svg { style, .. } => style,
         }
     }
 
@@ -1469,15 +1521,86 @@ fn drop_unsatisfiable_grow(style: &ComputedStyle, children: &mut [PreviewNode]) 
     }
 }
 
+/// SVG names that HTML and JSX parsing flattens to lowercase but SVG itself
+/// requires in camel case (elements) or kebab case (presentation attributes).
+/// Serialising without restoring these produces markup a renderer ignores.
+#[rustfmt::skip]
+const SVG_NAMES: &[(&str, &str)] = &[
+    ("clippath", "clipPath"), ("lineargradient", "linearGradient"),
+    ("radialgradient", "radialGradient"), ("textpath", "textPath"),
+    ("foreignobject", "foreignObject"), ("animatemotion", "animateMotion"),
+    ("animatetransform", "animateTransform"), ("viewbox", "viewBox"),
+    ("preserveaspectratio", "preserveAspectRatio"), ("patternunits", "patternUnits"),
+    ("gradientunits", "gradientUnits"), ("gradienttransform", "gradientTransform"),
+    ("clippathunits", "clipPathUnits"), ("markerwidth", "markerWidth"),
+    ("markerheight", "markerHeight"), ("spreadmethod", "spreadMethod"),
+    ("stopcolor", "stop-color"), ("stopopacity", "stop-opacity"),
+    ("strokewidth", "stroke-width"), ("strokelinecap", "stroke-linecap"),
+    ("strokelinejoin", "stroke-linejoin"), ("strokedasharray", "stroke-dasharray"),
+    ("strokedashoffset", "stroke-dashoffset"), ("strokeopacity", "stroke-opacity"),
+    ("strokemiterlimit", "stroke-miterlimit"), ("fillopacity", "fill-opacity"),
+    ("fillrule", "fill-rule"), ("cliprule", "clip-rule"),
+    ("fontfamily", "font-family"), ("fontsize", "font-size"),
+    ("textanchor", "text-anchor"), ("dominantbaseline", "dominant-baseline"),
+    ("clippath-attr", "clip-path"),
+];
+
+fn restore_svg_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    SVG_NAMES
+        .iter()
+        .find(|(flat, _)| *flat == lower)
+        .map(|(_, proper)| (*proper).to_string())
+        .unwrap_or(name.to_string())
+}
+
+/// Rebuilds an `<svg>` subtree as standalone SVG source.
+///
+/// `current_color` stands in for `currentColor`, which resolves against the
+/// element's colour on a page but means nothing to a standalone rasteriser —
+/// leaving it in renders the shape black or not at all.
+fn serialize_svg(element: &DomElement, current_color: Option<Rgba>, depth: usize) -> String {
+    if depth > MAX_NESTING_DEPTH {
+        return String::new();
+    }
+    let color = current_color
+        .map(|color| format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b))
+        .unwrap_or_else(|| "#000000".to_string());
+
+    let tag = restore_svg_name(&element.tag);
+    let mut out = format!("<{tag}");
+    if element.tag == "svg" && !element.attrs.contains_key("xmlns") {
+        out.push_str(" xmlns=\"http://www.w3.org/2000/svg\"");
+    }
+    for (name, value) in &element.attrs {
+        // `className` is React's spelling; SVG wants `class`.
+        let name = if name == "classname" { "class" } else { name };
+        let value = value.replace("currentColor", &color).replace('"', "&quot;");
+        out.push_str(&format!(" {}=\"{}\"", restore_svg_name(name), value));
+    }
+    out.push('>');
+    for child in &element.children {
+        match child {
+            DomNode::Text(text) => out.push_str(text),
+            DomNode::Element(child) => {
+                out.push_str(&serialize_svg(child, current_color, depth + 1))
+            }
+        }
+    }
+    out.push_str(&format!("</{tag}>"));
+    out
+}
+
 /// Whether a node paints anything a reader would notice.
 fn has_visible_content(node: &PreviewNode) -> bool {
     match node {
         PreviewNode::Inline { fragments, .. } => {
             fragments.iter().any(|fragment| !fragment.text.trim().is_empty())
         }
-        PreviewNode::Image { .. } | PreviewNode::Placeholder { .. } | PreviewNode::Rule { .. } => {
-            true
-        }
+        PreviewNode::Image { .. }
+        | PreviewNode::Placeholder { .. }
+        | PreviewNode::Rule { .. }
+        | PreviewNode::Svg { .. } => true,
         PreviewNode::Box(preview_box) => {
             if preview_box.style.display == Display::None {
                 return false;
@@ -1513,8 +1636,8 @@ enum DomNode {
 
 /// Tags whose content is not part of the rendered page.
 const DROPPED_TAGS: &[&str] = &[
-    "script", "style", "noscript", "template", "head", "meta", "link", "title", "base", "svg",
-    "path", "iframe", "canvas",
+    "script", "style", "noscript", "template", "head", "meta", "link", "title", "base", "iframe",
+    "canvas",
 ];
 
 /// Tags that participate in an inline run rather than opening a box.
@@ -1964,6 +2087,12 @@ impl Compiler<'_> {
                 };
             }
             "hr" => return PreviewNode::Rule { style },
+            "svg" => {
+                return PreviewNode::Svg {
+                    source: serialize_svg(element, style.color, 0),
+                    style,
+                }
+            }
             "input" => {
                 let label = element
                     .attrs
@@ -3204,6 +3333,12 @@ impl Compiler<'_> {
                 },
                 children: Vec::new(),
             });
+        }
+        if element.tag == "svg" {
+            return PreviewNode::Svg {
+                source: serialize_svg(element, style.color, 0),
+                style,
+            };
         }
         if element.tag == "img" {
             let src = element.attrs.get("src").cloned().unwrap_or_default();

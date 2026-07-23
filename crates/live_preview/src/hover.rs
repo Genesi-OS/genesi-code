@@ -647,7 +647,8 @@ const VOID_TAGS: &[&str] = &[
 /// produced a card that was titled `path` and completely blank.
 const NON_TARGET_TAGS: &[&str] = &[
     "html", "head", "body", "script", "style", "title", "meta", "link", "base", "template",
-    "svg", "path",
+    // `svg` itself renders now; its innards do not stand alone.
+    "path",
     "g", "circle", "ellipse", "rect", "line", "polyline", "polygon", "defs", "use", "symbol",
     "clippath", "mask", "filter", "lineargradient", "radialgradient", "stop", "tspan",
 ];

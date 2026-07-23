@@ -11,7 +11,10 @@ use markdown_parser::weight::CustomWeight;
 use markdown_parser::{
     FormattedText, FormattedTextFragment, FormattedTextLine, FormattedTextStyles,
 };
-use warpui::assets::asset_cache::AssetSource;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+
+use warpui::assets::asset_cache::{AssetSource, AsyncAssetId, AsyncAssetType};
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, CacheOption, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element,
@@ -21,8 +24,8 @@ use warpui::elements::{
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 
 use super::live_preview::{
-    Align, ComputedStyle, Display, Edges, FlexDirection, InlineFragment, Justify, PreviewDocument,
-    PreviewNode, Rgba, TextAlign,
+    Align, BoxShadow, ComputedStyle, Display, Edges, FlexDirection, InlineFragment, Justify,
+    PreviewDocument, PreviewNode, Rgba, TextAlign,
 };
 use crate::appearance::Appearance;
 
@@ -142,6 +145,7 @@ pub fn render_node(
             let color = style.color.map(to_color).unwrap_or(inherited_color);
             render_placeholder(appearance, label, color, scale)
         }
+        PreviewNode::Svg { source, style } => render_svg(source, style, scale),
         PreviewNode::Rule { style } => {
             let color = style
                 .border_color
@@ -267,6 +271,9 @@ fn decorate(
         container =
             container.with_corner_radius(CornerRadius::with_all(Radius::Pixels(scale.px(style.radius))));
     }
+    if let Some(shadow) = style.shadow {
+        container = container.with_drop_shadow(to_drop_shadow(shadow, scale));
+    }
     let element = container.finish();
 
     let needs_size =
@@ -297,6 +304,58 @@ fn decorate(
             .finish();
     }
     sized
+}
+
+/// Namespace for rasterised inline SVG, so its cache keys cannot collide with
+/// any other async asset.
+struct InlineSvgAsset;
+impl AsyncAssetType for InlineSvgAsset {}
+
+fn to_drop_shadow(shadow: BoxShadow, scale: PreviewScale) -> warpui::elements::DropShadow {
+    warpui::elements::DropShadow {
+        color: to_color(shadow.color),
+        offset: warpui::geometry::vector::vec2f(
+            scale.px(shadow.offset_x),
+            scale.px(shadow.offset_y),
+        ),
+        blur_radius: scale.px(shadow.blur),
+        spread_radius: scale.px(shadow.spread),
+    }
+}
+
+/// Draws an inline `<svg>` by handing its source to the image cache, which
+/// already rasterises SVG. The bytes are supplied directly rather than fetched,
+/// and the cache key is the source's hash so identical icons are rasterised
+/// once.
+fn render_svg(source: &str, style: &ComputedStyle, scale: PreviewScale) -> Box<dyn Element> {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+
+    let bytes: Arc<[u8]> = Arc::from(source.as_bytes().to_vec().into_boxed_slice());
+    let image = Image::new(
+        AssetSource::Async {
+            id: AsyncAssetId::new::<InlineSvgAsset>(key),
+            fetch: Arc::new(move || {
+                let bytes = bytes.clone();
+                Box::pin(async move { Ok(bytes::Bytes::from(bytes.to_vec())) })
+            }),
+        },
+        CacheOption::BySize,
+    )
+    .contain()
+    .finish();
+
+    // An icon with no declared size still needs a box to draw in.
+    let width = style.width.map(|width| scale.px(width)).unwrap_or(scale.px(24.));
+    let height = style
+        .height
+        .map(|height| scale.px(height))
+        .unwrap_or(scale.px(24.));
+    ConstrainedBox::new(image)
+        .with_width(width)
+        .with_height(height)
+        .finish()
 }
 
 fn scaled_edges(edges: Edges, scale: PreviewScale) -> Edges {
