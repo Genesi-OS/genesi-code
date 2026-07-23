@@ -34,7 +34,16 @@ pub fn declarations_for_class(class: &str) -> Vec<(String, String)> {
     // Arbitrary values: `text-[#61dafb]`, `w-[32px]`, `bg-[rgb(1,2,3)]`.
     if let Some((head, value)) = arbitrary_value(bare) {
         return match head {
-            "text" => declaration("color", value),
+            // `text-[…]` is a colour or a font size depending on the value:
+            // `text-[#1a1a1a]` vs `text-[24px]`. Treating every one as a colour
+            // silently dropped arbitrary font sizes.
+            "text" => {
+                if looks_like_length(&value) {
+                    declaration("font-size", value)
+                } else {
+                    declaration("color", value)
+                }
+            }
             "bg" => declaration("background-color", value),
             "border" => declaration("border-color", value),
             "w" => declaration("width", value),
@@ -183,6 +192,15 @@ pub fn declarations_for_class(class: &str) -> Vec<(String, String)> {
     }
 
     Vec::new()
+}
+
+/// Whether an arbitrary value is a length rather than a colour.
+fn looks_like_length(value: &str) -> bool {
+    let value = value.trim();
+    ["px", "rem", "em", "vh", "vw", "%", "pt"]
+        .iter()
+        .any(|unit| value.ends_with(unit))
+        || value.parse::<f32>().is_ok()
 }
 
 fn is_responsive_prefix(prefix: &str) -> bool {

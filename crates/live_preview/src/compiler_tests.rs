@@ -1232,3 +1232,35 @@ fn only_the_first_of_a_shadow_list_is_used() {
     let shadow = node.style.shadow.expect("a shadow");
     assert_eq!(shadow.color, Rgba::new(255, 0, 0, 255));
 }
+
+// ── a real hovered element (Competitivo.tsx) ────────────────────────────────
+
+#[test]
+fn a_real_tailwind_element_resolves_its_utilities() {
+    let markup = r#"<div className="text-center mb-6 md:mb-10">
+        <h1 className="text-[24px] md:text-[32px] font-bold text-[#1a1a1a] mb-1 md:mb-2">Melhores Redacoes</h1>
+        <p className="text-sm md:text-base text-[#666]">Ranking dos melhores escritores</p>
+    </div>"#;
+    let document = compile_markup(markup, "");
+
+    let outer = find_box(&document.root, "div").expect("div");
+    assert_eq!(outer.style.text_align, TextAlign::Center);
+    assert_eq!(outer.style.margin.bottom, 40.); // md:mb-10 wins over mb-6
+
+    let h1 = find_box(&document.root, "h1").expect("h1");
+    assert!(h1.style.bold);
+    assert_eq!(h1.style.color, Some(Rgba::new(0x1a, 0x1a, 0x1a, 255)));
+    // The arbitrary font size must come from `text-[32px]`, not the h1 default.
+    assert_eq!(h1.style.font_size, 32.);
+}
+
+#[test]
+fn an_arbitrary_text_value_is_a_font_size_when_it_is_a_length() {
+    let document = compile_markup(r#"<span className="text-[14px]">hi</span>"#, "");
+    let span = find_box(&document.root, "span").expect("span");
+    assert_eq!(span.style.font_size, 14.);
+    // …and still a colour when it is one.
+    let document = compile_markup(r#"<span className="text-[#00ff00]">hi</span>"#, "");
+    let span = find_box(&document.root, "span").expect("span");
+    assert_eq!(span.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
