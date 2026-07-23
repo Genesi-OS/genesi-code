@@ -915,3 +915,58 @@ fn a_blurred_element_is_drawn_faintly_rather_than_solid() {
         glow.style.opacity
     );
 }
+
+// ── custom properties reach fragments and components ────────────────────────
+
+#[test]
+fn a_fragment_inherits_the_root_custom_properties() {
+    // The shape of a real stylesheet: every colour named by a variable on
+    // `:root`. Compiling a fragment without them left `var(--…)` unresolved,
+    // so the hovered element came out with no styling at all.
+    let sheet = Stylesheet::parse(
+        r#"
+        :root { --navbar-dark-primary: #18283b; --navbar-light-primary: #f5f6fa; }
+        #nav-bar { background: var(--navbar-dark-primary); color: var(--navbar-light-primary); }
+        "#,
+    );
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        r#"<div id="nav-bar">hi</div>"#,
+        &sheet,
+    );
+    let bar = find_box(&document.root, "div").expect("nav-bar");
+    assert_eq!(bar.style.background, Some(Rgba::new(0x18, 0x28, 0x3b, 255)));
+    assert_eq!(bar.style.color, Some(Rgba::new(0xf5, 0xf6, 0xfa, 255)));
+}
+
+#[test]
+fn a_component_inherits_the_root_custom_properties() {
+    let component = JsxComponentSource {
+        name: "Card".to_string(),
+        path: "/project/src/Card.tsx".into(),
+        line: 1,
+        markup: r#"<div className="card">hi</div>"#.to_string(),
+        stylesheets: Vec::new(),
+    };
+    let sheet = Stylesheet::parse(
+        ":root { --surface: #101418; } .card { background: var(--surface); }",
+    );
+    let document =
+        compile_jsx_component(Path::new("/project"), &component, &HashMap::new(), &sheet);
+    let card = find_box(&document.root, "div").expect("card");
+    assert_eq!(card.style.background, Some(Rgba::new(0x10, 0x14, 0x18, 255)));
+}
+
+#[test]
+fn a_fragment_variable_falls_back_when_the_root_never_defines_it() {
+    let sheet = Stylesheet::parse(".a { color: var(--missing, #abcdef); }");
+    let document = compile_html_fragment(
+        Path::new("/project"),
+        Path::new("/project/index.html"),
+        r#"<div class="a">hi</div>"#,
+        &sheet,
+    );
+    let node = find_box(&document.root, "div").expect("div");
+    assert_eq!(node.style.color, Some(Rgba::new(0xab, 0xcd, 0xef, 255)));
+}

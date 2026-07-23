@@ -3041,8 +3041,10 @@ pub fn compile_jsx_component(
         budget: 2_000,
         nesting: 0,
     };
-    let root_style = ComputedStyle::default();
-    let root = compiler.compile_component_tree(&dom, &root_style, &[], &HashMap::new());
+    // Same as a page fragment: a component inherits the root's custom
+    // properties, which is where a design system keeps its colours.
+    let (root_style, root_variables) = resolve_root(&sheet);
+    let root = compiler.compile_component_tree(&dom, &root_style, &[], &root_variables);
 
     PreviewDocument {
         title: component.name.clone(),
@@ -3233,7 +3235,12 @@ pub fn compile_html_fragment(
         budget: 600,
         nesting: 0,
     };
-    let root = compiler.compile_element(&body, &ComputedStyle::default(), &[], &HashMap::new());
+    // A fragment is still part of its page, so it inherits the root's custom
+    // properties. Without them every `var(--…)` resolved to nothing, and a
+    // stylesheet that names its colours that way — most of them do — produced
+    // a completely unstyled card.
+    let (root_style, root_variables) = resolve_root(sheet);
+    let root = compiler.compile_element(&body, &root_style, &[], &root_variables);
     PreviewDocument {
         title: "Fragment".to_string(),
         root,
