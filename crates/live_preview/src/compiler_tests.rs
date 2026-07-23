@@ -1031,3 +1031,92 @@ fn a_row_uses_its_width_to_decide_whether_growth_is_satisfiable() {
         .expect("fill");
     assert_eq!(fill.style.grow, 1.);
 }
+
+// ── JSX expressions ─────────────────────────────────────────────────────────
+
+fn compile_markup(markup: &str, css: &str) -> PreviewDocument {
+    let component = JsxComponentSource {
+        name: "X".to_string(),
+        path: "/p/src/X.tsx".into(),
+        line: 1,
+        markup: markup.to_string(),
+        stylesheets: Vec::new(),
+    };
+    compile_jsx_component(
+        Path::new("/p"),
+        &component,
+        &HashMap::new(),
+        &Stylesheet::parse(css),
+    )
+}
+
+#[test]
+fn a_jsx_comment_is_not_rendered() {
+    // Taken from a real navbar: a commented-out block was being printed as a
+    // chip of source, putting dead markup on screen.
+    let document = compile_markup(
+        r#"<nav>
+             {/* <div className="flex items-center gap-4">
+                   <span>Dashboard</span>
+                 </div> */}
+             <span>Corressay</span>
+           </nav>"#,
+        "",
+    );
+    let text = collect_text(&document.root);
+    assert!(text.contains("Corressay"));
+    assert!(!text.contains("className"), "comment leaked: {text}");
+    assert!(!text.contains("Dashboard"), "comment leaked: {text}");
+}
+
+#[test]
+fn a_conditional_renders_the_markup_it_guards() {
+    let document = compile_markup(
+        r#"<div>{showDropdown && (<button className="item">Sair</button>)}</div>"#,
+        ".item { color: #00ff00; }",
+    );
+    assert!(collect_text(&document.root).contains("Sair"));
+    let button = find_box(&document.root, "button").expect("button");
+    assert_eq!(button.style.color, Some(Rgba::new(0, 255, 0, 255)));
+}
+
+#[test]
+fn a_ternary_renders_one_of_its_branches() {
+    let document = compile_markup(
+        "<div>{loading ? <span>Carregando</span> : <span>Pronto</span>}</div>",
+        "",
+    );
+    let text = collect_text(&document.root);
+    assert!(text.contains("Carregando"), "got {text}");
+}
+
+#[test]
+fn a_map_renders_one_row() {
+    let document = compile_markup(
+        "<ul>{items.map((item) => (<li key={item.id}>Item</li>))}</ul>",
+        "",
+    );
+    assert!(collect_text(&document.root).contains("Item"));
+}
+
+#[test]
+fn a_comparison_is_not_mistaken_for_markup() {
+    // `a < b` must not be read as a tag.
+    let document = compile_markup("<div>{count < limit}</div>", "");
+    let text = collect_text(&document.root);
+    assert!(text.contains("count"), "expected a placeholder, got {text}");
+}
+
+#[test]
+fn a_plain_value_expression_still_shows_as_a_placeholder() {
+    let document = compile_markup("<span>{userName}</span>", "");
+    assert!(collect_text(&document.root).contains("userName"));
+}
+
+#[test]
+fn a_fallback_literal_renders_as_text() {
+    let document = compile_markup("<span>{userName || 'Usuário'}</span>", "");
+    let text = collect_text(&document.root);
+    assert!(text.contains("Usuário"), "got {text}");
+    assert!(!text.contains("userName"), "raw source leaked: {text}");
+}

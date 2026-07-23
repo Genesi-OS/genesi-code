@@ -2754,9 +2754,26 @@ fn parse_jsx_node(markup: &str, cursor: &mut usize) -> Option<DomElement> {
                     text.clear();
                 }
                 let expression = read_braced_expression(markup, cursor);
-                if let Some(literal) = string_literal_value(&expression) {
+                let trimmed = expression.trim();
+                // `{/* … */}` is a JSX comment. It is not rendered, and showing
+                // it put commented-out markup on screen as a chip of source.
+                if trimmed.starts_with("/*") {
+                    // nothing to render
+                } else if let Some(literal) = string_literal_value(trimmed) {
                     element.children.push(DomNode::Text(literal));
-                } else if !expression.trim().is_empty() {
+                } else if let Some(inner) = first_jsx_in_expression(trimmed) {
+                    // `{cond && <X/>}`, `{a ? <A/> : <B/>}`, `{list.map(… => <Row/>)}`.
+                    // These are how most real markup is assembled, so rendering
+                    // the JSX inside beats printing the expression's source.
+                    let mut nested = 0usize;
+                    if let Some(child) = parse_jsx_node(&inner, &mut nested) {
+                        element.children.push(DomNode::Element(child));
+                    }
+                } else if let Some(fallback) = literal_fallback_in_expression(trimmed) {
+                    // `{name || 'Usuário'}` — the literal is what the page shows
+                    // whenever the value is missing, so it reads as real text.
+                    element.children.push(DomNode::Text(fallback));
+                } else if !trimmed.is_empty() {
                     element.children.push(DomNode::Element(DomElement {
                         tag: "genesi-expression".to_string(),
                         id: None,
@@ -2880,6 +2897,35 @@ fn class_names_from_expression(value: &str) -> Vec<String> {
     }
     names.dedup();
     names
+}
+
+/// The string literal a `||` or `??` fallback ends in, if any.
+fn literal_fallback_in_expression(expression: &str) -> Option<String> {
+    let tail = expression
+        .rsplit_once("||")
+        .or_else(|| expression.rsplit_once("??"))?
+        .1;
+    string_literal_value(tail.trim())
+}
+
+/// The first JSX element embedded in an expression, as source.
+///
+/// A `<` is only a tag when a name (or a fragment's `>`) follows it, which is
+/// what keeps a comparison like `a < b` from being mistaken for markup.
+fn first_jsx_in_expression(expression: &str) -> Option<String> {
+    let bytes = expression.as_bytes();
+    for (index, _) in expression.match_indices('<') {
+        let next = *bytes.get(index + 1)? as char;
+        if !next.is_alphabetic() && next != '_' && next != '>' {
+            continue;
+        }
+        if let Some((markup, _)) = read_jsx_element(expression, index) {
+            if !markup.trim().is_empty() {
+                return Some(markup);
+            }
+        }
+    }
+    None
 }
 
 fn read_jsx_attribute_value(markup: &str, cursor: &mut usize) -> String {
