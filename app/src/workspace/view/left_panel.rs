@@ -62,6 +62,11 @@ use crate::workspace::view::{
 use crate::workspace::WorkspaceAction;
 use crate::TelemetryEvent;
 
+/// Gap between the quick-access rail and the project card. They are two
+/// separate surfaces in the design, so empty space — not a shared container —
+/// is what divides them.
+const RAIL_CARD_GAP: f32 = 6.;
+
 #[derive(Default)]
 struct MouseStateHandles {
     project_explorer_button: MouseStateHandle,
@@ -1226,11 +1231,17 @@ impl View for LeftPanelView {
         .with_uniform_padding(4.)
         .finish();
 
+        // The rail is a FREE-STANDING strip of quick-access icons, not part of
+        // the project card. It paints no surface of its own so it floats on the
+        // app background, and a gap — not a shared container — is what separates
+        // it from the card. (Both previously sat inside one filled wrapper, which
+        // read as a single lighter slab instead of two elements.)
         let rail = toolbelt
             .map(|toolbelt| {
                 Container::new(toolbelt)
-                    .with_horizontal_padding(5.)
+                    .with_horizontal_padding(6.)
                     .with_padding_top(8.)
+                    .with_margin_right(RAIL_CARD_GAP)
                     .finish()
             })
             .unwrap_or_else(|| Empty::new().finish());

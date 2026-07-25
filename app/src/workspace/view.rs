@@ -678,10 +678,6 @@ fn genesi_shell_panel_surface() -> ColorU {
     ColorU::new(30, 31, 34, 255)
 }
 
-fn genesi_shell_editor_surface() -> ColorU {
-    ColorU::new(18, 19, 21, 255)
-}
-
 fn genesi_shell_panel_border() -> ColorU {
     ColorU::new(255, 255, 255, 38)
 }
@@ -20027,9 +20023,11 @@ impl Workspace {
             .with_margin_top(14.)
             .finish();
 
-        self.wrap_in_panel_surface(
-            appearance,
-            &PanelPosition::Left,
+        // The conversations rail gets its own soft card. It deliberately does NOT
+        // go through wrap_in_panel_surface: that wrapper is now transparent on the
+        // left so the IDE's quick-access rail can float, while here a gentle fill
+        // is exactly what separates the chat list from the conversation beside it.
+        Container::new(
             Container::new(
                 Flex::column()
                     .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -20039,9 +20037,12 @@ impl Workspace {
                     .finish(),
             )
             .with_uniform_padding(14.)
+            .with_background_color(genesi_shell_panel_surface())
+            .with_corner_radius(genesi_shell_panel_radius())
             .finish(),
-            genesi_shell_panel_radius(),
         )
+        .with_margin_right(GENESI_SHELL_PANEL_GAP)
+        .finish()
     }
 
     fn current_genesi_project_label(&self, app: &AppContext) -> String {
@@ -22100,20 +22101,22 @@ impl Workspace {
         contents: Box<dyn Element>,
         corner_radius: CornerRadius,
     ) -> Box<dyn Element> {
-        let mut container = Container::new(contents)
-            .with_background_color(genesi_shell_panel_surface())
-            .with_corner_radius(corner_radius);
+        let mut container = Container::new(contents).with_corner_radius(corner_radius);
 
         match side {
-            // The project panel is a soft card, not another framed window. Its
-            // own explorer card supplies the hierarchy while the rail stays light.
+            // The LEFT side is NOT a surface of its own. It holds two separate
+            // things — the quick-access rail and the project card — and the card
+            // paints itself (see LeftPanelView). Filling this wrapper welded them
+            // into one lighter slab, which is what the mock does not show: the
+            // rail floats directly on the app background.
             PanelPosition::Left => {
                 container = container.with_margin_right(GENESI_SHELL_PANEL_GAP);
             }
-            // Keep the framing for the AI/review panel so it remains a distinct,
-            // resizable working surface beside the editor.
+            // The AI panel keeps its frame — per the design it is the one docked
+            // surface that should read as its own window.
             PanelPosition::Right => {
                 container = container
+                    .with_background_color(genesi_shell_panel_surface())
                     .with_uniform_padding(1.)
                     .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
                     .with_margin_left(GENESI_SHELL_PANEL_GAP);
@@ -22123,14 +22126,16 @@ impl Workspace {
         container.finish()
     }
 
+    /// The editor/terminal column. Deliberately paints NOTHING: the code area
+    /// sits on the app background with no fill and no border, so it reads as
+    /// part of the window rather than as another card. (The outer workspace
+    /// container already paints the base fill — see APP-4328.)
     fn wrap_in_main_surface(
         &self,
         _appearance: &Appearance,
         contents: Box<dyn Element>,
     ) -> Box<dyn Element> {
-        Container::new(contents)
-            .with_background_color(genesi_shell_editor_surface())
-            .finish()
+        Container::new(contents).finish()
     }
 
     #[cfg(not(target_family = "wasm"))]

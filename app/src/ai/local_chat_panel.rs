@@ -117,10 +117,6 @@ fn genesi_card_surface() -> ColorU {
     ColorU::new(31, 32, 35, 245)
 }
 
-fn genesi_vibe_surface() -> ColorU {
-    ColorU::new(38, 25, 52, 255)
-}
-
 fn genesi_subtle_border() -> ColorU {
     ColorU::new(255, 255, 255, 24)
 }
@@ -379,6 +375,46 @@ pub struct LocalChatSummary {
     pub is_active: bool,
 }
 
+/// How the assistant is allowed to work. One selector replaces what used to be
+/// two independent chips (Agent on/off and AUTO on/off), which could express the
+/// same three useful states plus a meaningless fourth (AUTO while not an agent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMode {
+    /// Answers questions only; no tools, nothing touched.
+    Chat,
+    /// Uses tools, but asks before anything that changes the machine.
+    Build,
+    /// Uses tools and runs them without asking.
+    Auto,
+}
+
+impl ChatMode {
+    fn label(self) -> &'static str {
+        match self {
+            ChatMode::Chat => "Chat",
+            ChatMode::Build => "Build",
+            ChatMode::Auto => "Auto",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            ChatMode::Chat => "Answer only — no files or commands touched",
+            ChatMode::Build => "Reads and edits, asking before each change",
+            ChatMode::Auto => "Reads and edits without asking",
+        }
+    }
+}
+
+/// Which half of the model picker is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPickerTab {
+    /// Models running on this machine (ollama tags and local GGUF files).
+    Local,
+    /// A cloud provider used with the user's own API key.
+    Cloud,
+}
+
 /// Click actions dispatched by the header chips.
 #[derive(Debug, Clone)]
 pub enum LocalAiChatAction {
@@ -404,6 +440,13 @@ pub enum LocalAiChatAction {
     ToggleAuto,
     /// Open/close the AI model picker popup (above the compose box).
     ToggleModelPicker,
+    /// Open/close the mode picker (Chat / Build / Auto).
+    ToggleModePicker,
+    /// Select a working mode. This is the single control that replaced the
+    /// separate Agent and AUTO chips; it sets the same two flags underneath.
+    SetChatMode(ChatMode),
+    /// Show only local models, or only cloud providers, in the model picker.
+    SetPickerTab(ModelPickerTab),
     /// Pick the local model at this index from the picker, and use the local
     /// (ollama) endpoint.
     PickModel(usize),
@@ -473,6 +516,10 @@ pub struct LocalAiChatView {
     /// The GGUF currently being loaded into llama-server, if any. Drives the
     /// "loading…" hint and stops a second pick from racing the first.
     preparing_model: Option<String>,
+    /// Whether the Chat/Build/Auto popup is showing.
+    mode_picker_open: bool,
+    /// Which half of the model picker is showing (local vs cloud).
+    picker_tab: ModelPickerTab,
     selected_model: Option<usize>,
     ai_mode: Option<AiModeState>,
 
@@ -581,6 +628,8 @@ impl LocalAiChatView {
             models: Vec::new(),
             gguf_labels: HashMap::new(),
             preparing_model: None,
+            mode_picker_open: false,
+            picker_tab: ModelPickerTab::Local,
             selected_model: None,
             ai_mode: None,
             in_flight: false,
@@ -4241,70 +4290,143 @@ impl LocalAiChatView {
             format!("AI: {model_name}")
         };
 
-        let mut controls = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.chip_with_icon(
-                appearance,
-                if self.agent_mode {
-                    "Agent ON".to_string()
-                } else {
-                    "Agent".to_string()
-                },
-                Some("bundled/svg/agentmode.svg"),
-                LocalAiChatAction::ToggleAgent,
-                self.agent_mode,
-                true,
-            ))
-            .with_child(self.chip_with_icon(
-                appearance,
-                "Attach".to_string(),
-                Some("bundled/svg/paperclip.svg"),
-                LocalAiChatAction::ToggleAttachContext,
-                self.attach_context,
-                true,
-            ));
-        if self.agent_mode {
-            controls.add_child(self.chip_with_icon(
-                appearance,
-                format!("AUTO {}", if self.auto_approve { "on" } else { "off" }),
-                Some("bundled/svg/sparkle.svg"),
-                LocalAiChatAction::ToggleAuto,
-                self.auto_approve,
-                true,
-            ));
-        }
-        controls.add_child(self.chip_with_icon(
-            appearance,
-            "Turbo".to_string(),
-            Some("bundled/svg/lightning-02.svg"),
-            LocalAiChatAction::ToggleTurbo,
-            self.endpoint == LocalEndpoint::Turbo,
-            true,
-        ));
-        controls.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
-        controls.add_child(self.chip_with_icon(
-            appearance,
-            ai_mode_short_label(self.ai_mode.as_ref()),
-            Some("bundled/svg/psychology.svg"),
-            LocalAiChatAction::CycleAiMode,
-            self.ai_mode.is_some(),
-            true,
-        ));
+        // The compose bar carries exactly three controls, matching the design:
+        // an attach affordance on the left, then the mode and model selectors on
+        // the right. Everything that used to sit here as its own chip (Agent,
+        // AUTO, Turbo, AI Mode) is now either folded into the mode selector or
+        // lives in the model picker, so the row stops looking like a toolbar.
         Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(Shrinkable::new(1., controls.finish()).finish())
-            .with_child(
-                Container::new(self.selector_button(
-                    appearance,
-                    selector_label,
-                    LocalAiChatAction::ToggleModelPicker,
-                    self.model_picker_open,
-                ))
-                .with_margin_left(5.)
+            .with_child(self.icon_toggle_button(
+                appearance,
+                "bundled/svg/paperclip.svg",
+                LocalAiChatAction::ToggleAttachContext,
+                self.attach_context,
+            ))
+            .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
+            .with_child(self.selector_button(
+                appearance,
+                self.chat_mode().label().to_string(),
+                LocalAiChatAction::ToggleModePicker,
+                self.mode_picker_open,
+            ))
+            .with_child(self.selector_button(
+                appearance,
+                selector_label,
+                LocalAiChatAction::ToggleModelPicker,
+                self.model_picker_open,
+            ))
+            .finish()
+    }
+
+    /// The current mode, derived from the two flags it drives. Keeping the flags
+    /// as the source of truth means every existing behaviour check
+    /// (`agent_mode`, `auto_approve`) keeps working untouched.
+    fn chat_mode(&self) -> ChatMode {
+        match (self.agent_mode, self.auto_approve) {
+            (false, _) => ChatMode::Chat,
+            (true, false) => ChatMode::Build,
+            (true, true) => ChatMode::Auto,
+        }
+    }
+
+    fn set_chat_mode(&mut self, mode: ChatMode) {
+        match mode {
+            ChatMode::Chat => self.agent_mode = false,
+            ChatMode::Build => {
+                self.agent_mode = true;
+                self.auto_approve = false;
+            }
+            ChatMode::Auto => {
+                self.agent_mode = true;
+                self.auto_approve = true;
+            }
+        }
+    }
+
+    /// A square, icon-only toggle — the attach affordance in the design is an
+    /// icon with no label, tinted when active.
+    fn icon_toggle_button(
+        &self,
+        appearance: &Appearance,
+        icon: &'static str,
+        action: LocalAiChatAction,
+        active: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let color: ColorU = if active {
+            genesi_green()
+        } else {
+            theme.sub_text_color(theme.background()).into()
+        };
+        let mut container = Container::new(
+            ConstrainedBox::new(Icon::new(icon, color).finish())
+                .with_width(15.)
+                .with_height(15.)
                 .finish(),
-            )
+        )
+        .with_uniform_padding(6.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_margin_top(2.);
+        if active {
+            container = container.with_background_color(green_tint());
+        }
+
+        EventHandler::new(container.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// The Chat / Build / Auto popup, opened from the mode selector.
+    fn render_mode_picker(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
+        if !self.mode_picker_open {
+            return None;
+        }
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let current = self.chat_mode();
+
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for mode in [ChatMode::Chat, ChatMode::Build, ChatMode::Auto] {
+            let selected = mode == current;
+            list.add_child(self.picker_row(
+                appearance,
+                format!(
+                    "{}{}",
+                    if selected { "●  " } else { "○  " },
+                    mode.label()
+                ),
+                LocalAiChatAction::SetChatMode(mode),
+                selected,
+            ));
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    mode.description(),
+                    CHIP_FONT_SIZE,
+                    muted,
+                    true,
+                ))
+                .with_horizontal_padding(22.)
+                .with_padding_bottom(4.)
+                .finish(),
+            );
+        }
+        Some(self.popup_surface(list.finish()))
+    }
+
+    /// Shared framing for the popups that float above the compose box.
+    fn popup_surface(&self, contents: Box<dyn Element>) -> Box<dyn Element> {
+        Container::new(contents)
+            .with_background_color(genesi_card_surface())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_uniform_padding(6.)
+            .with_margin_bottom(6.)
             .finish()
     }
 
@@ -4460,183 +4582,170 @@ impl LocalAiChatView {
         let theme = appearance.theme();
         let muted: ColorU = theme.disabled_text_color(theme.background()).into();
 
-        let section = |me: &Self, text: &str| -> Box<dyn Element> {
-            Container::new(me.label_text(appearance, text, CHIP_FONT_SIZE, muted, false))
+        let note = |me: &Self, text: &str| -> Box<dyn Element> {
+            Container::new(me.label_text(appearance, text, CHIP_FONT_SIZE, muted, true))
                 .with_horizontal_padding(8.)
                 .with_padding_top(4.)
-                .with_padding_bottom(2.)
+                .with_padding_bottom(4.)
                 .finish()
         };
 
         let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        list.add_child(section(self, "On-device models"));
 
-        if self.models.is_empty() {
-            list.add_child(
-                Container::new(self.label_text(
-                    appearance,
-                    "No models yet — start ollama and pull one (e.g. `ollama pull llama3.2`), \
-                     or import a .gguf in the AI Mode Monitor, then Refresh.",
-                    BODY_FONT_SIZE,
-                    muted,
-                    true,
-                ))
-                .with_horizontal_padding(8.)
-                .with_vertical_padding(6.)
-                .finish(),
-            );
-        } else {
-            for (index, model) in self.models.iter().enumerate() {
-                // A GGUF runs on Turbo and an ollama tag on Ollama, and picking
-                // one sets the matching endpoint — so the endpoint no longer
-                // decides selection, the index does. (Requiring Ollama here left
-                // a picked GGUF showing as unselected.)
-                let selected = !self.cloud_active && self.selected_model == Some(index);
-                let mark = if selected { "●  " } else { "○  " };
-                let loading = self.preparing_model.as_deref() == Some(model.as_str());
-                let suffix = if loading { "   loading…" } else { "" };
+        // Local and cloud used to be stacked in one long flat list, so the panel
+        // showed ollama models, Turbo, providers, key status and cloud models all
+        // at once. They are alternatives, not a sequence - one tab at a time.
+        list.add_child(
+            Container::new(
+                Flex::row()
+                    .with_child(self.picker_tab_button(
+                        appearance,
+                        "On this machine",
+                        ModelPickerTab::Local,
+                    ))
+                    .with_child(self.picker_tab_button(
+                        appearance,
+                        "Cloud (your API key)",
+                        ModelPickerTab::Cloud,
+                    ))
+                    .finish(),
+            )
+            .with_padding_bottom(6.)
+            .finish(),
+        );
+
+        match self.picker_tab {
+            ModelPickerTab::Local => {
+                if self.models.is_empty() {
+                    list.add_child(note(
+                        self,
+                        "No local models yet. Pull one with ollama, or import a .gguf in the \
+                         AI Mode Monitor, then Refresh.",
+                    ));
+                } else {
+                    for (index, model) in self.models.iter().enumerate() {
+                        // A GGUF runs on Turbo and an ollama tag on Ollama, and
+                        // picking one sets the matching endpoint - so the endpoint
+                        // no longer decides selection, the index does.
+                        let selected = !self.cloud_active && self.selected_model == Some(index);
+                        let mark = if selected { "\u{25cf}  " } else { "\u{25cb}  " };
+                        let loading = self.preparing_model.as_deref() == Some(model.as_str());
+                        let suffix = if loading { "   loading\u{2026}" } else { "" };
+                        list.add_child(self.picker_row(
+                            appearance,
+                            format!("{mark}{}{suffix}", self.model_label(model)),
+                            LocalAiChatAction::PickModel(index),
+                            selected,
+                        ));
+                    }
+                }
+
+                // Turbo is a property of HOW a local model runs, so it belongs
+                // with the local models rather than as a chip on the compose bar.
+                let gguf_active = self
+                    .current_model()
+                    .is_some_and(|model| is_gguf_ref(&model));
+                let turbo_selected = self.endpoint == LocalEndpoint::Turbo && !gguf_active;
+                let turbo_label = if self.turbo_available || turbo_selected {
+                    format!(
+                        "{}\u{26a1} Turbo \u{2014} full GPU offload",
+                        if turbo_selected { "\u{25cf}  " } else { "\u{25cb}  " }
+                    )
+                } else {
+                    "\u{25cb}  \u{26a1} Turbo \u{2014} not running".to_string()
+                };
                 list.add_child(self.picker_row(
                     appearance,
-                    format!("{mark}{}{suffix}", self.model_label(model)),
-                    LocalAiChatAction::PickModel(index),
-                    selected,
+                    turbo_label,
+                    LocalAiChatAction::ToggleTurbo,
+                    turbo_selected,
+                ));
+                if gguf_active {
+                    list.add_child(note(
+                        self,
+                        "A local GGUF always runs through Turbo - it is the only backend that \
+                         can load one.",
+                    ));
+                }
+
+                // System-wide AI Mode tuning: also a property of running locally.
+                list.add_child(self.picker_row(
+                    appearance,
+                    format!("AI Mode: {}", ai_mode_short_label(self.ai_mode.as_ref())),
+                    LocalAiChatAction::CycleAiMode,
+                    self.ai_mode.is_some(),
+                ));
+            }
+            ModelPickerTab::Cloud => {
+                for provider in cloud_presets() {
+                    let selected = self.cloud.provider == *provider;
+                    let mark = if self.cloud_active && selected {
+                        "\u{25cf}  "
+                    } else {
+                        "\u{25cb}  "
+                    };
+                    list.add_child(self.picker_row(
+                        appearance,
+                        format!("{mark}{}", provider.label()),
+                        LocalAiChatAction::SelectCloudProvider(*provider),
+                        selected,
+                    ));
+                }
+
+                let key_saved = !self.active_cloud_key().trim().is_empty();
+                list.add_child(self.picker_row(
+                    appearance,
+                    if key_saved {
+                        format!("\u{2713} Key stored for {}", self.cloud.provider.label())
+                    } else {
+                        format!("Add an API key for {}", self.cloud.provider.label())
+                    },
+                    LocalAiChatAction::SetKey,
+                    key_saved,
+                ));
+
+                for model in self.cloud.provider.suggested_models() {
+                    let selected = self.cloud.model == *model;
+                    let mark = if selected { "\u{25cf}  " } else { "\u{25cb}  " };
+                    list.add_child(self.picker_row(
+                        appearance,
+                        format!("{mark}{model}"),
+                        LocalAiChatAction::PickCloudModel((*model).to_string()),
+                        selected,
+                    ));
+                }
+                list.add_child(self.picker_row(
+                    appearance,
+                    format!(
+                        "Custom model: {}",
+                        truncate_middle(self.cloud.model.trim(), MODEL_LABEL_MAX_CHARS)
+                    ),
+                    LocalAiChatAction::SetModel,
+                    false,
+                ));
+                list.add_child(note(
+                    self,
+                    match self.cloud.provider {
+                        CloudProviderKind::Anthropic => {
+                            "Anthropic uses its native Messages API; the key is sent with \
+                             x-api-key."
+                        }
+                        CloudProviderKind::Gemini => {
+                            "Gemini uses Google's official OpenAI-compatible endpoint."
+                        }
+                        CloudProviderKind::OpenAI => {
+                            "OpenAI uses /v1/chat/completions with your own bearer token."
+                        }
+                        CloudProviderKind::HuggingFace => {
+                            "Hugging Face uses the official router and an HF token with \
+                             Inference Providers permission."
+                        }
+                    },
                 ));
             }
         }
 
-        list.add_child(section(self, "Accelerated"));
-        // The standalone Turbo row means "run the picked ollama model through
-        // llama-server". A GGUF is ALREADY on Turbo by construction, so it must
-        // not light this row up as well.
-        let gguf_active = self
-            .current_model()
-            .is_some_and(|model| is_gguf_ref(&model));
-        let turbo_selected = self.endpoint == LocalEndpoint::Turbo && !gguf_active;
-        let turbo_label = if self.turbo_available || turbo_selected {
-            format!(
-                "{}⚡ Turbo — full GPU offload",
-                if turbo_selected { "●  " } else { "○  " }
-            )
-        } else {
-            "○  ⚡ Turbo — not running".to_string()
-        };
-        list.add_child(self.picker_row(
-            appearance,
-            turbo_label,
-            LocalAiChatAction::ToggleTurbo,
-            turbo_selected,
-        ));
-
-        list.add_child(section(self, "Cloud providers"));
-        for provider in cloud_presets() {
-            let selected = self.cloud.provider == *provider;
-            let mark = if self.cloud_active && selected {
-                "●  "
-            } else {
-                "○  "
-            };
-            list.add_child(self.picker_row(
-                appearance,
-                format!("{mark}{}", provider.label()),
-                LocalAiChatAction::SelectCloudProvider(*provider),
-                selected,
-            ));
-        }
-
-        let key_saved = !self.active_cloud_key().trim().is_empty();
-        let key_status = if key_saved {
-            format!("Key stored securely for {}", self.cloud.provider.label())
-        } else {
-            format!(
-                "No API key saved for {}. Open Settings to add one.",
-                self.cloud.provider.label()
-            )
-        };
-        list.add_child(
-            Container::new(self.label_text(appearance, key_status, BODY_FONT_SIZE, muted, false))
-                .with_horizontal_padding(8.)
-                .with_padding_top(6.)
-                .finish(),
-        );
-        list.add_child(self.picker_row(
-            appearance,
-            if key_saved {
-                "Manage API keys in Settings".to_string()
-            } else {
-                "Open API key Settings".to_string()
-            },
-            LocalAiChatAction::SetKey,
-            key_saved,
-        ));
-        list.add_child(section(self, "Suggested cloud models"));
-        for model in self.cloud.provider.suggested_models() {
-            let selected = self.cloud.model == *model;
-            let mark = if selected { "●  " } else { "○  " };
-            list.add_child(self.picker_row(
-                appearance,
-                format!("{mark}{model}"),
-                LocalAiChatAction::PickCloudModel((*model).to_string()),
-                selected,
-            ));
-        }
-        list.add_child(self.picker_row(
-            appearance,
-            format!(
-                "Custom model: {}",
-                truncate_middle(self.cloud.model.trim(), MODEL_LABEL_MAX_CHARS)
-            ),
-            LocalAiChatAction::SetModel,
-            false,
-        ));
-        list.add_child(
-            Container::new(self.label_text(
-                appearance,
-                match self.cloud.provider {
-                    CloudProviderKind::Anthropic => {
-                        "Anthropic uses its native Messages API; the key is sent with x-api-key."
-                    }
-                    CloudProviderKind::Gemini => {
-                        "Gemini uses Google's official OpenAI-compatible endpoint."
-                    }
-                    CloudProviderKind::OpenAI => {
-                        "OpenAI uses /v1/chat/completions with your own bearer token."
-                    }
-                    CloudProviderKind::HuggingFace => {
-                        "Hugging Face uses the official router and an HF token with Inference Providers permission."
-                    }
-                },
-                CHIP_FONT_SIZE,
-                muted,
-                true,
-            ))
-            .with_horizontal_padding(8.)
-            .with_padding_top(6.)
-            .with_padding_bottom(4.)
-            .finish(),
-        );
-        if false {
-            // Cloud (BYOK) is deferred to the roadmap; show the slot disabled so it's
-            // discoverable without being wired up yet.
-            list.add_child(
-                Container::new(self.label_text(
-                    appearance,
-                    "☁  Cloud providers — coming soon",
-                    BODY_FONT_SIZE,
-                    muted,
-                    false,
-                ))
-                .with_horizontal_padding(8.)
-                .with_vertical_padding(6.)
-                .finish(),
-            );
-        }
-        let card = Container::new(list.finish())
-            .with_uniform_padding(6.)
-            .with_margin_bottom(6.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background(theme.surface_1())
-            .finish();
+        let card = self.popup_surface(list.finish());
         let wrapped = if self.vibe_mode {
             ConstrainedBox::new(card)
                 .with_width(VIBE_COLUMN_WIDTH)
@@ -4649,6 +4758,38 @@ impl LocalAiChatView {
                 .with_horizontal_padding(PANEL_PADDING)
                 .finish(),
         )
+    }
+
+    /// One half of the Local / Cloud segmented control at the top of the picker.
+    fn picker_tab_button(
+        &self,
+        appearance: &Appearance,
+        label: &str,
+        tab: ModelPickerTab,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let selected = self.picker_tab == tab;
+        let color: ColorU = if selected {
+            genesi_green()
+        } else {
+            theme.sub_text_color(theme.background()).into()
+        };
+        let mut container =
+            Container::new(self.label_text(appearance, label, CHIP_FONT_SIZE, color, false))
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(5.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+                .with_margin_right(4.);
+        if selected {
+            container = container.with_background_color(green_tint());
+        }
+
+        EventHandler::new(container.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LocalAiChatAction::SetPickerTab(tab));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
     }
 
     /// One clickable row in the model picker: a full-width hit target that tints
@@ -5195,6 +5336,78 @@ impl LocalAiChatView {
         }
     }
 
+    /// The three capability tiles under the vibe-mode hero. Informational only —
+    /// they describe what this assistant actually does here, so nothing is
+    /// promised that the panel can't deliver.
+    fn render_vibe_capability_cards(&self, appearance: &Appearance) -> Box<dyn Element> {
+        const CARDS: [(&str, &str, &str); 3] = [
+            (
+                "bundled/svg/search.svg",
+                "Understands the project",
+                "Reads files on demand and explains how they fit together.",
+            ),
+            (
+                "bundled/svg/agentmode.svg",
+                "Writes and edits",
+                "Proposes changes as a diff you review before anything lands.",
+            ),
+            (
+                "bundled/svg/lightning-02.svg",
+                "Runs on your machine",
+                "Local models by default - no account and no cloud required.",
+            ),
+        ];
+
+        let theme = appearance.theme();
+        let title_color: ColorU = theme.active_ui_text_color().into();
+        let body_color: ColorU = theme.disabled_text_color(theme.background()).into();
+
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for (index, (icon, title, body)) in CARDS.iter().enumerate() {
+            let card = Container::new(
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(
+                        ConstrainedBox::new(Icon::new(icon, genesi_green()).finish())
+                            .with_width(16.)
+                            .with_height(16.)
+                            .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            (*title).to_string(),
+                            BODY_FONT_SIZE,
+                            title_color,
+                            false,
+                        ))
+                        .with_margin_top(10.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            (*body).to_string(),
+                            CHIP_FONT_SIZE,
+                            body_color,
+                            true,
+                        ))
+                        .with_margin_top(4.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_uniform_padding(14.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .with_background_color(genesi_card_surface())
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_margin_right(if index + 1 < CARDS.len() { 10. } else { 0. })
+            .finish();
+            row.add_child(Expanded::new(1., card).finish());
+        }
+        row.finish()
+    }
+
     fn render_transcript(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
@@ -5242,6 +5455,11 @@ impl LocalAiChatView {
                         )
                         .with_margin_top(8.)
                         .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.render_vibe_capability_cards(appearance))
+                            .with_margin_top(26.)
+                            .finish(),
                     )
                     .finish();
                 return Container::new(hero)
@@ -5504,6 +5722,23 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::ToggleModelPicker => {
                 self.load_cloud_keys(ctx);
                 self.model_picker_open = !self.model_picker_open;
+                // Only one popup at a time — they occupy the same slot above the
+                // compose box and would stack awkwardly.
+                self.mode_picker_open = false;
+                ctx.notify();
+            }
+            LocalAiChatAction::ToggleModePicker => {
+                self.mode_picker_open = !self.mode_picker_open;
+                self.model_picker_open = false;
+                ctx.notify();
+            }
+            LocalAiChatAction::SetChatMode(mode) => {
+                self.set_chat_mode(*mode);
+                self.mode_picker_open = false;
+                ctx.notify();
+            }
+            LocalAiChatAction::SetPickerTab(tab) => {
+                self.picker_tab = *tab;
                 ctx.notify();
             }
             LocalAiChatAction::PickModel(index) => {
@@ -5987,6 +6222,9 @@ impl View for LocalAiChatView {
         if let Some(picker) = self.render_model_picker(appearance) {
             root.add_child(picker);
         }
+        if let Some(picker) = self.render_mode_picker(appearance) {
+            root.add_child(picker);
+        }
 
         // The compose box: a single full-width, bordered, rounded container that
         // holds the prompt input on top and the AI controls (selector + Turbo +
@@ -6057,14 +6295,9 @@ impl View for LocalAiChatView {
         };
         root.add_child(compose_container);
 
-        let contents = root.finish();
-        if self.vibe_mode {
-            Container::new(contents)
-                .with_background_color(genesi_vibe_surface())
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(16.)))
-                .finish()
-        } else {
-            contents
-        }
+        // Vibe mode paints NO surface of its own — it sits on the normal app
+        // background like every other view. A solid tinted fill here turned the
+        // whole mode into one flat colour block.
+        root.finish()
     }
 }
