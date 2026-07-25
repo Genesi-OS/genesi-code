@@ -117,6 +117,10 @@ fn genesi_card_surface() -> ColorU {
     ColorU::new(31, 32, 35, 245)
 }
 
+fn genesi_vibe_surface() -> ColorU {
+    ColorU::new(38, 25, 52, 255)
+}
+
 fn genesi_subtle_border() -> ColorU {
     ColorU::new(255, 255, 255, 24)
 }
@@ -4142,6 +4146,18 @@ impl LocalAiChatView {
         let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
+            .with_child(
+                Container::new(
+                    ConstrainedBox::new(
+                        Icon::new("bundled/svg/sparkle.svg", genesi_green()).finish(),
+                    )
+                    .with_width(13.)
+                    .with_height(13.)
+                    .finish(),
+                )
+                .with_margin_right(6.)
+                .finish(),
+            )
             .with_child(self.label_text(
                 appearance,
                 "Genesi Code",
@@ -4149,24 +4165,62 @@ impl LocalAiChatView {
                 theme.active_ui_text_color().into(),
                 false,
             ))
+            .with_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "New chat",
+                    CHIP_FONT_SIZE,
+                    theme.disabled_text_color(theme.background()).into(),
+                    false,
+                ))
+                .with_margin_left(7.)
+                .finish(),
+            )
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
-            .with_child(self.chip_with_icon(
-                appearance,
-                "Refresh".to_string(),
-                Some("bundled/svg/refresh-cw-04.svg"),
+            .with_child(self.utility_icon_button(
+                "bundled/svg/refresh-cw-04.svg",
                 LocalAiChatAction::Refresh,
-                false,
                 true,
             ));
-        row.add_child(self.chip_with_icon(
-            appearance,
-            "Clear".to_string(),
-            Some("bundled/svg/trash-02.svg"),
+        row.add_child(self.utility_icon_button(
+            "bundled/svg/trash-02.svg",
             LocalAiChatAction::Clear,
-            false,
             !self.messages.is_empty(),
         ));
         row.finish()
+    }
+
+    fn utility_icon_button(
+        &self,
+        icon_path: &'static str,
+        action: LocalAiChatAction,
+        enabled: bool,
+    ) -> Box<dyn Element> {
+        let icon_color = if enabled {
+            ColorU::new(222, 225, 231, 255)
+        } else {
+            ColorU::new(126, 130, 138, 255)
+        };
+        let button = Container::new(
+            ConstrainedBox::new(Icon::new(icon_path, icon_color).finish())
+                .with_width(13.)
+                .with_height(13.)
+                .finish(),
+        )
+        .with_uniform_padding(7.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_margin_left(4.)
+        .finish();
+
+        if !enabled {
+            return button;
+        }
+        EventHandler::new(button)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
     }
 
     /// The bottom control strip, sitting just above the compose box like a real
@@ -4187,44 +4241,31 @@ impl LocalAiChatView {
             format!("AI: {model_name}")
         };
 
-        let selector_row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(
-                Shrinkable::new(
-                    1.,
-                    self.selector_button(
-                        appearance,
-                        selector_label,
-                        LocalAiChatAction::ToggleModelPicker,
-                        self.model_picker_open,
-                    ),
-                )
-                .finish(),
-            )
-            .with_child(self.chip_with_icon(
-                appearance,
-                "Turbo".to_string(),
-                Some("bundled/svg/lightning-02.svg"),
-                LocalAiChatAction::ToggleTurbo,
-                self.endpoint == LocalEndpoint::Turbo,
-                true,
-            ))
-            .finish();
-
-        let mut toggles_row = Flex::row()
+        let mut controls = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.chip_with_icon(
                 appearance,
-                "Agent".to_string(),
+                if self.agent_mode {
+                    "Agent ON".to_string()
+                } else {
+                    "Agent".to_string()
+                },
                 Some("bundled/svg/agentmode.svg"),
                 LocalAiChatAction::ToggleAgent,
                 self.agent_mode,
                 true,
+            ))
+            .with_child(self.chip_with_icon(
+                appearance,
+                "Attach".to_string(),
+                Some("bundled/svg/paperclip.svg"),
+                LocalAiChatAction::ToggleAttachContext,
+                self.attach_context,
+                true,
             ));
         if self.agent_mode {
-            toggles_row.add_child(self.chip_with_icon(
+            controls.add_child(self.chip_with_icon(
                 appearance,
                 format!("AUTO {}", if self.auto_approve { "on" } else { "off" }),
                 Some("bundled/svg/sparkle.svg"),
@@ -4233,16 +4274,16 @@ impl LocalAiChatView {
                 true,
             ));
         }
-        toggles_row.add_child(self.chip_with_icon(
+        controls.add_child(self.chip_with_icon(
             appearance,
-            "Attach".to_string(),
-            Some("bundled/svg/paperclip.svg"),
-            LocalAiChatAction::ToggleAttachContext,
-            self.attach_context,
+            "Turbo".to_string(),
+            Some("bundled/svg/lightning-02.svg"),
+            LocalAiChatAction::ToggleTurbo,
+            self.endpoint == LocalEndpoint::Turbo,
             true,
         ));
-        toggles_row.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
-        toggles_row.add_child(self.chip_with_icon(
+        controls.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
+        controls.add_child(self.chip_with_icon(
             appearance,
             ai_mode_short_label(self.ai_mode.as_ref()),
             Some("bundled/svg/psychology.svg"),
@@ -4250,14 +4291,19 @@ impl LocalAiChatView {
             self.ai_mode.is_some(),
             true,
         ));
-
-        Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(selector_row)
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Shrinkable::new(1., controls.finish()).finish())
             .with_child(
-                Container::new(toggles_row.finish())
-                    .with_margin_top(5.)
-                    .finish(),
+                Container::new(self.selector_button(
+                    appearance,
+                    selector_label,
+                    LocalAiChatAction::ToggleModelPicker,
+                    self.model_picker_open,
+                ))
+                .with_margin_left(5.)
+                .finish(),
             )
             .finish()
     }
@@ -5155,7 +5201,50 @@ impl LocalAiChatView {
 
         if self.messages.is_empty() {
             if self.vibe_mode {
-                return Container::new(Empty::new().finish())
+                let hero = Flex::column()
+                    .with_main_axis_alignment(MainAxisAlignment::Center)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Container::new(
+                            ConstrainedBox::new(
+                                Icon::new("bundled/svg/sparkle.svg", genesi_green()).finish(),
+                            )
+                            .with_width(34.)
+                            .with_height(34.)
+                            .finish(),
+                        )
+                        .with_uniform_padding(14.)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        .with_background_color(ColorU::new(15, 143, 106, 36))
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            "Ready to create something new?".to_string(),
+                            23.,
+                            theme.active_ui_text_color().into(),
+                            false,
+                        ))
+                        .with_margin_top(18.)
+                        .finish(),
+                    )
+                    .with_child(
+                        Container::new(
+                            self.label_text(
+                                appearance,
+                                "Genesi Code can plan, write, review, and explain your project."
+                                    .to_string(),
+                                BODY_FONT_SIZE,
+                                theme.disabled_text_color(theme.background()).into(),
+                                false,
+                            ),
+                        )
+                        .with_margin_top(8.)
+                        .finish(),
+                    )
+                    .finish();
+                return Container::new(hero)
                     .with_horizontal_padding(PANEL_PADDING)
                     .finish();
             }
@@ -5928,18 +6017,26 @@ impl View for LocalAiChatView {
                     .with_padding_top(6.)
                     .finish(),
             )
-            .with_child(
-                Container::new(self.render_vibe_lab_strip(appearance))
-                    .with_padding_top(6.)
-                    .finish(),
-            )
             .finish();
+        let compose_inner = if self.vibe_mode {
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(compose_inner)
+                .with_child(
+                    Container::new(self.render_vibe_lab_strip(appearance))
+                        .with_padding_top(6.)
+                        .finish(),
+                )
+                .finish()
+        } else {
+            compose_inner
+        };
         let compose_box = Container::new(compose_inner)
-            .with_horizontal_padding(8.)
-            .with_vertical_padding(8.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
-            .with_border(Border::all(1.).with_border_fill(theme.outline()))
-            .with_background_color(genesi_panel_surface())
+            .with_horizontal_padding(11.)
+            .with_vertical_padding(10.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
+            .with_border(Border::all(1.).with_border_fill(genesi_subtle_border()))
+            .with_background_color(genesi_card_surface())
             .finish();
         let compose_container = if self.vibe_mode {
             Container::new(
@@ -5960,6 +6057,14 @@ impl View for LocalAiChatView {
         };
         root.add_child(compose_container);
 
-        root.finish()
+        let contents = root.finish();
+        if self.vibe_mode {
+            Container::new(contents)
+                .with_background_color(genesi_vibe_surface())
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(16.)))
+                .finish()
+        } else {
+            contents
+        }
     }
 }

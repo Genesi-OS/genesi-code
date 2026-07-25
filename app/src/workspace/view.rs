@@ -552,12 +552,12 @@ const LOCAL_AI_PANEL_MAX_WIDTH: f32 = 720.;
 
 // Ratio of terminal : theme chooser when theme chooser is active
 const THEME_CHOOSER_RATIO: f32 = 3.5;
-const GENESI_SHELL_PANEL_GAP: f32 = 6.0;
-const GENESI_SHELL_PANEL_RADIUS: f32 = 8.0;
+const GENESI_SHELL_PANEL_GAP: f32 = 8.0;
+const GENESI_SHELL_PANEL_RADIUS: f32 = 12.0;
 /// Breathing room between the shell's panel surfaces and the window edges. The
 /// panels already leave [`GENESI_SHELL_PANEL_GAP`] between each other; without
 /// this they still ran flush into the top and side chrome.
-const GENESI_SHELL_WINDOW_PADDING: f32 = 8.0;
+const GENESI_SHELL_WINDOW_PADDING: f32 = 6.0;
 
 /// Save position for the tab bar.
 pub(crate) const TAB_BAR_POSITION_ID: &str = "workspace_view:tab_bar";
@@ -675,15 +675,15 @@ fn genesi_shell_panel_radius() -> CornerRadius {
 }
 
 fn genesi_shell_panel_surface() -> ColorU {
-    ColorU::new(22, 23, 25, 255)
+    ColorU::new(30, 31, 34, 255)
 }
 
 fn genesi_shell_editor_surface() -> ColorU {
-    ColorU::new(22, 23, 25, 255)
+    ColorU::new(18, 19, 21, 255)
 }
 
 fn genesi_shell_panel_border() -> ColorU {
-    ColorU::new(255, 255, 255, 34)
+    ColorU::new(255, 255, 255, 38)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22102,14 +22102,23 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let mut container = Container::new(contents)
             .with_background_color(genesi_shell_panel_surface())
-            .with_corner_radius(corner_radius)
-            .with_uniform_padding(1.)
-            .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()));
+            .with_corner_radius(corner_radius);
 
         match side {
-            PanelPosition::Left => container = container.with_margin_right(GENESI_SHELL_PANEL_GAP),
-            PanelPosition::Right => container = container.with_margin_left(GENESI_SHELL_PANEL_GAP),
-        };
+            // The project panel is a soft card, not another framed window. Its
+            // own explorer card supplies the hierarchy while the rail stays light.
+            PanelPosition::Left => {
+                container = container.with_margin_right(GENESI_SHELL_PANEL_GAP);
+            }
+            // Keep the framing for the AI/review panel so it remains a distinct,
+            // resizable working surface beside the editor.
+            PanelPosition::Right => {
+                container = container
+                    .with_uniform_padding(1.)
+                    .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
+                    .with_margin_left(GENESI_SHELL_PANEL_GAP);
+            }
+        }
 
         container.finish()
     }
@@ -22121,9 +22130,6 @@ impl Workspace {
     ) -> Box<dyn Element> {
         Container::new(contents)
             .with_background_color(genesi_shell_editor_surface())
-            .with_corner_radius(genesi_shell_panel_radius())
-            .with_uniform_padding(5.)
-            .with_border(Border::all(1.).with_border_color(genesi_shell_panel_border()))
             .finish()
     }
 
@@ -24421,8 +24427,12 @@ impl TypedActionView for Workspace {
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
-                ctx.dispatch_typed_action(&WorkspaceAction::AddTerminalTab {
-                    hide_homepage: true,
+                self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+                    pane_group.add_terminal_pane_ignoring_default_session_mode(
+                        Direction::Down,
+                        None,
+                        ctx,
+                    );
                 });
                 ctx.notify();
             }

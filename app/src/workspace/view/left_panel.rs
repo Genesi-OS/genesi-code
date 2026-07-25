@@ -6,9 +6,9 @@ use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
-    resizable_state_handle, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide,
-    Element, Empty, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
-    Resizable, ResizableStateHandle, Shrinkable,
+    resizable_state_handle, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    DragBarSide, Element, Empty, Expanded, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    ParentElement, Radius, Resizable, ResizableStateHandle, Shrinkable,
 };
 use warpui::platform::Cursor;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
@@ -1127,11 +1127,11 @@ impl View for LeftPanelView {
 
         // If there is only one button in the toolbelt row,
         // there is no need to show it as it's a bit redundant.
-        let toolbelt_button_row = if self.toolbelt_buttons.len() > 1 {
+        let toolbelt = if self.toolbelt_buttons.len() > 1 {
             Some(
-                Flex::row()
+                Flex::column()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.0)
+                    .with_spacing(6.0)
                     .with_children(self.toolbelt_buttons.iter().zip(&mouse_state_handles).map(
                         |(button_config, mouse_state)| {
                             Self::render_button(button_config, mouse_state.clone(), appearance)
@@ -1183,38 +1183,75 @@ impl View for LeftPanelView {
             }
         };
 
-        let panel_content = Container::new({
-            let column = Flex::column();
-
-            let header_left = if let Some(row) = toolbelt_button_row {
-                row
-            } else {
-                Flex::row().finish()
-            };
-
-            let header_row = Container::new(
-                ConstrainedBox::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(Shrinkable::new(1.0, header_left).finish())
-                        .with_child(self.close_button(appearance, app))
+        let panel_title = match self.active_view.get() {
+            ToolPanelView::ProjectExplorer => "Project",
+            ToolPanelView::GlobalSearch { .. } => "Search",
+            ToolPanelView::WarpDrive => "Workspace",
+            ToolPanelView::ConversationListView => "Conversations",
+        };
+        let header_row = Container::new(
+            ConstrainedBox::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        warpui::elements::Text::new_inline(
+                            panel_title,
+                            appearance.ui_font_family(),
+                            12.,
+                        )
+                        .with_color(appearance.theme().active_ui_text_color().into())
                         .finish(),
-                )
-                .with_height(PANE_HEADER_HEIGHT)
-                .finish(),
+                    )
+                    .with_child(self.close_button(appearance, app))
+                    .finish(),
             )
-            .with_padding_left(10.)
-            .with_padding_right(HEADER_EDGE_PADDING)
-            .finish();
+            .with_height(PANE_HEADER_HEIGHT)
+            .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(HEADER_EDGE_PADDING)
+        .finish();
 
-            column
+        let explorer_card = Container::new(
+            Flex::column()
                 .with_child(header_row)
                 .with_child(Shrinkable::new(1.0, content_area).finish())
                 .with_main_axis_size(MainAxisSize::Max)
-                .finish()
-        })
+                .finish(),
+        )
+        .with_background(internal_colors::fg_overlay_1(appearance.theme()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_uniform_padding(4.)
+        .finish();
+
+        let rail = toolbelt
+            .map(|toolbelt| {
+                Container::new(toolbelt)
+                    .with_horizontal_padding(5.)
+                    .with_padding_top(8.)
+                    .finish()
+            })
+            .unwrap_or_else(|| Empty::new().finish());
+
+        let panel_content = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(rail)
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(explorer_card)
+                            .with_padding_right(6.)
+                            .with_padding_top(6.)
+                            .with_padding_bottom(6.)
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .finish(),
+        )
         .finish();
 
         if warpui::platform::is_mobile_device() {
