@@ -24,6 +24,68 @@ fn ollama_tags_are_not_gguf_references() {
 }
 
 #[test]
+fn a_gguf_always_routes_to_llama_server() {
+    // Regression guard for `ollama returned 404: model 'gguf:…' not found`: the
+    // endpoint field had drifted to Ollama while a GGUF was selected. Only
+    // llama-server can load one, so the model must override the selection.
+    assert_eq!(
+        transport_for("gguf:gpt-oss-20b-MXFP4", LocalEndpoint::Ollama),
+        LocalEndpoint::Turbo
+    );
+    assert_eq!(
+        transport_for("/home/u/model.gguf", LocalEndpoint::Ollama),
+        LocalEndpoint::Turbo
+    );
+}
+
+#[test]
+fn an_ollama_tag_keeps_the_selected_endpoint() {
+    // The override is one-way: picking Turbo for a normal tag is a legitimate
+    // choice (it runs the same model through llama-server) and must survive.
+    assert_eq!(
+        transport_for("llama3.1:8b", LocalEndpoint::Ollama),
+        LocalEndpoint::Ollama
+    );
+    assert_eq!(
+        transport_for("llama3.1:8b", LocalEndpoint::Turbo),
+        LocalEndpoint::Turbo
+    );
+}
+
+#[test]
+fn reasoning_only_chunks_still_produce_text() {
+    // gpt-oss and other thinking models leave `content` empty and stream their
+    // work in `reasoning_content`; reading only `content` made them look like
+    // they answered nothing.
+    let chunk: ChatChunk = serde_json::from_str(
+        r#"{"choices":[{"delta":{"content":"","reasoning_content":"weighing options"}}]}"#,
+    )
+    .expect("chunk should parse");
+    let delta = &chunk.choices[0].delta;
+    let text = delta
+        .content
+        .clone()
+        .filter(|c| !c.is_empty())
+        .or(delta.reasoning_content.clone());
+    assert_eq!(text.as_deref(), Some("weighing options"));
+}
+
+#[test]
+fn content_wins_over_reasoning_when_both_are_present() {
+    let chunk: ChatChunk = serde_json::from_str(
+        r#"{"choices":[{"delta":{"content":"the answer","reasoning_content":"scratch"}}]}"#,
+    )
+    .expect("chunk should parse");
+    let delta = &chunk.choices[0].delta;
+    let text = delta
+        .content
+        .clone()
+        .filter(|c| !c.is_empty())
+        .or(delta.reasoning_content.clone());
+    assert_eq!(text.as_deref(), Some("the answer"));
+}
+
+#[test]
 fn server_detail_unwraps_the_openai_error_shape() {
     // llama-server and the OpenAI-compatible providers answer with this shape;
     // showing the bare status code is what made the failure undiagnosable.

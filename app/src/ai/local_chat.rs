@@ -206,6 +206,12 @@ struct ChatChoice {
 struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning models (gpt-oss's harmony channels, DeepSeek-R1, Qwen3 in
+    /// thinking mode) have llama-server put their chain-of-thought here and
+    /// leave `content` empty until the final answer. Reading only `content`
+    /// meant such a model streamed for a while and appeared to answer nothing.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Native (non-OpenAI) request body for ollama's `/api/chat`.
@@ -437,10 +443,18 @@ fn stream_chat_openai_sse(
                 }
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
+                        // Prefer the answer; fall back to the reasoning stream so
+                        // a thinking model shows its work instead of nothing.
                         let text: String = chunk
                             .choices
                             .into_iter()
-                            .filter_map(|choice| choice.delta.content)
+                            .filter_map(|choice| {
+                                choice
+                                    .delta
+                                    .content
+                                    .filter(|content| !content.is_empty())
+                                    .or(choice.delta.reasoning_content)
+                            })
                             .collect();
                         if text.is_empty() {
                             None
@@ -707,6 +721,22 @@ pub async fn list_gguf_models() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Which local endpoint must serve `model`, given the endpoint the UI currently
+/// has selected.
+///
+/// A GGUF can only be loaded by llama-server, so it always overrides the
+/// selection. The endpoint field is written from several places (the model
+/// picker, the Turbo auto-default, the endpoint cycler), and when it drifted out
+/// of step with the chosen model the GGUF reference was posted to Ollama, which
+/// replied `model 'gguf:…' not found`.
+pub fn transport_for(model: &str, selected: LocalEndpoint) -> LocalEndpoint {
+    if is_gguf_ref(model) {
+        LocalEndpoint::Turbo
+    } else {
+        selected
+    }
+}
+
 /// Make Turbo serve `model`, restarting it if it currently has another one open.
 /// Blocks until llama-server answers `/health`. Only meaningful for a GGUF: an
 /// Ollama tag is served by Ollama itself and needs nothing here.
@@ -724,6 +754,14 @@ pub async fn ensure_turbo_serving(model: &str) -> Result<()> {
     #[cfg(not(unix))]
     let mut command = command::r#async::Command::new("genesi-ai-turbo");
     command.args(["serve", model, "--no-spec"]);
+    // Turbo defaults to a 4K window, which is fine for a chat but tight for an
+    // IDE: every turn carries the agent instructions plus up to ~6K characters
+    // of file context, and once that overflows the server can accept the request
+    // and return nothing. Ask for a roomier window, without overriding a value
+    // the user set deliberately.
+    if std::env::var_os("GENESI_TURBO_CTX").is_none() {
+        command.env("GENESI_TURBO_CTX", "8192");
+    }
     let mut child = command.spawn().map_err(|err| {
         anyhow!("couldn't run genesi-ai-turbo (is genesi-ai-mode installed?): {err}")
     })?;

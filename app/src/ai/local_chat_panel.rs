@@ -45,9 +45,9 @@ use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
     load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
-    set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok, AiModeState, ChatMessage,
-    ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
-    CLOUD_KEYS_STORAGE_KEY,
+    set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for, turbo_health_ok, AiModeState,
+    ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext,
+    LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -764,7 +764,9 @@ impl LocalAiChatView {
                 messages,
             )
         } else {
-            stream_chat(self.endpoint, model, messages)
+            // The transport is decided by the MODEL, not by `self.endpoint`
+            // alone — see transport_for.
+            stream_chat(transport_for(model, self.endpoint), model, messages)
         }
     }
 
