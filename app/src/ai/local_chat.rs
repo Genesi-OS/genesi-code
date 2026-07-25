@@ -15,14 +15,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{Stream, StreamExt};
-use reqwest_eventsource::Event;
+use reqwest_eventsource::{Error as EventSourceError, Event};
 use serde::{Deserialize, Serialize};
 
-/// Upper bound on a single chat request. A local model that never loads (or an
-/// ollama wedged on an oversized model) would otherwise leave the panel
-/// spinning forever; this surfaces a clear timeout error instead. Generous
-/// enough not to cut a slow-but-working generation from a small local model.
-const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+// NOTE: there is deliberately no whole-request timeout on the chat paths. An
+// earlier 120s cap aborted slow-but-working generations on CPU (the "error
+// sending request" reports), so both streams now run until the server finishes
+// or the user presses Stop. Connection failures still surface immediately.
 
 /// Default local endpoint: ollama's OpenAI-compatible API.
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
@@ -153,10 +152,27 @@ pub enum ChatStreamItem {
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
-    model: &'a str,
+    /// Omitted for the local Turbo server: llama-server has exactly ONE model
+    /// open and newer builds reject a `model` that doesn't match the alias they
+    /// advertise. The AI Mode Monitor has always omitted it on this path, which
+    /// is why its Turbo chat worked while Code's silently produced nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
     messages: &'a [ChatMessage],
     stream: bool,
+    /// Without a cap llama-server can run to the end of the context window; the
+    /// Monitor sends one and Code did not.
+    max_tokens: u32,
+    /// Reuse the KV prefix across turns — the system prompt and file context are
+    /// resent every turn, so this is a large time-to-first-token win locally.
+    /// Ignored by cloud providers that don't know the field.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cache_prompt: bool,
 }
+
+/// Upper bound on one local reply. Generous enough for a full code block, small
+/// enough that a runaway model can't fill the whole context window.
+const LOCAL_MAX_TOKENS: u32 = 2048;
 
 #[derive(Serialize)]
 struct AnthropicChatRequest<'a> {
@@ -248,7 +264,7 @@ pub fn stream_chat(
     match endpoint {
         LocalEndpoint::Ollama => stream_chat_ollama_native(model.to_string(), messages).boxed(),
         LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), model, messages, None).boxed()
+            stream_chat_openai_sse(endpoint.base_url(), None, messages, None).boxed()
         }
     }
 }
@@ -266,7 +282,7 @@ pub fn stream_chat_cloud(
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match provider {
         CloudProviderKind::Anthropic => stream_chat_anthropic_sse(model, messages, api_key).boxed(),
-        _ => stream_chat_openai_sse(provider.base_url(), model, messages, Some(api_key)).boxed(),
+        _ => stream_chat_openai_sse(provider.base_url(), Some(model), messages, Some(api_key)).boxed(),
     }
 }
 
@@ -369,17 +385,27 @@ fn error_chain<E: std::error::Error>(err: &E) -> String {
 
 /// OpenAI-compatible SSE streaming (`/v1/chat/completions`) — used for the Turbo
 /// (llama-server) endpoint, whose OpenAI compat layer works correctly.
+/// `model` is `None` for the local llama-server (it has exactly one model open
+/// and newer builds reject a mismatched name) and `Some(..)` for a cloud
+/// provider, which requires it.
 fn stream_chat_openai_sse(
     base_url: &str,
-    model: &str,
+    model: Option<&str>,
     messages: Vec<ChatMessage>,
     api_key: Option<String>,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    // `model: None` means the local llama-server, which must NOT be sent one (see
+    // ChatRequest::model) and does understand `cache_prompt`. Passing it
+    // explicitly beats inferring "local" from the absence of an API key, which
+    // would silently drop the model for any keyless cloud endpoint.
+    let is_local = model.is_none();
     let body = ChatRequest {
         model,
         messages: &messages,
         stream: true,
+        max_tokens: LOCAL_MAX_TOKENS,
+        cache_prompt: is_local,
     };
 
     // `json()` serializes eagerly into the builder, so `body` (and its borrow of
@@ -428,6 +454,31 @@ fn stream_chat_openai_sse(
                     }
                 }
             }
+            // A normal end of stream, NOT a failure. The event source yields this
+            // once the server closes the connection, which happens right after
+            // `[DONE]` — reporting it put an error banner under every successful
+            // answer. Ending quietly is correct; a genuinely empty response is
+            // caught by the caller, which knows whether any token arrived.
+            Err(EventSourceError::StreamEnded) => None,
+            // The server refused the request or answered with something that
+            // isn't an event stream (llama-server does this for a prompt that
+            // exceeds the context window, for example). Both variants carry the
+            // response, so read the body and show what it actually said instead
+            // of a bare "Invalid status code: 400".
+            Err(EventSourceError::InvalidStatusCode(status, response)) => {
+                let body = response.text().await.unwrap_or_default();
+                Some(Err(anyhow!(
+                    "the model server returned {status}{}",
+                    format_server_detail(&body)
+                )))
+            }
+            Err(EventSourceError::InvalidContentType(_, response)) => {
+                let body = response.text().await.unwrap_or_default();
+                Some(Err(anyhow!(
+                    "the model server did not return a stream{}",
+                    format_server_detail(&body)
+                )))
+            }
             Err(err) => {
                 // reqwest's Display hides the underlying cause (e.g. "connection
                 // refused" / "connection reset"), so walk the source chain and
@@ -444,6 +495,41 @@ fn stream_chat_openai_sse(
             }
         }
     })
+}
+
+/// Pull the human-readable part out of an error body. llama-server and the
+/// OpenAI-compatible providers answer `{"error":{"message":"…"}}`; anything else
+/// is shown verbatim, trimmed so a huge HTML page can't flood the panel.
+fn format_server_detail(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| {
+                    error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .or_else(|| error.as_str())
+                })
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.to_string());
+    if message.is_empty() {
+        return String::new();
+    }
+    const MAX_CHARS: usize = 400;
+    let mut shown: String = message.chars().take(MAX_CHARS).collect();
+    // Compare CHAR counts of the same string — comparing byte lengths against the
+    // raw body marked an untruncated 400-char message as truncated.
+    if shown.chars().count() < message.chars().count() {
+        shown.push('…');
+    }
+    format!(": {shown}")
 }
 
 #[derive(Deserialize)]
@@ -545,6 +631,129 @@ fn stream_chat_anthropic_sse(
         }
     })
 }
+
+// ── local GGUF models ────────────────────────────────────────────────────────
+// `/v1/models` only ever knows what `ollama pull` fetched (or, on :11435, the one
+// file llama-server already has open), so a GGUF the user imported into Genesi is
+// invisible to it. `genesi-ai-turbo` owns that library, so we ask it — the same
+// source the AI Mode Monitor uses, which keeps both apps showing one list.
+//
+// A GGUF is referenced everywhere by the stable string `gguf:<file stem>`; it
+// stays a plain String so it flows through the picker and the request path with
+// no special casing.
+
+/// True when `model` names a local GGUF rather than an Ollama tag.
+pub fn is_gguf_ref(model: &str) -> bool {
+    model.starts_with("gguf:") || model.to_ascii_lowercase().ends_with(".gguf")
+}
+
+#[derive(Deserialize)]
+struct TurboGgufEntry {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    params_b: f32,
+}
+
+/// The local GGUF library as `(reference, label)` pairs. Returns an empty list
+/// when `genesi-ai-turbo` is missing or fails — a machine without it simply has
+/// no local library, which is not an error worth showing the user.
+pub async fn list_gguf_models() -> Vec<(String, String)> {
+    let mut command = command::r#async::Command::new("genesi-ai-turbo");
+    command.arg("gguf-list");
+    let Ok(output) = command.output().await else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let entries: Vec<TurboGgufEntry> = match serde_json::from_slice(&output.stdout) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!("genesi-ai-turbo gguf-list: unparseable output: {err}");
+            return Vec::new();
+        }
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let stem = std::path::Path::new(&entry.path)
+                .file_stem()?
+                .to_string_lossy()
+                .into_owned();
+            if stem.is_empty() {
+                return None;
+            }
+            let name = if entry.name.trim().is_empty() {
+                stem.clone()
+            } else {
+                entry.name.trim().to_string()
+            };
+            // "30B", not "30.0B" — but keep a real fraction ("1.5B").
+            let size = if entry.params_b > 0.0 {
+                let rounded = (entry.params_b * 10.0).round() / 10.0;
+                if (rounded.fract()).abs() < f32::EPSILON {
+                    format!(" · {}B", rounded as i64)
+                } else {
+                    format!(" · {rounded:.1}B")
+                }
+            } else {
+                String::new()
+            };
+            Some((format!("gguf:{stem}"), format!("{name}{size} (GGUF)")))
+        })
+        .collect()
+}
+
+/// Make Turbo serve `model`, restarting it if it currently has another one open.
+/// Blocks until llama-server answers `/health`. Only meaningful for a GGUF: an
+/// Ollama tag is served by Ollama itself and needs nothing here.
+///
+/// This mirrors what the AI Mode Monitor does when a GGUF is picked. Without it,
+/// selecting a local file in Code would post to a server that has a DIFFERENT
+/// model loaded (or none at all) and silently return nothing.
+pub async fn ensure_turbo_serving(model: &str) -> Result<()> {
+    // Its own session on Linux (the shipping target), so the server outlives this
+    // request — and Code itself — exactly like the Monitor's `start_new_session`.
+    // `spawn()` nulls stdio by default and `kill_on_drop` is false, so dropping
+    // the handle below leaves llama-server running either way.
+    #[cfg(unix)]
+    let mut command = command::r#async::Command::new_with_session("genesi-ai-turbo");
+    #[cfg(not(unix))]
+    let mut command = command::r#async::Command::new("genesi-ai-turbo");
+    command.args(["serve", model, "--no-spec"]);
+    let mut child = command.spawn().map_err(|err| {
+        anyhow!("couldn't run genesi-ai-turbo (is genesi-ai-mode installed?): {err}")
+    })?;
+
+    // `serve` execs llama-server and stays in the foreground, so readiness comes
+    // from polling /health — not from waiting on the child. When a healthy server
+    // already has this exact model, `serve` reuses it and exits 0 right away.
+    for _ in 0..TURBO_LOAD_TIMEOUT_SECS {
+        if turbo_health_ok().await {
+            return Ok(());
+        }
+        if let Ok(Some(exit)) = child.try_status() {
+            if turbo_health_ok().await {
+                return Ok(()); // reused an existing server, then exited
+            }
+            return Err(anyhow!(
+                "genesi-ai-turbo exited ({exit}) without bringing the model up — \
+                 run `genesi-ai-turbo serve {model}` in a terminal to see why"
+            ));
+        }
+        warpui::r#async::Timer::after(Duration::from_secs(1)).await;
+    }
+    Err(anyhow!(
+        "{model} took over {TURBO_LOAD_TIMEOUT_SECS}s to load"
+    ))
+}
+
+/// How long to wait for llama-server to come up with a freshly picked model.
+/// A large MoE read from a cold page cache genuinely takes minutes.
+const TURBO_LOAD_TIMEOUT_SECS: u32 = 300;
 
 /// Best-effort `GET {base_url}/models` to populate the model picker. Returns the
 /// model ids (e.g. `llama3.2:3b`). Errors bubble up so the UI can hint that the
@@ -943,3 +1152,7 @@ pub fn save_cloud_config(cfg: &CloudConfig) -> Result<()> {
     std::fs::write(&path, json).map_err(|e| anyhow!("failed to write cloud config: {e}"))?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "local_chat_tests.rs"]
+mod tests;

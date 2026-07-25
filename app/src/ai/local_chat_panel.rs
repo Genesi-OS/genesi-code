@@ -43,10 +43,11 @@ use warpui_extras::secure_storage::AppContextExt as _;
 
 use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
-    cloud_presets, list_models, load_cloud_config, load_legacy_cloud_key, read_ai_mode_state,
-    save_cloud_config, set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok,
-    AiModeState, ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind,
-    CodeContext, LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
+    cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
+    load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
+    set_ai_mode_force, stream_chat, stream_chat_cloud, turbo_health_ok, AiModeState, ChatMessage,
+    ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
+    CLOUD_KEYS_STORAGE_KEY,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -458,7 +459,16 @@ pub struct LocalAiChatView {
     /// Set once the user picks an endpoint by hand, so the Turbo auto-default
     /// (see [`Self::refresh_models`]) never overrides a deliberate choice.
     endpoint_user_chosen: bool,
+    /// Every selectable model as a raw reference: ollama tags, plus local GGUFs
+    /// as the stable `gguf:<file stem>` form that genesi-ai-turbo resolves.
     models: Vec<String>,
+    /// Display names for the `gguf:` entries above (reference -> friendly name),
+    /// so the picker can show "Qwen3 30B A3B · 30B (GGUF)" while the VALUE stays
+    /// the reference the backend needs.
+    gguf_labels: HashMap<String, String>,
+    /// The GGUF currently being loaded into llama-server, if any. Drives the
+    /// "loading…" hint and stops a second pick from racing the first.
+    preparing_model: Option<String>,
     selected_model: Option<usize>,
     ai_mode: Option<AiModeState>,
 
@@ -565,6 +575,8 @@ impl LocalAiChatView {
             turbo_available: false,
             endpoint_user_chosen: false,
             models: Vec::new(),
+            gguf_labels: HashMap::new(),
+            preparing_model: None,
             selected_model: None,
             ai_mode: None,
             in_flight: false,
@@ -626,6 +638,60 @@ impl LocalAiChatView {
             .cloned()
     }
 
+    /// Friendly name for a model reference. Ollama tags read fine as-is; a
+    /// `gguf:` reference becomes the model's real name so the picker doesn't
+    /// show raw file stems.
+    fn model_label(&self, reference: &str) -> String {
+        self.gguf_labels
+            .get(reference)
+            .cloned()
+            .unwrap_or_else(|| reference.to_string())
+    }
+
+    /// A local GGUF is loaded by llama-server, never by ollama, so picking one
+    /// has to (a) switch the endpoint to Turbo and (b) make that server actually
+    /// open THIS file. Without (b) the request goes to a server holding a
+    /// different model — or none — and returns nothing, which is precisely the
+    /// "runs a few seconds and answers nothing" failure.
+    fn ensure_model_ready(&mut self, model: String, ctx: &mut ViewContext<Self>) {
+        if self.cloud_active || !is_gguf_ref(&model) {
+            return;
+        }
+        if self.endpoint != LocalEndpoint::Turbo {
+            self.endpoint = LocalEndpoint::Turbo;
+            self.endpoint_user_chosen = true;
+        }
+        if self.preparing_model.as_deref() == Some(model.as_str()) {
+            return; // already bringing this one up
+        }
+        self.preparing_model = Some(model.clone());
+        self.error = None;
+        ctx.notify();
+        let label = self.model_label(&model);
+        ctx.spawn(
+            {
+                let model = model.clone();
+                async move { ensure_turbo_serving(&model).await }
+            },
+            move |me, result, ctx| {
+                if me.preparing_model.as_deref() != Some(model.as_str()) {
+                    return; // superseded by another pick
+                }
+                me.preparing_model = None;
+                match result {
+                    Ok(()) => {
+                        me.turbo_available = true;
+                        me.error = None;
+                    }
+                    Err(err) => {
+                        me.error = Some(format!("Couldn't load {label}: {err}"));
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
     /// Build the chat stream for the active backend: the user's cloud provider
     /// (BYOK) when it's selected and ready, otherwise the local Ollama / Turbo
     /// endpoint. Both yield the same `ChatStreamItem` stream so the agent loop
@@ -667,35 +733,50 @@ impl LocalAiChatView {
         // readiness comes from the `/health` probe below instead.
         let is_turbo = self.endpoint == LocalEndpoint::Turbo;
         ctx.spawn(
-            async move { list_models(&base).await },
-            move |me, result, ctx| {
-                match result {
-                    Ok(models) => {
-                        me.models = models;
-                        me.selected_model = if me.models.is_empty() {
-                            None
-                        } else {
-                            Some(me.selected_model.unwrap_or(0).min(me.models.len() - 1))
-                        };
-                        if me.models.is_empty() && !is_turbo {
-                            me.error = Some(
-                                "No local models found. Is ollama running? Try `ollama pull llama3.2`."
-                                    .to_string(),
-                            );
-                        } else {
-                            me.error = None;
-                        }
-                    }
-                    Err(e) => {
-                        me.models.clear();
-                        me.selected_model = None;
-                        me.error = if is_turbo {
-                            None
-                        } else {
-                            Some(format!("Can't reach the local endpoint: {e}"))
-                        };
-                    }
-                }
+            async move {
+                // Two sources, one list. `/v1/models` only knows what ollama
+                // pulled (or the single file llama-server has open), so a GGUF
+                // the user imported into Genesi is invisible to it — ask
+                // genesi-ai-turbo for the library too, exactly like the AI Mode
+                // Monitor does, so both apps offer the same models.
+                let served = list_models(&base).await;
+                let local = list_gguf_models().await;
+                (served, local)
+            },
+            move |me, (served, local), ctx| {
+                let reachable = served.is_ok();
+                let mut models = served.unwrap_or_default();
+                // A GGUF the server happens to have open is already listed by
+                // /v1/models under its file path; keep the stable `gguf:` form as
+                // the single way to name it so the picker has no duplicates.
+                models.retain(|m| !is_gguf_ref(m));
+                me.gguf_labels = local.iter().cloned().collect();
+                models.extend(local.into_iter().map(|(reference, _)| reference));
+
+                // Re-anchor the selection by VALUE, not index. The list is rebuilt
+                // from two async sources, so a plain index survives a reorder by
+                // silently pointing at a different model.
+                let previous = me.current_model();
+                me.models = models;
+                me.selected_model = if me.models.is_empty() {
+                    None
+                } else {
+                    previous
+                        .and_then(|model| me.models.iter().position(|m| *m == model))
+                        .or(Some(0))
+                };
+                me.error = if !me.models.is_empty() || is_turbo {
+                    None
+                } else if reachable {
+                    Some(
+                        "No local models found. Is ollama running? Try \
+                         `ollama pull llama3.2`, or import a .gguf in the AI Mode \
+                         Monitor."
+                            .to_string(),
+                    )
+                } else {
+                    Some("Can't reach the local endpoint (is ollama running?)".to_string())
+                };
                 ctx.notify();
             },
         );
@@ -919,12 +1000,35 @@ impl LocalAiChatView {
             None if self.endpoint == LocalEndpoint::Turbo => "local".to_string(),
             None => {
                 self.error = Some(
-                    "No model selected. Is ollama running? Try `ollama pull llama3.2`.".to_string(),
+                    "No model selected. Is ollama running? Try `ollama pull llama3.2`, \
+                     or import a .gguf in the AI Mode Monitor."
+                        .to_string(),
                 );
                 ctx.notify();
                 return;
             }
         };
+
+        // A GGUF still being loaded into llama-server would take the request and
+        // answer nothing. Say so instead of sending into a server that isn't ready.
+        // Only THIS model blocks: a load left running for a model the user has
+        // since switched away from must not hold the send button hostage.
+        if self.preparing_model.as_deref() == Some(model.as_str()) {
+            self.error = Some(format!("{} is still loading — give it a moment.", self.model_label(&model)));
+            ctx.notify();
+            return;
+        }
+        // Picked a GGUF but the server isn't up (Code restarted, or Turbo was
+        // stopped elsewhere)? Bring it back rather than failing the turn.
+        if is_gguf_ref(&model) && !self.turbo_available {
+            self.ensure_model_ready(model.clone(), ctx);
+            self.error = Some(format!(
+                "Loading {} — press send again once it's ready.",
+                self.model_label(&model)
+            ));
+            ctx.notify();
+            return;
+        }
 
         self.error = None;
 
@@ -992,11 +1096,49 @@ impl LocalAiChatView {
                 // Stream ended without an explicit `[DONE]` — settle the UI.
                 if turn == me.current_turn && me.in_flight {
                     me.in_flight = false;
+                    // An END with nothing streamed is a FAILURE, not a finished
+                    // answer. Settling silently here is what produced the
+                    // "spins for a few seconds, then nothing" report: the empty
+                    // bubble stayed and no reason was ever shown. Say something.
+                    let empty = me
+                        .messages
+                        .last()
+                        .is_some_and(|m| m.role == ChatRole::Assistant && m.text.is_empty());
+                    if empty {
+                        me.messages.pop();
+                        me.error = Some(me.empty_reply_error());
+                    }
                     ctx.notify();
                 }
             },
         );
         ctx.notify();
+    }
+
+    /// Why a local endpoint can accept a request, stream nothing, and close.
+    /// Ordered by how often each cause actually bites on a small local setup.
+    fn empty_reply_error(&self) -> String {
+        if self.cloud_active {
+            return format!(
+                "{}: the provider closed the stream without sending any text.",
+                self.active_backend_error_label()
+            );
+        }
+        match self.endpoint {
+            LocalEndpoint::Turbo => format!(
+                "{}: the model returned nothing. The prompt may not fit the server's \
+                 context window — start Turbo with a bigger one \
+                 (GENESI_TURBO_CTX=8192), shorten the conversation, or turn off \
+                 “Attach file context”. Run `genesi-ai-turbo serve <model>` in a \
+                 terminal to see the server's own error.",
+                self.active_backend_error_label()
+            ),
+            LocalEndpoint::Ollama => format!(
+                "{}: the model returned nothing. Check `ollama ps` — the model may \
+                 have failed to load, or the prompt may exceed its context window.",
+                self.active_backend_error_label()
+            ),
+        }
     }
 
     // ── agent loop ─────────────────────────────────────────────────────────
@@ -1066,6 +1208,15 @@ impl LocalAiChatView {
             return; // already errored out, stopped, or superseded
         }
         let reply = self.agent_step_buffer.trim().to_string();
+        // The step produced no text at all: the endpoint accepted the request and
+        // closed without generating. Continuing would append an empty assistant
+        // turn and loop on a model that just told us nothing — fail with the
+        // reason instead (the plain-chat path does the same).
+        if reply.is_empty() {
+            let reason = self.empty_reply_error();
+            self.finish_agent_with_error(turn, reason, ctx);
+            return;
+        }
         self.agent_messages
             .push(ChatMessage::assistant(reply.clone()));
 
@@ -4025,6 +4176,7 @@ impl LocalAiChatView {
     fn render_control_strip(&self, appearance: &Appearance) -> Box<dyn Element> {
         let model_name = self
             .current_model()
+            .map(|model| self.model_label(&model))
             .unwrap_or_else(|| "no model".to_string());
         let model_name = truncate_middle(&model_name, MODEL_LABEL_MAX_CHARS);
         let selector_label = if self.cloud_active {
@@ -4277,7 +4429,8 @@ impl LocalAiChatView {
             list.add_child(
                 Container::new(self.label_text(
                     appearance,
-                    "No models yet — start ollama, pull one (e.g. `ollama pull llama3.2`), then Refresh.",
+                    "No models yet — start ollama and pull one (e.g. `ollama pull llama3.2`), \
+                     or import a .gguf in the AI Mode Monitor, then Refresh.",
                     BODY_FONT_SIZE,
                     muted,
                     true,
@@ -4288,13 +4441,17 @@ impl LocalAiChatView {
             );
         } else {
             for (index, model) in self.models.iter().enumerate() {
-                let selected = !self.cloud_active
-                    && self.endpoint == LocalEndpoint::Ollama
-                    && self.selected_model == Some(index);
+                // A GGUF runs on Turbo and an ollama tag on Ollama, and picking
+                // one sets the matching endpoint — so the endpoint no longer
+                // decides selection, the index does. (Requiring Ollama here left
+                // a picked GGUF showing as unselected.)
+                let selected = !self.cloud_active && self.selected_model == Some(index);
                 let mark = if selected { "●  " } else { "○  " };
+                let loading = self.preparing_model.as_deref() == Some(model.as_str());
+                let suffix = if loading { "   loading…" } else { "" };
                 list.add_child(self.picker_row(
                     appearance,
-                    format!("{mark}{model}"),
+                    format!("{mark}{}{suffix}", self.model_label(model)),
                     LocalAiChatAction::PickModel(index),
                     selected,
                 ));
@@ -4302,7 +4459,13 @@ impl LocalAiChatView {
         }
 
         list.add_child(section(self, "Accelerated"));
-        let turbo_selected = self.endpoint == LocalEndpoint::Turbo;
+        // The standalone Turbo row means "run the picked ollama model through
+        // llama-server". A GGUF is ALREADY on Turbo by construction, so it must
+        // not light this row up as well.
+        let gguf_active = self
+            .current_model()
+            .is_some_and(|model| is_gguf_ref(&model));
+        let turbo_selected = self.endpoint == LocalEndpoint::Turbo && !gguf_active;
         let turbo_label = if self.turbo_available || turbo_selected {
             format!(
                 "{}⚡ Turbo — full GPU offload",
@@ -5199,6 +5362,10 @@ impl TypedActionView for LocalAiChatView {
                         .map(|index| (index + 1) % self.models.len())
                         .unwrap_or(0);
                     self.selected_model = Some(next);
+                    // Cycling onto a GGUF must load it too, same as picking one.
+                    if let Some(model) = self.models.get(next).cloned() {
+                        self.ensure_model_ready(model, ctx);
+                    }
                 }
                 ctx.notify();
             }
@@ -5251,16 +5418,23 @@ impl TypedActionView for LocalAiChatView {
                 ctx.notify();
             }
             LocalAiChatAction::PickModel(index) => {
-                // A deliberate local-model choice: pin the local (ollama)
-                // endpoint and stop the Turbo auto-default from overriding it.
+                // A deliberate local-model choice: pin the endpoint and stop the
+                // Turbo auto-default from overriding it.
                 self.endpoint_user_chosen = true;
                 self.cloud_active = false;
-                self.endpoint = LocalEndpoint::Ollama;
+                let picked = self.models.get(*index).cloned();
                 if *index < self.models.len() {
                     self.selected_model = Some(*index);
                 }
                 self.model_picker_open = false;
                 self.error = None;
+                match picked {
+                    // A GGUF can only be served by llama-server, so pinning
+                    // ollama here would guarantee an empty reply. Switch to
+                    // Turbo and load the file.
+                    Some(model) if is_gguf_ref(&model) => self.ensure_model_ready(model, ctx),
+                    _ => self.endpoint = LocalEndpoint::Ollama,
+                }
                 ctx.notify();
             }
             LocalAiChatAction::ToggleTurbo => {
