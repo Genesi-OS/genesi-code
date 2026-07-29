@@ -1231,18 +1231,25 @@ impl View for LeftPanelView {
         .with_uniform_padding(4.)
         .finish();
 
-        // The rail is a FREE-STANDING strip of quick-access icons, not part of
-        // the project card. It paints no surface of its own so it floats on the
-        // app background, and a gap — not a shared container — is what separates
-        // it from the card. (Both previously sat inside one filled wrapper, which
-        // read as a single lighter slab instead of two elements.)
+        // The rail is its OWN card, matching the project card's fill, with a gap
+        // between the two — two surfaces side by side, never one merged slab.
+        // Inside it the icons are bare; only the active one carries a highlight
+        // (see render_button), so the strip reads as a set of tabs.
         let rail = toolbelt
             .map(|toolbelt| {
-                Container::new(toolbelt)
-                    .with_horizontal_padding(6.)
-                    .with_padding_top(8.)
-                    .with_margin_right(RAIL_CARD_GAP)
-                    .finish()
+                Container::new(
+                    Container::new(toolbelt)
+                        .with_horizontal_padding(6.)
+                        .with_vertical_padding(8.)
+                        .with_background(internal_colors::fg_overlay_1(appearance.theme()))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                        .finish(),
+                )
+                .with_margin_right(RAIL_CARD_GAP)
+                .with_padding_top(6.)
+                .with_padding_bottom(6.)
+                .with_padding_left(6.)
+                .finish()
             })
             .unwrap_or_else(|| Empty::new().finish());
 

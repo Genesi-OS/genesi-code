@@ -117,6 +117,13 @@ fn genesi_card_surface() -> ColorU {
     ColorU::new(31, 32, 35, 245)
 }
 
+/// The compose box. Clearly lighter than the panel fill it sits on
+/// (`genesi_shell_panel_surface`, rgb 30/31/34) so it reads as a raised card
+/// without needing a border.
+fn genesi_compose_surface() -> ColorU {
+    ColorU::new(46, 48, 53, 255)
+}
+
 fn genesi_subtle_border() -> ColorU {
     ColorU::new(255, 255, 255, 24)
 }
@@ -607,6 +614,9 @@ impl LocalAiChatView {
             input.set_placeholder_text(" Ask the local model...", ctx);
             input.set_outer_margins(0., 0., ctx);
             input.set_submit_button_visible(false, ctx);
+            // The compose box already IS the surface; the component's own frame
+            // drew a second box inside it.
+            input.set_borderless(true, ctx);
         });
         ctx.subscribe_to_view(&input, |me, _, event, ctx| {
             me.handle_input_event(event, ctx);
@@ -3653,18 +3663,16 @@ impl LocalAiChatView {
             return;
         }
 
-        self.project_canvas_pending_drag_pointer = Some(pointer);
+        // Apply every move. The previous throttle stored the pointer as "pending"
+        // and returned, but nothing ever came back to flush it — the only flush
+        // was on mouse-up. Since pointer events arrive far more often than the
+        // 16ms budget, most of a gesture was DISCARDED rather than deferred, so
+        // the canvas appeared to freeze mid-drag and jump at the end. The frame
+        // budget that protects the render already lives in the canvas view
+        // (it draws fewer nodes while dragging), which is the right place for it:
+        // dropping input is not throttling, it is losing the gesture.
         let now = Instant::now();
-        let frame_is_too_soon = self
-            .project_canvas_last_drag_frame
-            .is_some_and(|last| now.duration_since(last) < CANVAS_DRAG_FRAME_INTERVAL);
-        let movement_is_too_small = self
-            .project_canvas_last_drag_pointer
-            .is_some_and(|last| (pointer - last).length() < CANVAS_DRAG_MIN_DISTANCE);
-        if frame_is_too_soon || movement_is_too_small {
-            return;
-        }
-
+        self.project_canvas_pending_drag_pointer = Some(pointer);
         if self.apply_project_canvas_drag_pointer(pointer) {
             self.project_canvas_last_drag_frame = Some(now);
             self.project_canvas_last_drag_pointer = Some(pointer);
@@ -4319,6 +4327,13 @@ impl LocalAiChatView {
                 LocalAiChatAction::ToggleModelPicker,
                 self.model_picker_open,
             ))
+            // Send lives at the end of this row, i.e. the bottom-right corner of
+            // the compose box.
+            .with_child(
+                Container::new(self.render_prompt_action_button(appearance))
+                    .with_margin_left(6.)
+                    .finish(),
+            )
             .finish()
     }
 
@@ -4464,18 +4479,15 @@ impl LocalAiChatView {
                 )
                 .finish(),
         )
+        // Text only: no frame and no fill, as in the reference. A tint appears
+        // solely while the popup is open, so the trigger still reads as active.
         .with_horizontal_padding(8.)
         .with_vertical_padding(5.)
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-        .with_border(Border::all(1.).with_border_color(if open {
-            green_soft()
-        } else {
-            genesi_subtle_border()
-        }))
         .with_background_color(if open {
             green_tint()
         } else {
-            ColorU::new(255, 255, 255, 6)
+            ColorU::transparent_black()
         })
         .with_margin_right(4.)
         .with_margin_top(2.);
@@ -6232,25 +6244,16 @@ impl View for LocalAiChatView {
         // holds the prompt input on top and the AI controls (selector + Turbo +
         // agent toggles) along its bottom edge — like a real IDE assistant, with
         // everything in one surface instead of loose chips above a bare input.
+        // The prompt field spans the full width on its own line, and every
+        // control — including send — sits on the row beneath it, so the send
+        // affordance lands in the box's bottom-right corner like the reference.
         let compose_inner = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(
-                Container::new(
-                    Flex::row()
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(
-                            Shrinkable::new(1., ChildView::new(&self.input).finish()).finish(),
-                        )
-                        .with_child(
-                            Container::new(self.render_prompt_action_button(appearance))
-                                .with_margin_left(8.)
-                                .finish(),
-                        )
-                        .finish(),
-                )
-                .with_horizontal_padding(4.)
-                .with_vertical_padding(2.)
-                .finish(),
+                Container::new(ChildView::new(&self.input).finish())
+                    .with_horizontal_padding(4.)
+                    .with_vertical_padding(2.)
+                    .finish(),
             )
             .with_child(
                 Container::new(self.render_control_strip(appearance))
@@ -6271,12 +6274,14 @@ impl View for LocalAiChatView {
         } else {
             compose_inner
         };
+        // No border: the card is separated from the panel by being LIGHTER, not by
+        // an outline. genesi_card_surface sat within a point or two of the panel
+        // fill, so the box was invisible against it.
         let compose_box = Container::new(compose_inner)
             .with_horizontal_padding(11.)
             .with_vertical_padding(10.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
-            .with_border(Border::all(1.).with_border_fill(genesi_subtle_border()))
-            .with_background_color(genesi_card_surface())
+            .with_background_color(genesi_compose_surface())
             .finish();
         let compose_container = if self.vibe_mode {
             Container::new(

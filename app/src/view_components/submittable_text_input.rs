@@ -37,6 +37,10 @@ pub struct SubmittableTextInput {
     show_submit_button: bool,
     outer_margin_top: f32,
     outer_margin_bottom: f32,
+    /// Drop the frame around the field. A caller that already draws its own
+    /// compose surface (the AI panel) otherwise gets a second box inside the
+    /// first. An error still draws its border, so invalid input stays visible.
+    borderless: bool,
 }
 
 impl SubmittableTextInput {
@@ -63,6 +67,7 @@ impl SubmittableTextInput {
             show_submit_button: true,
             outer_margin_top: 10.,
             outer_margin_bottom: 10.,
+            borderless: false,
         }
     }
 
@@ -91,6 +96,12 @@ impl SubmittableTextInput {
     pub fn set_outer_margins(&mut self, top: f32, bottom: f32, ctx: &mut ViewContext<Self>) {
         self.outer_margin_top = top;
         self.outer_margin_bottom = bottom;
+        ctx.notify();
+    }
+
+    /// Render without the surrounding frame — for callers that supply their own.
+    pub fn set_borderless(&mut self, borderless: bool, ctx: &mut ViewContext<Self>) {
+        self.borderless = borderless;
         ctx.notify();
     }
 
@@ -217,9 +228,13 @@ impl View for SubmittableTextInput {
             );
         }
 
-        Container::new(row.finish())
-            .with_border(Border::all(1.).with_border_fill(border_fill))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        let mut outer = Container::new(row.finish());
+        if !self.borderless || self.has_error {
+            outer = outer
+                .with_border(Border::all(1.).with_border_fill(border_fill))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+        }
+        outer
             .with_margin_top(self.outer_margin_top)
             .with_margin_bottom(self.outer_margin_bottom)
             .with_padding_left(4.)

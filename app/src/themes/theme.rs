@@ -45,11 +45,14 @@ pub enum ThemeKind {
     SentReferralReward,
     #[schemars(skip)]
     ReceivedReferralReward,
+    // Genesi Code ships Adeberry as its default look, so it carries #[default]
+    // here rather than relying on the DefaultAdeberryTheme onboarding hook, which
+    // only ever fired for a brand-new user whose theme was still Phenomenon.
+    #[default]
     #[schemars(description = "Adeberry")]
     Adeberry,
     #[schemars(description = "Phenomenon")]
     Phenomenon,
-    #[default]
     #[schemars(description = "Dark")]
     Dark,
     #[schemars(description = "Dracula")]

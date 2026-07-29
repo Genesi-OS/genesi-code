@@ -69,7 +69,7 @@ use warp_core::semantic_selection::SemanticSelection;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::phenomenon::PhenomenonStyle;
-use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::{Fill, VerticalGradient};
 use warp_core::ui::Icon;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_editor::editor::NavigationKey;
@@ -677,6 +677,18 @@ fn genesi_shell_panel_radius() -> CornerRadius {
 fn genesi_shell_panel_surface() -> ColorU {
     ColorU::new(30, 31, 34, 255)
 }
+
+/// Corner radius of vibe mode's conversation card. Larger than the docked
+/// panels' so the mode reads as one soft surface rather than another window.
+const GENESI_VIBE_CARD_RADIUS: f32 = 18.0;
+
+/// Genesi's brand green (#0F8F6A), used for the app mark in the title bar.
+const GENESI_GREEN: ColorU = ColorU {
+    r: 15,
+    g: 143,
+    b: 106,
+    a: 255,
+};
 
 fn genesi_shell_panel_border() -> ColorU {
     ColorU::new(255, 255, 255, 38)
@@ -19796,13 +19808,20 @@ impl Workspace {
 
     fn render_genesi_app_switcher(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let active = theme.active_ui_text_color();
+        let _ = theme;
 
+        // The Genesi Code mark. This slot used to show a generic four-square grid
+        // glyph that looked like an app-switcher button but was not clickable and
+        // did nothing — the leaf is what belongs here. The asset carries its own
+        // green, so it is drawn unrecoloured.
         let logo = Container::new(
-            ConstrainedBox::new(icons::Icon::Grid.to_warpui_icon(active).finish())
-                .with_width(18.)
-                .with_height(18.)
-                .finish(),
+            ConstrainedBox::new(
+                warpui::elements::Icon::new("bundled/svg/warp-logo-light.svg", GENESI_GREEN)
+                    .finish(),
+            )
+            .with_width(18.)
+            .with_height(18.)
+            .finish(),
         )
         .with_margin_right(8.)
         .finish();
@@ -20068,10 +20087,22 @@ impl Workspace {
             .with_child(
                 Expanded::new(
                     1.,
-                    self.wrap_in_main_surface(
-                        appearance,
-                        ChildView::new(&self.local_ai_panel).finish(),
-                    ),
+                    // One large rounded card with padding, holding the whole
+                    // conversation. The tint is a very shallow vertical gradient
+                    // in the Genesi green rather than a flat block of colour — a
+                    // plain gradient fill, so nothing extra to rasterise.
+                    Container::new(ChildView::new(&self.local_ai_panel).finish())
+                        .with_background(Fill::VerticalGradient(VerticalGradient::new(
+                            ColorU::new(24, 38, 33, 255),
+                            ColorU::new(17, 20, 22, 255),
+                        )))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                            GENESI_VIBE_CARD_RADIUS,
+                        )))
+                        .with_margin_top(GENESI_SHELL_PANEL_GAP)
+                        .with_margin_bottom(GENESI_SHELL_PANEL_GAP)
+                        .with_margin_right(GENESI_SHELL_PANEL_GAP)
+                        .finish(),
                 )
                 .finish(),
             );
@@ -24468,35 +24499,54 @@ impl TypedActionView for Workspace {
                 });
                 ctx.notify();
             }
+            // EVERY canvas action below must notify the WORKSPACE, not just the
+            // panel. The canvas is rendered by
+            // `render_resizable_genesi_tools_panel`, which calls
+            // `local_ai_panel.as_ref(app).render_review_sidebar(..)` — an inline
+            // render, NOT a ChildView — so the canvas elements belong to this
+            // view's element tree. A `ctx.notify()` inside the panel marks the
+            // panel dirty and leaves the workspace clean, so the state changed
+            // but nothing repainted: dragging felt frozen and a node click did
+            // nothing until some other workspace-owned element (hovering the node
+            // palette) forced a repaint and revealed the already-applied state.
+            // Selecting a node was the one action that worked, purely because it
+            // happened to call ctx.notify() here.
             AutoArrangeGenesiCanvas => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.auto_arrange_project_canvas(ctx));
+                ctx.notify();
             }
             FitGenesiCanvas => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.fit_project_canvas(ctx));
+                ctx.notify();
             }
             ZoomGenesiCanvas(delta) => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.zoom_project_canvas(*delta, ctx));
+                ctx.notify();
             }
             PanGenesiCanvas(delta) => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.pan_project_canvas(*delta, ctx));
+                ctx.notify();
             }
             BeginGenesiCanvasDrag { node_id, pointer } => {
                 self.local_ai_panel.update(ctx, |panel, ctx| {
                     panel.begin_project_canvas_drag(node_id.clone(), *pointer, ctx)
                 });
+                ctx.notify();
             }
             UpdateGenesiCanvasDrag(pointer) => {
                 self.local_ai_panel.update(ctx, |panel, ctx| {
                     panel.update_project_canvas_drag(*pointer, ctx)
                 });
+                ctx.notify();
             }
             EndGenesiCanvasDrag => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.end_project_canvas_drag(ctx));
+                ctx.notify();
             }
             SelectGenesiCanvasNode(id) => {
                 self.local_ai_panel
