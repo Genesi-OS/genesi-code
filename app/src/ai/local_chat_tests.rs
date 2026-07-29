@@ -53,36 +53,30 @@ fn an_ollama_tag_keeps_the_selected_endpoint() {
 }
 
 #[test]
-fn reasoning_only_chunks_still_produce_text() {
+fn a_reasoning_delta_is_parsed_separately_from_the_answer() {
     // gpt-oss and other thinking models leave `content` empty and stream their
-    // work in `reasoning_content`; reading only `content` made them look like
-    // they answered nothing.
+    // work in `reasoning_content`. Both fields must survive deserialization: the
+    // stream reports them as different items so the agent loop can show the
+    // thinking without parsing tool calls out of it.
     let chunk: ChatChunk = serde_json::from_str(
         r#"{"choices":[{"delta":{"content":"","reasoning_content":"weighing options"}}]}"#,
     )
     .expect("chunk should parse");
     let delta = &chunk.choices[0].delta;
-    let text = delta
-        .content
-        .clone()
-        .filter(|c| !c.is_empty())
-        .or(delta.reasoning_content.clone());
-    assert_eq!(text.as_deref(), Some("weighing options"));
+    assert_eq!(delta.content.as_deref(), Some(""));
+    assert_eq!(delta.reasoning_content.as_deref(), Some("weighing options"));
 }
 
 #[test]
-fn content_wins_over_reasoning_when_both_are_present() {
-    let chunk: ChatChunk = serde_json::from_str(
-        r#"{"choices":[{"delta":{"content":"the answer","reasoning_content":"scratch"}}]}"#,
-    )
-    .expect("chunk should parse");
+fn a_delta_without_reasoning_still_parses() {
+    // Regression guard: the field is optional, so a server that never sends it
+    // (every non-thinking model) must not fail to deserialize.
+    let chunk: ChatChunk =
+        serde_json::from_str(r#"{"choices":[{"delta":{"content":"the answer"}}]}"#)
+            .expect("chunk should parse");
     let delta = &chunk.choices[0].delta;
-    let text = delta
-        .content
-        .clone()
-        .filter(|c| !c.is_empty())
-        .or(delta.reasoning_content.clone());
-    assert_eq!(text.as_deref(), Some("the answer"));
+    assert_eq!(delta.content.as_deref(), Some("the answer"));
+    assert!(delta.reasoning_content.is_none());
 }
 
 #[test]

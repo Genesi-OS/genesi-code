@@ -811,10 +811,15 @@ impl LocalAiChatView {
             move |me, (served, local), ctx| {
                 let reachable = served.is_ok();
                 let mut models = served.unwrap_or_default();
-                // A GGUF the server happens to have open is already listed by
-                // /v1/models under its file path; keep the stable `gguf:` form as
-                // the single way to name it so the picker has no duplicates.
-                models.retain(|m| !is_gguf_ref(m));
+                // Drop llama-server's self-report. On :11435 `/v1/models` answers
+                // with the FILE it currently has open — a .gguf path, or an
+                // extensionless ollama blob like
+                // `/var/lib/ollama/blobs/sha256-7da77af9f7ccdff`. Neither is a
+                // model you can choose: they only describe what Turbo already
+                // loaded, and listing them put that hash in the picker as if it
+                // were a model name. The real choices are the ollama tags and the
+                // GGUF library, both added below.
+                models.retain(|m| !is_gguf_ref(m) && !m.contains('/'));
                 me.gguf_labels = local.iter().cloned().collect();
                 models.extend(local.into_iter().map(|(reference, _)| reference));
 
@@ -1258,6 +1263,19 @@ impl LocalAiChatView {
                 self.scroll_to_bottom();
                 ctx.notify();
             }
+            // Thinking is shown live but MUST NOT enter agent_step_buffer: that
+            // buffer is what parse_tool_call reads, and a reasoning model's
+            // narration there ("I'll create index.html…") is parsed as the final
+            // answer, so the tool never runs and the model only appears to act.
+            Ok(ChatStreamItem::Reasoning(thinking)) => {
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == ChatRole::Thought {
+                        last.text.push_str(&thinking);
+                    }
+                }
+                self.scroll_to_bottom();
+                ctx.notify();
+            }
             // The step is settled in `on_agent_step_end`.
             Ok(ChatStreamItem::Done) => {}
             Err(e) => self.finish_agent_with_error(
@@ -1670,7 +1688,9 @@ impl LocalAiChatView {
             return; // a stopped / superseded turn
         }
         match item {
-            Ok(ChatStreamItem::Token(token)) => {
+            // Plain chat has no tool parsing, so a thinking model's reasoning is
+            // simply shown — seeing it beats an empty bubble while it works.
+            Ok(ChatStreamItem::Token(token)) | Ok(ChatStreamItem::Reasoning(token)) => {
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == ChatRole::Assistant {
                         last.text.push_str(&token);

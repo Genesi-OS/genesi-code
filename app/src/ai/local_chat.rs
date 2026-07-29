@@ -146,6 +146,11 @@ fn fenced(language: &str, text: &str) -> String {
 pub enum ChatStreamItem {
     /// A chunk of assistant text to append.
     Token(String),
+    /// A chunk of a reasoning model's chain-of-thought. Kept SEPARATE from
+    /// `Token` because the agent loop parses tool calls out of the answer: mixing
+    /// the model's thinking into that buffer means it parses narration ("I will
+    /// create the file…") instead of the `<tool:…>` tag it was looking for.
+    Reasoning(String),
     /// The model finished this turn cleanly.
     Done,
 }
@@ -443,23 +448,25 @@ fn stream_chat_openai_sse(
                 }
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
-                        // Prefer the answer; fall back to the reasoning stream so
-                        // a thinking model shows its work instead of nothing.
-                        let text: String = chunk
-                            .choices
-                            .into_iter()
-                            .filter_map(|choice| {
-                                choice
-                                    .delta
-                                    .content
-                                    .filter(|content| !content.is_empty())
-                                    .or(choice.delta.reasoning_content)
-                            })
-                            .collect();
-                        if text.is_empty() {
-                            None
+                        // The answer and the thinking are reported separately, so
+                        // a thinking model shows progress without its reasoning
+                        // being mistaken for the answer.
+                        let mut answer = String::new();
+                        let mut thinking = String::new();
+                        for choice in chunk.choices {
+                            if let Some(content) = choice.delta.content {
+                                answer.push_str(&content);
+                            }
+                            if let Some(reasoning) = choice.delta.reasoning_content {
+                                thinking.push_str(&reasoning);
+                            }
+                        }
+                        if !answer.is_empty() {
+                            Some(Ok(ChatStreamItem::Token(answer)))
+                        } else if !thinking.is_empty() {
+                            Some(Ok(ChatStreamItem::Reasoning(thinking)))
                         } else {
-                            Some(Ok(ChatStreamItem::Token(text)))
+                            None
                         }
                     }
                     Err(err) => {
