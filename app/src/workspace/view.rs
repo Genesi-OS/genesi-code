@@ -69,7 +69,7 @@ use warp_core::semantic_selection::SemanticSelection;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::phenomenon::PhenomenonStyle;
-use warp_core::ui::theme::{Fill, VerticalGradient};
+use warp_core::ui::theme::Fill;
 use warp_core::ui::Icon;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_editor::editor::NavigationKey;
@@ -681,6 +681,14 @@ fn genesi_shell_panel_surface() -> ColorU {
 /// Corner radius of vibe mode's conversation card. Larger than the docked
 /// panels' so the mode reads as one soft surface rather than another window.
 const GENESI_VIBE_CARD_RADIUS: f32 = 18.0;
+
+/// Fill of that card: neutral, one step lighter than the window behind it.
+const GENESI_VIBE_CARD_SURFACE: ColorU = ColorU {
+    r: 26,
+    g: 27,
+    b: 30,
+    a: 255,
+};
 
 /// Genesi's brand green (#0F8F6A), used for the app mark in the title bar.
 const GENESI_GREEN: ColorU = ColorU {
@@ -20088,14 +20096,12 @@ impl Workspace {
                 Expanded::new(
                     1.,
                     // One large rounded card with padding, holding the whole
-                    // conversation. The tint is a very shallow vertical gradient
-                    // in the Genesi green rather than a flat block of colour — a
-                    // plain gradient fill, so nothing extra to rasterise.
+                    // conversation. A single neutral surface a step lighter than
+                    // the window behind it: the green wash read as a tinted block
+                    // rather than as depth, and a gradient was never what gave the
+                    // card its shape — the radius and the surrounding gap are.
                     Container::new(ChildView::new(&self.local_ai_panel).finish())
-                        .with_background(Fill::VerticalGradient(VerticalGradient::new(
-                            ColorU::new(24, 38, 33, 255),
-                            ColorU::new(17, 20, 22, 255),
-                        )))
+                        .with_background_color(GENESI_VIBE_CARD_SURFACE)
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
                             GENESI_VIBE_CARD_RADIUS,
                         )))
@@ -20836,10 +20842,11 @@ impl Workspace {
         .with_height(TAB_BAR_HEIGHT)
         .finish();
 
-        let tab_bar_border =
-            Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(appearance.theme().outline());
+        // The top bar is part of the window, not a panel: no rule under it and no
+        // fill of its own, so it reads as the same surface as everything below.
+        let tab_bar_border = Border::bottom(0.);
 
-        let mut tab_bar_container = Container::new(
+        let tab_bar_container = Container::new(
             EventHandler::new(Clipped::new(self.render_tab_bar_hoverable(bar_contents)).finish())
                 .on_back_mouse_down(move |ctx, _app, _position| {
                     ctx.dispatch_typed_action(WorkspaceAction::ActivatePrevTab);
@@ -20852,10 +20859,7 @@ impl Workspace {
                 .finish(),
         )
         .with_border(tab_bar_border);
-        if FeatureFlag::NewTabStyling.is_enabled() {
-            tab_bar_container = tab_bar_container
-                .with_background(internal_colors::fg_overlay_1(appearance.theme()));
-        }
+        // Deliberately unfilled — see tab_bar_border above.
         let tab_bar_element = tab_bar_container.finish();
 
         let dimming_color = appearance.theme().background().into();

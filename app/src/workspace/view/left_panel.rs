@@ -1237,12 +1237,21 @@ impl View for LeftPanelView {
         // (see render_button), so the strip reads as a set of tabs.
         let rail = toolbelt
             .map(|toolbelt| {
+                let card = Container::new(toolbelt)
+                    .with_horizontal_padding(6.)
+                    .with_vertical_padding(8.)
+                    .with_background(internal_colors::fg_overlay_1(appearance.theme()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                    .finish();
+                // The row stretches its children to full height, which dragged the
+                // card's fill all the way down the window. Pair it with a
+                // flexible spacer so the painted card ends at the last icon and
+                // only the empty space below it stretches.
                 Container::new(
-                    Container::new(toolbelt)
-                        .with_horizontal_padding(6.)
-                        .with_vertical_padding(8.)
-                        .with_background(internal_colors::fg_overlay_1(appearance.theme()))
-                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                    Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(card)
+                        .with_child(Expanded::new(1., Empty::new().finish()).finish())
                         .finish(),
                 )
                 .with_margin_right(RAIL_CARD_GAP)
