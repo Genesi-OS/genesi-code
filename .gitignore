@@ -57,6 +57,11 @@ app/src/persistence/schema.rs.orig
 # Don't include Claude Code scheduled task lock
 .claude/scheduled_tasks.lock
 
+# Don't include local agent-tooling state: Codex CLI config and
+# oh-my-claudecode sessions/memory. Per-machine, not part of the project.
+.codex/
+.omc/
+
 # Don't include ctags output
 tags
 
