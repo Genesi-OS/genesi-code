@@ -113,3 +113,61 @@ fn the_prompt_tells_the_model_where_the_tag_must_go() {
         "the harmony guidance should stay in the agent prompt"
     );
 }
+
+#[test]
+fn narrating_a_tool_is_not_calling_it() {
+    // The gpt-oss failure on hardware: it says what it will do and stops.
+    assert!(announced_tool_without_calling(
+        "I'll use list_files to look at the project."
+    ));
+    assert!(announced_tool_without_calling("Vou usar o read_file agora"));
+}
+
+#[test]
+fn a_real_call_is_not_treated_as_narration() {
+    // Prose AROUND a real tag is still a call — do not re-prompt over it.
+    assert!(!announced_tool_without_calling(
+        "Let me look: <tool:list_files path=\".\"/>"
+    ));
+    assert!(!announced_tool_without_calling("<tool:read_file path=\"a.rs\"/>"));
+}
+
+#[test]
+fn an_ordinary_answer_is_left_alone() {
+    assert!(!announced_tool_without_calling(
+        "The bug is in the retry loop: it never resets the counter."
+    ));
+    assert!(!announced_tool_without_calling(""));
+}
+
+#[test]
+fn every_advertised_tool_schema_maps_back_to_a_tool() {
+    // The schema names are what a tool-native model will call, so each one must
+    // round-trip through tool_from_native_call or the call would be dropped.
+    let schemas = tool_schemas();
+    let entries = schemas.as_array().expect("an array of tools");
+    assert_eq!(entries.len(), TOOL_NAMES.len());
+    for entry in entries {
+        let name = entry["function"]["name"].as_str().expect("a name");
+        assert!(
+            TOOL_NAMES.contains(&name),
+            "{name} is advertised but not a known tool"
+        );
+        // Feed it the arguments its own schema declares required.
+        let mut args = serde_json::Map::new();
+        for required in entry["function"]["parameters"]["required"]
+            .as_array()
+            .expect("a required list")
+        {
+            args.insert(
+                required.as_str().expect("a string").to_string(),
+                serde_json::Value::String("x".to_string()),
+            );
+        }
+        let json = serde_json::to_string(&args).expect("serializes");
+        assert!(
+            tool_from_native_call(name, &json).is_some(),
+            "{name} advertises arguments it can't be built from: {json}"
+        );
+    }
+}

@@ -1175,6 +1175,19 @@ pub fn init(app: &mut AppContext) {
     .with_context_predicate(id!("Workspace"))
     .with_key_binding(cmd_or_ctrl_shift("g"))]);
 
+    // Genesi: open a terminal in the CURRENT tab. Without this, once the terminal
+    // pane is closed the only way back to a shell is a whole new tab
+    // (ctrl-shift-t), which navigates away from the code you were working on.
+    // Registered as an editable binding, so ctrl-' is only the default.
+    app.register_editable_bindings([EditableBinding::new(
+        "workspace:open_terminal_pane",
+        "Open terminal in this tab",
+        WorkspaceAction::OpenGenesiTerminalTool,
+    )
+    .with_group(bindings::BindingGroup::Navigation.as_str())
+    .with_context_predicate(id!("Workspace"))
+    .with_key_binding("ctrl-'")]);
+
     app.register_editable_bindings([
         EditableBinding::new(
             "workspace:create_team_env_vars",

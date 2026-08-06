@@ -49,6 +49,7 @@ use crate::menu::{Menu, MenuItem, MenuItemFields};
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::server::telemetry::TelemetryEvent;
+use crate::ai::local_chat_panel::{LocalAiChatView, LocalAiDropTargetData};
 use crate::terminal::input::InputDropTargetData;
 use crate::terminal::view::{TerminalDropTargetData, TerminalView};
 use crate::ui_components::icons::Icon;
@@ -140,6 +141,12 @@ pub enum FileTreeAction {
     ItemDroppedOnTerminal {
         id: FileTreeIdentifier,
         terminal_view: WeakViewHandle<TerminalView>,
+    },
+    /// Dropped on the Genesi AI compose box: attach the file to the conversation
+    /// as a reference rather than typing its path anywhere.
+    ItemDroppedOnLocalAi {
+        id: FileTreeIdentifier,
+        panel: WeakViewHandle<LocalAiChatView>,
     },
 }
 
@@ -2207,7 +2214,8 @@ impl FileTreeView {
             })
             .use_copy_cursor_when_dragging_over_drop_target()
             .with_accepted_by_drop_target_fn(move |drop_target_data, _| {
-                // Allow drops on terminal input and terminal block list
+                // Allow drops on terminal input, the terminal block list, and the
+                // Genesi AI compose box (which takes the file as a reference).
                 if drop_target_data
                     .as_any()
                     .downcast_ref::<InputDropTargetData>()
@@ -2215,6 +2223,10 @@ impl FileTreeView {
                     || drop_target_data
                         .as_any()
                         .downcast_ref::<TerminalDropTargetData>()
+                        .is_some()
+                    || drop_target_data
+                        .as_any()
+                        .downcast_ref::<LocalAiDropTargetData>()
                         .is_some()
                 {
                     AcceptedByDropTarget::Yes
@@ -2238,6 +2250,14 @@ impl FileTreeView {
                     ctx.dispatch_typed_action(FileTreeAction::ItemDroppedOnTerminal {
                         id: id_for_drop.clone(),
                         terminal_view: terminal_drop_data.terminal_view.clone(),
+                    });
+                } else if let Some(local_ai_data) = data
+                    .as_ref()
+                    .and_then(|data| data.as_any().downcast_ref::<LocalAiDropTargetData>())
+                {
+                    ctx.dispatch_typed_action(FileTreeAction::ItemDroppedOnLocalAi {
+                        id: id_for_drop.clone(),
+                        panel: local_ai_data.panel(),
                     });
                 }
             })
@@ -3357,6 +3377,22 @@ impl TypedActionView for FileTreeView {
                 terminal_view.update(ctx, |view, ctx| {
                     view.handle_file_tree_drop_on_active_command(&file_path, ctx);
                 });
+            }
+            FileTreeAction::ItemDroppedOnLocalAi { id, panel } => {
+                // The AI panel wants an ABSOLUTE path (it reads the file at send
+                // time), so take the item's own path rather than the tree-relative
+                // one the terminal input uses.
+                let Some(root_dir) = self.root_directories.get(&id.root) else {
+                    return;
+                };
+                let Some(item) = root_dir.items.get(id.index) else {
+                    return;
+                };
+                let path = PathBuf::from(item.path().as_str());
+                let Some(panel) = panel.upgrade(ctx) else {
+                    return;
+                };
+                panel.update(ctx, |panel, ctx| panel.attach_dropped_path(path, ctx));
             }
         }
     }

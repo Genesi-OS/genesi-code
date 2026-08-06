@@ -25,10 +25,10 @@ use warpui::clipboard::ClipboardContent;
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler,
-    Expanded, Fill, Flex, FormattedTextElement, Icon, MainAxisAlignment, MainAxisSize,
-    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth,
-    SelectableArea, SelectionHandle, Shrinkable, Stack,
+    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DropTarget, DropTargetData,
+    Element, Empty, EventHandler, Expanded, Fill, Flex, FormattedTextElement, Icon,
+    MainAxisAlignment, MainAxisSize, OffsetPositioning, ParentAnchor, ParentElement,
+    ParentOffsetBounds, Radius, ScrollbarWidth, SelectableArea, SelectionHandle, Shrinkable, Stack,
 };
 use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::keymap::FixedBinding;
@@ -38,7 +38,7 @@ use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::units::Pixels;
 use warpui::{
     AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
+    ViewHandle, WeakViewHandle,
 };
 use warpui_extras::secure_storage::AppContextExt as _;
 
@@ -46,10 +46,10 @@ use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
     load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
-    model_supports_vision, set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for,
-    turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem,
-    CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
-    CLOUD_KEYS_STORAGE_KEY,
+    is_tools_unsupported_error, model_supports_vision, set_ai_mode_force, stream_chat,
+    stream_chat_cloud, transport_for, turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment,
+    ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext,
+    LocalEndpoint, CLOUD_KEYS_STORAGE_KEY, DEFAULT_LOCAL_BASE_URL,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -88,6 +88,39 @@ const SYSTEM_PROMPT: &str =
 /// its answer channel; asking again costs one round trip and usually gets the
 /// tool call. Bounded so a model that ONLY ever thinks can't spin forever.
 const MAX_AGENT_NUDGES: u32 = 2;
+
+/// Marks the AI panel's compose box as a place the file tree can drop onto, so a
+/// file can be dragged straight into the conversation as a reference — the same
+/// gesture that already drops a file onto the terminal input.
+#[derive(Debug, Clone)]
+pub struct LocalAiDropTargetData {
+    panel: WeakViewHandle<LocalAiChatView>,
+}
+
+impl LocalAiDropTargetData {
+    pub fn panel(&self) -> WeakViewHandle<LocalAiChatView> {
+        self.panel.clone()
+    }
+}
+
+impl DropTargetData for LocalAiDropTargetData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Whether the active server accepts the OpenAI `tools` field. Learned at
+/// runtime rather than configured: llama-server only takes it when built/started
+/// with `--jinja`, and there is no capability endpoint to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeToolSupport {
+    /// Not yet established — send tools and find out.
+    Untried,
+    /// A request with tools was accepted.
+    Supported,
+    /// The server refused the field; stop sending it for this session.
+    Unsupported,
+}
 
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
@@ -512,6 +545,9 @@ pub enum LocalAiChatAction {
 }
 
 pub struct LocalAiChatView {
+    /// Handle to this view, so the compose box can advertise itself as a drop
+    /// target (render only sees `&AppContext`, which can't produce one).
+    weak_handle: WeakViewHandle<Self>,
     input: ViewHandle<SubmittableTextInput>,
     messages: Vec<ChatEntry>,
     active_chat_id: String,
@@ -591,6 +627,8 @@ pub struct LocalAiChatView {
     /// reasoning channel. Bounded by [`MAX_AGENT_NUDGES`] so a model that always
     /// thinks and never speaks can't loop forever.
     agent_nudges: u32,
+    /// Whether this session's server takes the OpenAI `tools` field.
+    native_tools: NativeToolSupport,
     /// Summary of the tool currently running, used to render its step.
     agent_tool_summary: String,
 
@@ -659,6 +697,7 @@ impl LocalAiChatView {
         });
 
         let mut view = Self {
+            weak_handle: ctx.handle(),
             input,
             messages: Vec::new(),
             active_chat_id: String::new(),
@@ -692,6 +731,7 @@ impl LocalAiChatView {
             agent_reasoning_buffer: String::new(),
             agent_native_call: None,
             agent_nudges: 0,
+            native_tools: NativeToolSupport::Untried,
             agent_tool_summary: String::new(),
             auto_approve: false,
             pending_tool: None,
@@ -757,12 +797,19 @@ impl LocalAiChatView {
     /// different model — or none — and returns nothing, which is precisely the
     /// "runs a few seconds and answers nothing" failure.
     fn ensure_model_ready(&mut self, model: String, ctx: &mut ViewContext<Self>) {
-        if self.cloud_active || !is_gguf_ref(&model) {
+        if self.cloud_active {
             return;
         }
-        if self.endpoint != LocalEndpoint::Turbo {
+        // A GGUF can only be loaded by llama-server, so choosing one chooses Turbo.
+        if is_gguf_ref(&model) && self.endpoint != LocalEndpoint::Turbo {
             self.endpoint = LocalEndpoint::Turbo;
             self.endpoint_user_chosen = true;
+        }
+        // Ollama serves its own tags with no help. Only Turbo has to be TOLD what
+        // to load — and it does have to be told for a plain tag too, or it keeps
+        // serving whatever model it happened to have open.
+        if self.endpoint != LocalEndpoint::Turbo {
+            return;
         }
         if self.preparing_model.as_deref() == Some(model.as_str()) {
             return; // already bringing this one up
@@ -806,17 +853,24 @@ impl LocalAiChatView {
         ctx: &mut ViewContext<Self>,
     ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
         self.load_cloud_keys(ctx);
+        // Hand a tool-native model a real schema when we're driving the agent and
+        // the server is known to take one. gpt-oss reaches for its own tool
+        // channel however the prompt is worded, so the text protocol alone leaves
+        // it narrating ("I'll use list_files") instead of acting.
+        let tools = (self.agent_mode && self.native_tools != NativeToolSupport::Unsupported)
+            .then(local_agent::tool_schemas);
         if self.cloud_active && self.cloud_ready() {
             stream_chat_cloud(
                 self.cloud.provider,
                 model,
                 self.active_cloud_key().to_string(),
                 messages,
+                tools,
             )
         } else {
             // The transport is decided by the MODEL, not by `self.endpoint`
             // alone — see transport_for.
-            stream_chat(transport_for(model, self.endpoint), model, messages)
+            stream_chat(transport_for(model, self.endpoint), model, messages, tools)
         }
     }
 
@@ -832,7 +886,15 @@ impl LocalAiChatView {
         if self.cloud_active {
             return;
         }
-        let base = self.endpoint.base_url().to_string();
+        // ALWAYS enumerate ollama, whichever endpoint is selected. Asking Turbo
+        // instead only ever returns the one file llama-server has open (which is
+        // then filtered out below), so on Turbo the list collapsed to the GGUF
+        // library alone: a model fetched with `ollama pull` vanished, and the
+        // selection re-anchored to the first GGUF — which is why picking Turbo
+        // kept showing gpt-oss no matter what was actually loaded. Turbo can
+        // serve an ollama tag perfectly well (`genesi-ai-turbo serve <tag>`
+        // resolves it to its blob), so both endpoints offer the same list.
+        let base = DEFAULT_LOCAL_BASE_URL.to_string();
         // Turbo (llama-server) already has its model loaded and its `/v1/models`
         // isn't a reliable signal, so an empty/failed list there is not an error —
         // readiness comes from the `/health` probe below instead.
@@ -840,10 +902,9 @@ impl LocalAiChatView {
         ctx.spawn(
             async move {
                 // Two sources, one list. `/v1/models` only knows what ollama
-                // pulled (or the single file llama-server has open), so a GGUF
-                // the user imported into Genesi is invisible to it — ask
-                // genesi-ai-turbo for the library too, exactly like the AI Mode
-                // Monitor does, so both apps offer the same models.
+                // pulled, so a GGUF the user imported into Genesi is invisible to
+                // it — ask genesi-ai-turbo for the library too, exactly like the
+                // AI Mode Monitor does, so both apps offer the same models.
                 let served = list_models(&base).await;
                 let local = list_gguf_models().await;
                 (served, local)
@@ -1142,9 +1203,11 @@ impl LocalAiChatView {
             ctx.notify();
             return;
         }
-        // Picked a GGUF but the server isn't up (Code restarted, or Turbo was
-        // stopped elsewhere)? Bring it back rather than failing the turn.
-        if is_gguf_ref(&model) && !self.turbo_available {
+        // Headed for Turbo but the server isn't up (Code restarted, or Turbo was
+        // stopped elsewhere)? Bring it back rather than failing the turn. Keyed on
+        // the TRANSPORT, not on the model being a GGUF: an ollama tag served
+        // through Turbo needs the server just as much.
+        if transport_for(&model, self.endpoint) == LocalEndpoint::Turbo && !self.turbo_available {
             self.ensure_model_ready(model.clone(), ctx);
             self.error = Some(format!(
                 "Loading {} — press send again once it's ready.",
@@ -1324,6 +1387,13 @@ impl LocalAiChatView {
         }
     }
 
+    /// Attach a file dragged out of the file tree. Public because the drop is
+    /// handled where the drag started (the file tree owns the path), and it lands
+    /// here through [`LocalAiDropTargetData`].
+    pub fn attach_dropped_path(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        self.attach_paths(std::iter::once(path), ctx);
+    }
+
     /// Handle a paste into the compose box. Returns true when the clipboard held
     /// files or an image, meaning it became attachments and the text must NOT
     /// also be typed into the box (pasting a file should not paste its path).
@@ -1474,11 +1544,34 @@ impl LocalAiChatView {
             }
             // The step is settled in `on_agent_step_end`.
             Ok(ChatStreamItem::Done) => {}
-            Err(e) => self.finish_agent_with_error(
-                turn,
-                format!("{}: {e}", self.active_backend_error_label()),
-                ctx,
-            ),
+            Err(e) => {
+                let message = e.to_string();
+                // The server doesn't take the `tools` field (llama-server without
+                // `--jinja`). That's a capability mismatch, not a failed turn:
+                // remember it, drop the field, and run the step again on the text
+                // protocol — which is what every model had before.
+                if self.native_tools != NativeToolSupport::Unsupported
+                    && is_tools_unsupported_error(&message)
+                {
+                    log::info!("local chat: server rejected `tools`, falling back to the text protocol ({message})");
+                    self.native_tools = NativeToolSupport::Unsupported;
+                    // Drop this step's empty thought bubble; run_agent_step opens
+                    // a fresh one, and two would stack up.
+                    if let Some(last) = self.messages.last() {
+                        if last.role == ChatRole::Thought && last.text.trim().is_empty() {
+                            self.messages.pop();
+                        }
+                    }
+                    self.run_agent_step(ctx);
+                    ctx.notify();
+                    return;
+                }
+                self.finish_agent_with_error(
+                    turn,
+                    format!("{}: {message}", self.active_backend_error_label()),
+                    ctx,
+                )
+            }
         }
     }
 
@@ -1487,33 +1580,38 @@ impl LocalAiChatView {
             return; // already errored out, stopped, or superseded
         }
         let mut reply = self.agent_step_buffer.trim().to_string();
+        let budget_left = self.agent_step < MAX_AGENT_STEPS;
+
+        // 1. A NATIVE tool call, on the model's own tool channel. Checked before
+        //    anything else because a tool-native model often narrates in `content`
+        //    AND calls in the same step — the call is the part that matters.
+        if let Some(tool) = self.take_native_tool_call().filter(|_| budget_left) {
+            self.native_tools = NativeToolSupport::Supported;
+            // Record it in the TEXT protocol so the history stays in the one shape
+            // the next step is asked to produce.
+            self.agent_messages
+                .push(ChatMessage::assistant(tool.to_tag()));
+            let said = if reply.is_empty() {
+                self.agent_reasoning_buffer.trim().to_string()
+            } else {
+                reply.clone()
+            };
+            self.finalize_thought(&said, true);
+            if tool.requires_approval() && !self.auto_approve {
+                self.pending_tool = Some(tool);
+                self.scroll_to_bottom();
+                ctx.notify();
+            } else {
+                self.start_tool(tool, ctx);
+            }
+            return;
+        }
 
         // A harmony model (gpt-oss and friends) writes its analysis to one channel
         // and its answer to another; when it decides to ACT, everything it emits
         // can land outside `content`. So an empty answer here does not mean the
-        // model said nothing — check the other two channels before giving up.
-        let budget_left = self.agent_step < MAX_AGENT_STEPS;
+        // model said nothing — check the other channel before giving up.
         if reply.is_empty() {
-            // 1. A native tool call on the model's own tool channel. It never had
-            //    our tool list, so it calls the names the system prompt taught it;
-            //    map those onto the same tools the text protocol drives.
-            if let Some(tool) = self.take_native_tool_call().filter(|_| budget_left) {
-                // Record it in the TEXT protocol so the history stays in the one
-                // shape the next step is asked to produce.
-                self.agent_messages
-                    .push(ChatMessage::assistant(tool.to_tag()));
-                let thinking = self.agent_reasoning_buffer.trim().to_string();
-                self.finalize_thought(&thinking, true);
-                if tool.requires_approval() && !self.auto_approve {
-                    self.pending_tool = Some(tool);
-                    self.scroll_to_bottom();
-                    ctx.notify();
-                } else {
-                    self.start_tool(tool, ctx);
-                }
-                return;
-            }
-
             let thinking = self.agent_reasoning_buffer.trim().to_string();
             if !thinking.is_empty() {
                 if local_agent::parse_tool_call(&thinking).is_some() {
@@ -1571,6 +1669,25 @@ impl LocalAiChatView {
                     return;
                 }
                 self.start_tool(tool, ctx);
+            }
+            // The model SAID it would use a tool and then didn't — the exact
+            // gpt-oss failure where "I'll use list_files" ends the turn with
+            // nothing run. Narrating an intent is not a call, so push back
+            // instead of accepting it as the answer.
+            None if budget_left
+                && self.agent_nudges < MAX_AGENT_NUDGES
+                && local_agent::announced_tool_without_calling(&reply) =>
+            {
+                self.agent_nudges += 1;
+                self.agent_messages.push(ChatMessage::user(
+                    "You described a tool instead of calling one, so nothing ran. \
+                     Call it now: reply with ONLY the tool tag and no other text, \
+                     for example <tool:list_files path=\".\"/>."
+                        .to_string(),
+                ));
+                self.finalize_thought(&reply, true);
+                self.run_agent_step(ctx);
+                ctx.notify();
             }
             _ => {
                 // No tool call (or the step budget is spent): the reply is the
@@ -5240,6 +5357,7 @@ impl LocalAiChatView {
         let added: u32 = self.pending_edits.iter().map(|e| e.added).sum();
         let removed: u32 = self.pending_edits.iter().map(|e| e.removed).sum();
         let label = format!("> {n} file{} need review", if n == 1 { "" } else { "s" });
+        let close_icon_color: ColorU = theme.sub_text_color(theme.background()).into();
 
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -5283,6 +5401,30 @@ impl LocalAiChatView {
                 LocalAiChatAction::KeepEdits,
                 true,
             ))
+            // A way OUT of the bar. Closing it means the edits stay on disk — the
+            // same outcome as Keep All, which is why it dispatches that rather
+            // than inventing a third, vaguer state.
+            .with_child(
+                EventHandler::new(
+                    Container::new(
+                        ConstrainedBox::new(
+                            Icon::new("bundled/svg/x-close.svg", close_icon_color).finish(),
+                        )
+                        .with_width(11.)
+                        .with_height(11.)
+                        .finish(),
+                    )
+                    .with_uniform_padding(5.)
+                    .with_margin_left(2.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(LocalAiChatAction::KeepEdits);
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+            )
             .finish();
 
         let column = Flex::column()
@@ -6172,6 +6314,13 @@ impl TypedActionView for LocalAiChatView {
                     // ollama here would guarantee an empty reply. Switch to
                     // Turbo and load the file.
                     Some(model) if is_gguf_ref(&model) => self.ensure_model_ready(model, ctx),
+                    // An ollama tag runs on EITHER transport. Forcing ollama here
+                    // silently kicked the user off Turbo every time they picked
+                    // one; keep the endpoint they chose, and if that's Turbo, tell
+                    // it which model to load.
+                    Some(model) if self.endpoint == LocalEndpoint::Turbo => {
+                        self.ensure_model_ready(model, ctx)
+                    }
                     _ => self.endpoint = LocalEndpoint::Ollama,
                 }
                 ctx.notify();
@@ -6187,7 +6336,13 @@ impl TypedActionView for LocalAiChatView {
                     // Turn Turbo on. refresh_models re-probes /health, so a stale
                     // turbo_available can't pin us to a dead endpoint for long.
                     self.endpoint = LocalEndpoint::Turbo;
-                    if !self.turbo_available {
+                    // Point Turbo at the model that is actually SELECTED. Without
+                    // this, switching endpoints just re-aimed the requests at
+                    // whatever llama-server already had open, so the picker and
+                    // the server disagreed about which model was answering.
+                    if let Some(model) = self.current_model() {
+                        self.ensure_model_ready(model, ctx);
+                    } else if !self.turbo_available {
                         self.error = Some(
                             "Turbo (genesi-ai-turbo) isn't up yet — start it and it'll be used \
                              automatically once /health responds."
@@ -6683,12 +6838,20 @@ impl View for LocalAiChatView {
         // No border: the card is separated from the panel by being LIGHTER, not by
         // an outline. genesi_card_surface sat within a point or two of the panel
         // fill, so the box was invisible against it.
-        let compose_box = Container::new(compose_inner)
-            .with_horizontal_padding(11.)
-            .with_vertical_padding(10.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
-            .with_background_color(genesi_compose_surface())
-            .finish();
+        // The compose box doubles as a drop target so a file dragged out of the
+        // file tree lands in the conversation as a reference.
+        let compose_box = DropTarget::new(
+            Container::new(compose_inner)
+                .with_horizontal_padding(11.)
+                .with_vertical_padding(10.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
+                .with_background_color(genesi_compose_surface())
+                .finish(),
+            LocalAiDropTargetData {
+                panel: self.weak_handle.clone(),
+            },
+        )
+        .finish();
         let compose_container = if self.vibe_mode {
             Container::new(
                 ConstrainedBox::new(compose_box)

@@ -420,6 +420,24 @@ struct ChatRequest<'a> {
     /// Ignored by cloud providers that don't know the field.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     cache_prompt: bool,
+    /// Function schemas for a model that calls tools natively. Omitted entirely
+    /// in plain chat, and dropped for good once a server rejects it (llama-server
+    /// needs `--jinja` to accept this field at all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+}
+
+/// Whether a server error is the "I don't do tools" refusal, meaning the request
+/// should be retried without the `tools` field rather than shown to the user.
+/// llama-server answers a tools request built without `--jinja` with exactly
+/// that complaint.
+pub fn is_tools_unsupported_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    (lowered.contains("tool") || lowered.contains("function"))
+        && (lowered.contains("jinja")
+            || lowered.contains("not supported")
+            || lowered.contains("unsupported")
+            || lowered.contains("unknown"))
 }
 
 /// Upper bound on one local reply. Generous enough for a full code block, small
@@ -603,11 +621,14 @@ pub fn stream_chat(
     endpoint: LocalEndpoint,
     model: &str,
     messages: Vec<ChatMessage>,
+    tools: Option<serde_json::Value>,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match endpoint {
+        // ollama's native API takes tools in its own shape and its support varies
+        // per model; the text protocol is what works there, so leave it alone.
         LocalEndpoint::Ollama => stream_chat_ollama_native(model.to_string(), messages).boxed(),
         LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), None, messages, None).boxed()
+            stream_chat_openai_sse(endpoint.base_url(), None, messages, None, tools).boxed()
         }
     }
 }
@@ -622,10 +643,18 @@ pub fn stream_chat_cloud(
     model: &str,
     api_key: String,
     messages: Vec<ChatMessage>,
+    tools: Option<serde_json::Value>,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match provider {
         CloudProviderKind::Anthropic => stream_chat_anthropic_sse(model, messages, api_key).boxed(),
-        _ => stream_chat_openai_sse(provider.base_url(), Some(model), messages, Some(api_key)).boxed(),
+        _ => stream_chat_openai_sse(
+            provider.base_url(),
+            Some(model),
+            messages,
+            Some(api_key),
+            tools,
+        )
+        .boxed(),
     }
 }
 
@@ -737,6 +766,7 @@ fn stream_chat_openai_sse(
     model: Option<&str>,
     messages: Vec<ChatMessage>,
     api_key: Option<String>,
+    tools: Option<serde_json::Value>,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // `model: None` means the local llama-server, which must NOT be sent one (see
@@ -750,6 +780,7 @@ fn stream_chat_openai_sse(
         stream: true,
         max_tokens: LOCAL_MAX_TOKENS,
         cache_prompt: is_local,
+        tools,
     };
 
     // `json()` serializes eagerly into the builder, so `body` (and its borrow of

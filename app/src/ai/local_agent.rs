@@ -153,6 +153,105 @@ impl AgentTool {
     }
 }
 
+/// Every tool name the protocol answers to, for prompts and detection.
+pub const TOOL_NAMES: &[&str] = &[
+    "list_files",
+    "read_file",
+    "grep",
+    "run_command",
+    "write_file",
+    "edit_file",
+];
+
+/// True when a reply TALKS about calling a tool but contains no actual call.
+///
+/// This is the gpt-oss failure on hardware: it answers "I'll use list_files" as
+/// plain prose and the turn ends, because narrating an intent is not a call. The
+/// loop uses this to re-prompt instead of accepting the narration as a final
+/// answer — a model that names a tool has not finished its work.
+pub fn announced_tool_without_calling(text: &str) -> bool {
+    if parse_tool_call(text).is_some() {
+        return false;
+    }
+    let lowered = text.to_ascii_lowercase();
+    TOOL_NAMES.iter().any(|name| lowered.contains(name))
+}
+
+/// The tools in the OpenAI function-calling schema, for models that call tools
+/// natively rather than by writing our tags.
+///
+/// gpt-oss is trained on the harmony format and reaches for its own tool channel
+/// no matter how the prompt is worded; handing it a real schema lets it do what
+/// it was trained to do. Declared only where the server understands the `tools`
+/// param — see the caller, which stops sending them if it doesn't.
+pub fn tool_schemas() -> serde_json::Value {
+    let function = |name: &str, description: &str, properties: serde_json::Value, required: &[&str]| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        })
+    };
+    let path = |description: &str| serde_json::json!({ "path": { "type": "string", "description": description } });
+    serde_json::json!([
+        function(
+            "list_files",
+            "List the files and folders at a path in the project. Use \".\" for the project root.",
+            path("Project-relative directory, \".\" for the root"),
+            &["path"],
+        ),
+        function(
+            "read_file",
+            "Read a file's contents.",
+            path("Project-relative path to the file"),
+            &["path"],
+        ),
+        function(
+            "grep",
+            "Search the project for text.",
+            serde_json::json!({
+                "query": { "type": "string", "description": "Text to search for" },
+                "path": { "type": "string", "description": "Project-relative directory to search, \".\" for the root" },
+            }),
+            &["query"],
+        ),
+        function(
+            "run_command",
+            "Run a shell command in the project root and return its output.",
+            serde_json::json!({
+                "command": { "type": "string", "description": "The shell command to run" },
+            }),
+            &["command"],
+        ),
+        function(
+            "write_file",
+            "Create a file, or overwrite one, with the complete given contents.",
+            serde_json::json!({
+                "path": { "type": "string", "description": "Project-relative path to write" },
+                "content": { "type": "string", "description": "The COMPLETE new contents of the file" },
+            }),
+            &["path", "content"],
+        ),
+        function(
+            "edit_file",
+            "Replace an exact snippet in an existing file. Read the file first so the search text matches character for character.",
+            serde_json::json!({
+                "path": { "type": "string", "description": "Project-relative path to edit" },
+                "search": { "type": "string", "description": "The EXACT existing text to replace" },
+                "replace": { "type": "string", "description": "The new text" },
+            }),
+            &["path", "search", "replace"],
+        ),
+    ])
+}
+
 /// Build a tool from a model's NATIVE (OpenAI-shaped) tool call: a function name
 /// plus a JSON argument object.
 ///

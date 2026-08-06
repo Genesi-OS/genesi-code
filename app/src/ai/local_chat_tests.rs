@@ -195,3 +195,26 @@ fn a_message_with_an_image_serializes_content_parts() {
     assert_eq!(parts[0]["type"], "text");
     assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
 }
+
+#[test]
+fn a_tools_refusal_is_recognised_so_the_retry_can_drop_the_field() {
+    // llama-server built without --jinja answers a tools request with this.
+    assert!(is_tools_unsupported_error(
+        "tools param requires --jinja flag"
+    ));
+    assert!(is_tools_unsupported_error(
+        "Unknown parameter: 'tools' is not supported"
+    ));
+}
+
+#[test]
+fn an_ordinary_failure_is_not_mistaken_for_a_tools_refusal() {
+    // Retrying without tools would not help these, and would hide the real cause.
+    assert!(!is_tools_unsupported_error(
+        "the request exceeds the available context size"
+    ));
+    assert!(!is_tools_unsupported_error("connection refused"));
+    assert!(!is_tools_unsupported_error(
+        "the tool returned an unexpected result"
+    ));
+}
