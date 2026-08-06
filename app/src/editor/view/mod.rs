@@ -1912,6 +1912,10 @@ pub struct EditorView {
     /// Whether this editor should delegate handling of paste events to its parent.
     delegate_paste_handling: bool,
 
+    /// Paste-only delegation, without the terminal semantics
+    /// `delegate_paste_handling` also carries. See [`Self::set_paste_to_parent`].
+    paste_to_parent: bool,
+
     /// Optional hook that transforms each dropped path before it is escaped and inserted into
     /// the buffer. See [`EditorOptions::drag_drop_path_transformer`].
     drag_drop_path_transformer: Option<PathTransformerFn>,
@@ -3200,6 +3204,7 @@ impl EditorView {
             image_context_button_mouse_handle: Default::default(),
             ai_context_menu_state,
             delegate_paste_handling: options.delegate_paste_handling,
+            paste_to_parent: false,
             drag_drop_path_transformer: options.drag_drop_path_transformer,
             process_attached_images_future_handle: None,
             is_password: options.is_password,
@@ -4199,9 +4204,10 @@ impl EditorView {
 
     pub fn paste(&mut self, ctx: &mut ViewContext<Self>) {
         // If this editor does not delegate paste handling, insert clipboard text content.
-        // When paste handling is delegated, the parent view (e.g. the terminal input) is
-        // responsible for processing the paste.
-        if !self.delegate_paste_handling {
+        // When paste handling is delegated, the parent view (e.g. the terminal input, or a
+        // composer that turns pasted files into attachments) is responsible for
+        // processing the paste.
+        if !self.delegate_paste_handling && !self.paste_to_parent {
             // Read clipboard contents
             let content = ctx.clipboard().read();
 
@@ -4810,6 +4816,22 @@ impl EditorView {
                 },
             ),
         );
+    }
+
+    /// Route paste to the parent view instead of inserting it here.
+    ///
+    /// Deliberately NOT `delegate_paste_handling`: that flag has come to mean
+    /// "this is a terminal input" and also switches Ctrl+C from copy to
+    /// interrupt (see `handle_ctrl_c`). A text composer that wants to intercept
+    /// pasted FILES must not inherit terminal Ctrl+C along with it.
+    pub fn set_paste_to_parent(&mut self, delegate: bool) {
+        self.paste_to_parent = delegate;
+    }
+
+    /// Insert text as if it had been pasted. For a parent that took over paste
+    /// handling and decided the clipboard was plain text after all.
+    pub fn insert_pasted_text(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        self.user_initiated_insert(text, PlainTextEditorViewAction::Paste, ctx);
     }
 
     pub fn system_insert(

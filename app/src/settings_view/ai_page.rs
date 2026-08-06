@@ -1012,6 +1012,8 @@ impl AISettingsPageView {
                     });
                 }
                 SubmittableTextInputEvent::Escape => ctx.emit(AISettingsPageEvent::FocusModal),
+                // Paste isn't delegated here, so the editor already inserted it.
+                SubmittableTextInputEvent::Paste => {}
             },
         );
 

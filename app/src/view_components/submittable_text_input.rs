@@ -139,8 +139,29 @@ impl SubmittableTextInput {
                 ctx.notify();
             }
             EditorEvent::Escape => ctx.emit(SubmittableTextInputEvent::Escape),
+            // Surfaced so a caller that accepts attachments (the Genesi AI panel)
+            // can turn a pasted FILE into a reference instead of a wall of path
+            // text. With `delegate_paste_handling` on, nothing has been inserted
+            // yet — the handler decides, and calls back for the text case.
+            EditorEvent::Paste => ctx.emit(SubmittableTextInputEvent::Paste),
             _ => {}
         }
+    }
+
+    /// Route paste through the parent instead of inserting straight away. Only
+    /// meaningful together with a handler for [`SubmittableTextInputEvent::Paste`]
+    /// — without one, paste stops working.
+    pub fn set_delegate_paste(&mut self, delegate: bool, ctx: &mut ViewContext<Self>) {
+        self.editor.update(ctx, |editor, _| {
+            editor.set_paste_to_parent(delegate);
+        });
+    }
+
+    /// Insert text at the cursor, for a delegated paste the parent decided is
+    /// ordinary text after all.
+    pub fn insert_pasted_text(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        self.editor
+            .update(ctx, |editor, ctx| editor.insert_pasted_text(text, ctx));
     }
 
     fn on_try_submit(&mut self, ctx: &mut ViewContext<Self>) {
@@ -248,6 +269,10 @@ pub enum SubmittableTextInputEvent {
     /// Notify the subscribers (parent view) of the submission.
     Submit(String),
     Escape,
+    /// The user pasted. Only emitted usefully when the caller turned on
+    /// [`SubmittableTextInput::set_delegate_paste`], in which case the clipboard
+    /// has NOT been inserted and the handler owns what happens next.
+    Paste,
 }
 
 impl Entity for SubmittableTextInput {

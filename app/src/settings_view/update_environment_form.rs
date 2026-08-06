@@ -432,6 +432,8 @@ impl UpdateEnvironmentForm {
             SubmittableTextInputEvent::Escape => {
                 me.handle_action(&UpdateEnvironmentFormAction::Escape, ctx);
             }
+            // Paste isn't delegated here, so the editor already inserted it.
+            SubmittableTextInputEvent::Paste => {}
         });
 
         let setup_commands_input_editor = setup_commands_input.as_ref(ctx).editor().clone();

@@ -32,6 +32,7 @@ use warpui::elements::{
 };
 use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::keymap::FixedBinding;
+use warpui::platform::FilePickerConfiguration;
 use warpui::presenter::ChildView;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::units::Pixels;
@@ -45,9 +46,10 @@ use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
     load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
-    set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for, turbo_health_ok, AiModeState,
-    ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext,
-    LocalEndpoint, CLOUD_KEYS_STORAGE_KEY,
+    model_supports_vision, set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for,
+    turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem,
+    CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
+    CLOUD_KEYS_STORAGE_KEY,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -80,6 +82,12 @@ const CANVAS_DRAG_MIN_DISTANCE: f32 = 3.;
 
 const SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant running locally on Genesi OS. Be concise.";
+
+/// How many times one turn may re-prompt a model that produced only reasoning.
+/// A thinking model sometimes plans its next step and stops without ever opening
+/// its answer channel; asking again costs one round trip and usually gets the
+/// tool call. Bounded so a model that ONLY ever thinks can't spin forever.
+const MAX_AGENT_NUDGES: u32 = 2;
 
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
@@ -441,6 +449,12 @@ pub enum LocalAiChatAction {
     Clear,
     /// Toggle auto-attaching the focused file as context.
     ToggleAttachContext,
+    /// Open the OS file picker and attach whatever the user chooses.
+    PickAttachments,
+    /// Pin these paths to the next message (from the picker's callback).
+    AttachPaths(Vec<PathBuf>),
+    /// Drop the attachment at this index from the next message.
+    RemoveAttachment(usize),
     /// Toggle agent mode (the model can read the project via tools).
     ToggleAgent,
     /// Toggle AUTO: run agent commands/edits without per-action approval.
@@ -542,6 +556,12 @@ pub struct LocalAiChatView {
     /// as context — like a normal AI IDE.
     attach_context: bool,
 
+    /// Files the user pinned to the next message by hand: the paperclip picker,
+    /// or a Ctrl+V of files copied in the file manager. Separate from
+    /// `attach_context`, which is the editor's own file following the cursor.
+    /// Cleared once the message they were attached to is sent.
+    attachments: Vec<ChatAttachment>,
+
     /// When on, the model runs as a codebase agent: it can read the project via
     /// tools (read_file/list_files/grep) before answering.
     agent_mode: bool,
@@ -558,6 +578,19 @@ pub struct LocalAiChatView {
     agent_step: u32,
     /// Accumulates the current step's streamed tokens until it completes.
     agent_step_buffer: String,
+    /// Accumulates the current step's REASONING (a thinking model's private
+    /// analysis). Deliberately not part of `agent_step_buffer` — see
+    /// [`ChatStreamItem::Reasoning`] — but kept because it is the only thing a
+    /// harmony model produces when it never reaches its `final` channel, and the
+    /// step-end fallback reads it rather than failing the turn.
+    agent_reasoning_buffer: String,
+    /// A native tool call the model made on its own channel, accumulated across
+    /// stream fragments as `(name, arguments-json)`.
+    agent_native_call: Option<(Option<String>, String)>,
+    /// How many times this turn has re-prompted a model that answered only in its
+    /// reasoning channel. Bounded by [`MAX_AGENT_NUDGES`] so a model that always
+    /// thinks and never speaks can't loop forever.
+    agent_nudges: u32,
     /// Summary of the tool currently running, used to render its step.
     agent_tool_summary: String,
 
@@ -617,6 +650,9 @@ impl LocalAiChatView {
             // The compose box already IS the surface; the component's own frame
             // drew a second box inside it.
             input.set_borderless(true, ctx);
+            // Own paste: a file copied in the file manager becomes an attachment
+            // chip, not a wall of path text (see `handle_input_event`).
+            input.set_delegate_paste(true, ctx);
         });
         ctx.subscribe_to_view(&input, |me, _, event, ctx| {
             me.handle_input_event(event, ctx);
@@ -646,12 +682,16 @@ impl LocalAiChatView {
             error: None,
             current_turn: 0,
             attach_context: true,
+            attachments: Vec::new(),
             agent_mode: true,
             agent_root: None,
             agent_messages: Vec::new(),
             agent_model: String::new(),
             agent_step: 0,
             agent_step_buffer: String::new(),
+            agent_reasoning_buffer: String::new(),
+            agent_native_call: None,
+            agent_nudges: 0,
             agent_tool_summary: String::new(),
             auto_approve: false,
             pending_tool: None,
@@ -893,6 +933,20 @@ impl LocalAiChatView {
                     self.set_input_mode(InputMode::Chat, ctx);
                 }
             }
+            // We took paste over from the editor, so we owe it the text case.
+            // Files and images become attachment chips; anything else is typed
+            // in as usual. Key/model entry never attaches — a pasted API key is
+            // text, always.
+            SubmittableTextInputEvent::Paste => {
+                if self.input_mode == InputMode::Chat && self.attach_from_clipboard(ctx) {
+                    return;
+                }
+                let text = ctx.clipboard().read().plain_text;
+                if !text.is_empty() {
+                    self.input
+                        .update(ctx, |input, ctx| input.insert_pasted_text(&text, ctx));
+                }
+            }
         }
     }
 
@@ -1105,7 +1159,14 @@ impl LocalAiChatView {
         // Attach the focused file only when the toggle is on. Recorded on the
         // user entry so the transcript shows what the model was given.
         let context = if self.attach_context { context } else { None };
-        let context_label = context.as_ref().map(CodeContext::label);
+        // The turn consumes whatever the user pinned: the chips clear, and the
+        // transcript keeps the record of what went with the message.
+        let attachments = std::mem::take(&mut self.attachments);
+        let context_label = {
+            let mut parts: Vec<String> = context.as_ref().map(CodeContext::label).into_iter().collect();
+            parts.extend(attachments.iter().map(|a| a.name.clone()));
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        };
 
         self.messages
             .push(ChatEntry::prose(ChatRole::User, prompt, context_label));
@@ -1123,12 +1184,48 @@ impl LocalAiChatView {
         if let Some(context) = &context {
             request.push(context.to_system_message());
         }
-        for entry in &self.messages {
+        // Files the user pinned. Text goes in as fenced system context; images
+        // ride on the user's own message, which is the only place the OpenAI and
+        // Anthropic shapes both accept them.
+        let can_see = model_supports_vision(&model);
+        let mut images = Vec::new();
+        for attachment in &attachments {
+            match attachment.kind {
+                AttachmentKind::Text => {
+                    if let Some(message) = attachment.to_system_message() {
+                        request.push(message);
+                    }
+                }
+                AttachmentKind::Image => match can_see.then(|| attachment.as_chat_image()).flatten()
+                {
+                    Some(image) => images.push(image),
+                    // Silently dropping it would look like the model ignored the
+                    // picture. Tell the model it exists so it can say so.
+                    None => request.push(ChatMessage::system(format!(
+                        "The user attached the image `{}`, but this model cannot read \
+                         images, so its contents are not available. Say so if it matters.",
+                        attachment.name
+                    ))),
+                },
+            }
+        }
+        let last_user_index = self
+            .messages
+            .iter()
+            .rposition(|entry| entry.role == ChatRole::User && !entry.text.is_empty());
+        for (index, entry) in self.messages.iter().enumerate() {
             if entry.text.is_empty() {
                 continue;
             }
             match entry.role {
-                ChatRole::User => request.push(ChatMessage::user(entry.text.clone())),
+                ChatRole::User => {
+                    let mut message = ChatMessage::user(entry.text.clone());
+                    // Only the turn being sent carries the images.
+                    if Some(index) == last_user_index && !images.is_empty() {
+                        message = message.with_images(std::mem::take(&mut images));
+                    }
+                    request.push(message);
+                }
                 ChatRole::Assistant => request.push(ChatMessage::assistant(entry.text.clone())),
                 // Thought / Tool / Command steps are UI-only; the model's real
                 // tool calls + results live in `agent_messages` during a turn.
@@ -1149,6 +1246,7 @@ impl LocalAiChatView {
             self.agent_model = model;
             self.agent_messages = request;
             self.agent_step = 0;
+            self.agent_nudges = 0;
             self.run_agent_step(ctx);
             ctx.notify();
             return;
@@ -1185,6 +1283,90 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    // ── attachments ────────────────────────────────────────────────────────
+
+    /// Open the OS file picker and pin whatever the user chooses to the next
+    /// message. Multi-select, no type filter: an attachment is a reference, and
+    /// what counts as a useful reference is the user's call, not ours.
+    fn pick_attachments(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.open_file_picker(
+            move |result, ctx| match result {
+                Ok(paths) => ctx.dispatch_typed_action(&LocalAiChatAction::AttachPaths(
+                    paths.into_iter().map(PathBuf::from).collect(),
+                )),
+                Err(err) => log::warn!("attachment picker failed: {err}"),
+            },
+            FilePickerConfiguration::new().allow_multi_select(),
+        );
+    }
+
+    /// Pin file paths, skipping ones already attached so a double paste doesn't
+    /// send the same file twice.
+    fn attach_paths(&mut self, paths: impl Iterator<Item = PathBuf>, ctx: &mut ViewContext<Self>) {
+        let mut added = false;
+        for path in paths {
+            if path.as_os_str().is_empty() || path.is_dir() {
+                continue;
+            }
+            if self
+                .attachments
+                .iter()
+                .any(|existing| existing.path.as_deref() == Some(path.as_path()))
+            {
+                continue;
+            }
+            self.attachments.push(ChatAttachment::from_path(path));
+            added = true;
+        }
+        if added {
+            self.error = None;
+            ctx.notify();
+        }
+    }
+
+    /// Handle a paste into the compose box. Returns true when the clipboard held
+    /// files or an image, meaning it became attachments and the text must NOT
+    /// also be typed into the box (pasting a file should not paste its path).
+    fn attach_from_clipboard(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let content = ctx.clipboard().read();
+        let paths: Vec<PathBuf> = content
+            .paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect();
+        let images = content.images.unwrap_or_default();
+        if paths.is_empty() && images.is_empty() {
+            return false;
+        }
+        let before = self.attachments.len();
+        self.attach_paths(paths.into_iter(), ctx);
+        for image in images {
+            self.attachments.push(ChatAttachment::from_image_bytes(
+                image.filename.unwrap_or_default(),
+                &image.mime_type,
+                image.data,
+            ));
+        }
+        let changed = self.attachments.len() != before;
+        if changed {
+            self.error = None;
+            ctx.notify();
+        }
+        // Even when everything was a duplicate the paste WAS about files, so
+        // swallow it — inserting the raw paths is never what was meant.
+        true
+    }
+
+    /// Turn the accumulated native tool-call fragments into a tool, if the model
+    /// made one and we can map its name onto something we run.
+    fn take_native_tool_call(&mut self) -> Option<AgentTool> {
+        let (name, arguments) = self.agent_native_call.take()?;
+        let name = name?;
+        local_agent::tool_from_native_call(&name, &arguments)
+    }
+
     /// Why a local endpoint can accept a request, stream nothing, and close.
     /// Ordered by how often each cause actually bites on a small local setup.
     fn empty_reply_error(&self) -> String {
@@ -1196,11 +1378,11 @@ impl LocalAiChatView {
         }
         match self.endpoint {
             LocalEndpoint::Turbo => format!(
-                "{}: the model returned nothing. The prompt may not fit the server's \
-                 context window — start Turbo with a bigger one \
-                 (GENESI_TURBO_CTX=8192), shorten the conversation, or turn off \
-                 “Attach file context”. Run `genesi-ai-turbo serve <model>` in a \
-                 terminal to see the server's own error.",
+                "{}: the model returned nothing on any channel. The prompt may not fit \
+                 the server's context window — start Turbo with a bigger one \
+                 (GENESI_TURBO_CTX=8192), shorten the conversation, or remove the \
+                 reference chips above the input. Run `genesi-ai-turbo serve <model>` \
+                 in a terminal to see the server's own error.",
                 self.active_backend_error_label()
             ),
             LocalEndpoint::Ollama => format!(
@@ -1218,6 +1400,8 @@ impl LocalAiChatView {
     /// a tool and loop, or promote the thought into the final answer).
     fn run_agent_step(&mut self, ctx: &mut ViewContext<Self>) {
         self.agent_step_buffer.clear();
+        self.agent_reasoning_buffer.clear();
+        self.agent_native_call = None;
         self.messages.push(ChatEntry {
             role: ChatRole::Thought,
             text: String::new(),
@@ -1268,6 +1452,7 @@ impl LocalAiChatView {
             // narration there ("I'll create index.html…") is parsed as the final
             // answer, so the tool never runs and the model only appears to act.
             Ok(ChatStreamItem::Reasoning(thinking)) => {
+                self.agent_reasoning_buffer.push_str(&thinking);
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == ChatRole::Thought {
                         last.text.push_str(&thinking);
@@ -1275,6 +1460,17 @@ impl LocalAiChatView {
                 }
                 self.scroll_to_bottom();
                 ctx.notify();
+            }
+            // A native tool call, streamed in fragments. Accumulated silently —
+            // it becomes a proper tool step once the arguments are complete.
+            Ok(ChatStreamItem::ToolCall { name, arguments }) => {
+                let (call_name, call_args) = self
+                    .agent_native_call
+                    .get_or_insert_with(|| (None, String::new()));
+                if name.is_some() {
+                    *call_name = name;
+                }
+                call_args.push_str(&arguments);
             }
             // The step is settled in `on_agent_step_end`.
             Ok(ChatStreamItem::Done) => {}
@@ -1290,11 +1486,68 @@ impl LocalAiChatView {
         if turn != self.current_turn || !self.in_flight {
             return; // already errored out, stopped, or superseded
         }
-        let reply = self.agent_step_buffer.trim().to_string();
-        // The step produced no text at all: the endpoint accepted the request and
-        // closed without generating. Continuing would append an empty assistant
-        // turn and loop on a model that just told us nothing — fail with the
-        // reason instead (the plain-chat path does the same).
+        let mut reply = self.agent_step_buffer.trim().to_string();
+
+        // A harmony model (gpt-oss and friends) writes its analysis to one channel
+        // and its answer to another; when it decides to ACT, everything it emits
+        // can land outside `content`. So an empty answer here does not mean the
+        // model said nothing — check the other two channels before giving up.
+        let budget_left = self.agent_step < MAX_AGENT_STEPS;
+        if reply.is_empty() {
+            // 1. A native tool call on the model's own tool channel. It never had
+            //    our tool list, so it calls the names the system prompt taught it;
+            //    map those onto the same tools the text protocol drives.
+            if let Some(tool) = self.take_native_tool_call().filter(|_| budget_left) {
+                // Record it in the TEXT protocol so the history stays in the one
+                // shape the next step is asked to produce.
+                self.agent_messages
+                    .push(ChatMessage::assistant(tool.to_tag()));
+                let thinking = self.agent_reasoning_buffer.trim().to_string();
+                self.finalize_thought(&thinking, true);
+                if tool.requires_approval() && !self.auto_approve {
+                    self.pending_tool = Some(tool);
+                    self.scroll_to_bottom();
+                    ctx.notify();
+                } else {
+                    self.start_tool(tool, ctx);
+                }
+                return;
+            }
+
+            let thinking = self.agent_reasoning_buffer.trim().to_string();
+            if !thinking.is_empty() {
+                if local_agent::parse_tool_call(&thinking).is_some() {
+                    // 2. It wrote the tool tag, just inside its reasoning. Take it
+                    //    — the user asked for the work, not for the channel it was
+                    //    announced on.
+                    reply = thinking;
+                } else if self.agent_nudges < MAX_AGENT_NUDGES && budget_left {
+                    // 3. It thought out loud and stopped without ever opening its
+                    //    answer channel. Feed the thinking back and ask for the
+                    //    tool tag or the answer, rather than failing the turn.
+                    self.agent_nudges += 1;
+                    self.agent_messages
+                        .push(ChatMessage::assistant(thinking.clone()));
+                    self.agent_messages.push(ChatMessage::user(
+                        "Continue. Reply with ONLY the tool tag for your next step, \
+                         or your final answer as plain text. Do not stop at planning."
+                            .to_string(),
+                    ));
+                    self.finalize_thought(&thinking, true);
+                    self.run_agent_step(ctx);
+                    ctx.notify();
+                    return;
+                } else {
+                    // 4. Out of nudges. Its reasoning is the only thing it ever
+                    //    produced, so show that instead of an error banner.
+                    reply = thinking;
+                }
+            }
+        }
+
+        // Nothing on any channel: the endpoint accepted the request and closed
+        // without generating. Fail with the reason (the plain-chat path does the
+        // same) rather than looping on a model that told us nothing.
         if reply.is_empty() {
             let reason = self.empty_reply_error();
             self.finish_agent_with_error(turn, reason, ctx);
@@ -1699,6 +1952,9 @@ impl LocalAiChatView {
                 self.scroll_to_bottom();
                 ctx.notify();
             }
+            // Chat mode runs no tools, so a model that reaches for one has only
+            // its own reasoning to show — nothing to render here.
+            Ok(ChatStreamItem::ToolCall { .. }) => {}
             Ok(ChatStreamItem::Done) => {
                 self.in_flight = false;
                 // tokens/s and activity likely changed — refresh the badge.
@@ -4328,11 +4584,15 @@ impl LocalAiChatView {
         Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
+            // The paperclip does what a paperclip does everywhere else: opens a
+            // file picker. It used to toggle whether the editor's current file
+            // was auto-attached, which is a different idea entirely — that toggle
+            // now lives on its own chip in the row above.
             .with_child(self.icon_toggle_button(
                 appearance,
                 "bundled/svg/paperclip.svg",
-                LocalAiChatAction::ToggleAttachContext,
-                self.attach_context,
+                LocalAiChatAction::PickAttachments,
+                !self.attachments.is_empty(),
             ))
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             .with_child(self.selector_button(
@@ -4380,6 +4640,116 @@ impl LocalAiChatView {
                 self.auto_approve = true;
             }
         }
+    }
+
+    /// The row of reference chips above the input: the editor's own file (when
+    /// auto-attach is on) followed by everything the user pinned by hand. Absent
+    /// entirely when there is nothing attached and auto-attach is off, so a plain
+    /// chat keeps a clean compose box.
+    fn render_attachment_row(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
+        // A column, not a row: the panel is narrow and chip names are long, so
+        // one reference per line always fits where a row would clip.
+        let mut row = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Start);
+        // The implicit editor context, made visible: it behaves like every other
+        // chip, so dropping it is the same gesture as dropping a file — and when
+        // it is off, the same chip is how you get it back.
+        row.add_child(self.render_attachment_chip(
+            appearance,
+            "bundled/svg/file-code-02.svg",
+            if self.attach_context {
+                "Editor file".to_string()
+            } else {
+                "Editor file off".to_string()
+            },
+            LocalAiChatAction::ToggleAttachContext,
+            !self.attach_context,
+        ));
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            let icon = match attachment.kind {
+                AttachmentKind::Image => "bundled/svg/image-01.svg",
+                AttachmentKind::Text => "bundled/svg/file-06.svg",
+            };
+            row.add_child(self.render_attachment_chip(
+                appearance,
+                icon,
+                truncate_middle(&attachment.name, 28),
+                LocalAiChatAction::RemoveAttachment(index),
+                false,
+            ));
+        }
+        Some(
+            Container::new(row.finish())
+                .with_horizontal_padding(4.)
+                .with_padding_bottom(6.)
+                .finish(),
+        )
+    }
+
+    /// One reference chip: icon, name, and a trailing × that removes it. An `off`
+    /// chip is the inverse — greyed, with a ＋ that puts the reference back.
+    fn render_attachment_chip(
+        &self,
+        appearance: &Appearance,
+        icon: &'static str,
+        label: String,
+        remove: LocalAiChatAction,
+        off: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color: ColorU = if off {
+            theme.disabled_text_color(theme.background()).into()
+        } else {
+            theme.active_ui_text_color().into()
+        };
+        let icon_color: ColorU = theme.sub_text_color(theme.background()).into();
+        let trailing = if off {
+            "bundled/svg/add.svg"
+        } else {
+            "bundled/svg/x-close.svg"
+        };
+
+        let chip = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(Icon::new(icon, icon_color).finish())
+                            .with_width(12.)
+                            .with_height(12.)
+                            .finish(),
+                    )
+                    .with_margin_right(5.)
+                    .finish(),
+                )
+                .with_child(self.label_text(appearance, label, CHIP_FONT_SIZE, text_color, false))
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(Icon::new(trailing, icon_color).finish())
+                            .with_width(10.)
+                            .with_height(10.)
+                            .finish(),
+                    )
+                    .with_margin_left(6.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_horizontal_padding(7.)
+        .with_vertical_padding(4.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+        .with_background_color(genesi_card_surface())
+        .with_margin_right(5.)
+        .with_margin_top(4.);
+
+        // The whole chip is the remove target: it is small, and a 10px × alone
+        // would be a miss-prone hit box.
+        EventHandler::new(chip.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(remove.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
     }
 
     /// A square, icon-only toggle — the attach affordance in the design is an
@@ -5745,6 +6115,17 @@ impl TypedActionView for LocalAiChatView {
                 self.attach_context = !self.attach_context;
                 ctx.notify();
             }
+            LocalAiChatAction::PickAttachments => self.pick_attachments(ctx),
+            LocalAiChatAction::AttachPaths(paths) => {
+                self.attach_paths(paths.clone().into_iter(), ctx)
+            }
+            LocalAiChatAction::RemoveAttachment(index) => {
+                let index = *index;
+                if index < self.attachments.len() {
+                    self.attachments.remove(index);
+                    ctx.notify();
+                }
+            }
             LocalAiChatAction::ToggleAgent => {
                 self.agent_mode = !self.agent_mode;
                 ctx.notify();
@@ -6267,8 +6648,13 @@ impl View for LocalAiChatView {
         // The prompt field spans the full width on its own line, and every
         // control — including send — sits on the row beneath it, so the send
         // affordance lands in the box's bottom-right corner like the reference.
-        let compose_inner = Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        let mut compose_inner = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        // Reference chips sit above the prompt, where the user can see what the
+        // next message carries before sending it.
+        if let Some(attachments) = self.render_attachment_row(appearance) {
+            compose_inner.add_child(attachments);
+        }
+        let compose_inner = compose_inner
             .with_child(
                 Container::new(ChildView::new(&self.input).finish())
                     .with_horizontal_padding(4.)

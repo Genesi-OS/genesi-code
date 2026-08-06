@@ -27,10 +27,58 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// A single chat message in the OpenAI `chat/completions` shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialization is hand-written because the wire shape depends on the payload:
+/// a text-only message sends `content` as a plain string (which every
+/// OpenAI-compatible server accepts, including old llama-server builds), and
+/// only a message carrying an image switches to the content-parts array.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Images attached to this message. Empty for every ordinary message; only
+    /// the turn the user attached a picture to carries any.
+    #[serde(default, skip)]
+    pub images: Vec<ChatImage>,
+}
+
+/// An image being sent to a vision-capable model, already base64-encoded.
+#[derive(Debug, Clone)]
+pub struct ChatImage {
+    pub mime_type: String,
+    pub base64: String,
+}
+
+impl ChatImage {
+    /// The `data:` URI form both OpenAI-compatible servers and llama-server take.
+    pub fn data_uri(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.base64)
+    }
+}
+
+impl Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("role", &self.role)?;
+        if self.images.is_empty() {
+            map.serialize_entry("content", &self.content)?;
+        } else {
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": self.content,
+            })];
+            parts.extend(self.images.iter().map(|image| {
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": image.data_uri() },
+                })
+            }));
+            map.serialize_entry("content", &parts)?;
+        }
+        map.end()
+    }
 }
 
 impl ChatMessage {
@@ -38,6 +86,7 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -45,6 +94,7 @@ impl ChatMessage {
         Self {
             role: "assistant".to_string(),
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -52,7 +102,13 @@ impl ChatMessage {
         Self {
             role: "system".to_string(),
             content: content.into(),
+            images: Vec::new(),
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<ChatImage>) -> Self {
+        self.images = images;
+        self
     }
 }
 
@@ -113,18 +169,195 @@ impl CodeContext {
     }
 }
 
+/// An attachment is bigger than the incidental editor context: the user picked
+/// this file deliberately, so it gets a larger slice of the window.
+const ATTACHMENT_MAX_LINES: usize = 600;
+const ATTACHMENT_MAX_CHARS: usize = 24_000;
+
+/// Extensions treated as images (offered to the model only when it can see).
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// What an attachment is, which decides how it reaches the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    /// Read as text and fenced into the prompt.
+    Text,
+    /// Base64'd into an image content part, for a model that can see.
+    Image,
+}
+
+/// A file the user attached to the conversation by hand — via the paperclip, or
+/// by pasting a file copied in the file manager.
+///
+/// Deliberately separate from [`CodeContext`]: that one is the editor's current
+/// file, refreshed and attached implicitly on every turn, while these are pinned
+/// references the user chose and can remove.
+#[derive(Debug, Clone)]
+pub struct ChatAttachment {
+    /// Absolute path on disk. `None` for an image pasted as raw clipboard bytes,
+    /// which has no file behind it.
+    pub path: Option<PathBuf>,
+    /// What the chip shows — the file name, or a generated one for a paste.
+    pub name: String,
+    pub kind: AttachmentKind,
+    /// Raw bytes for a pasted image. Files are read at send time instead, so a
+    /// long-lived attachment always reflects what is on disk now.
+    pub bytes: Option<Vec<u8>>,
+}
+
+impl ChatAttachment {
+    /// Classify and wrap a path the user picked or pasted.
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let kind = if is_image_path(&path) {
+            AttachmentKind::Image
+        } else {
+            AttachmentKind::Text
+        };
+        Self {
+            path: Some(path),
+            name,
+            kind,
+            bytes: None,
+        }
+    }
+
+    /// An image pasted straight from the clipboard (a screenshot), which exists
+    /// only as bytes.
+    pub fn from_image_bytes(name: String, mime_type: &str, bytes: Vec<u8>) -> Self {
+        let name = if name.trim().is_empty() {
+            let ext = mime_type.rsplit('/').next().unwrap_or("png");
+            format!("pasted-image.{ext}")
+        } else {
+            name
+        };
+        Self {
+            path: None,
+            name,
+            kind: AttachmentKind::Image,
+            bytes: Some(bytes),
+        }
+    }
+
+    /// Language hint for the code fence, from the extension.
+    fn language(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .map(|ext| ext.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Read the attachment's bytes: the pasted buffer, or the file as it is on
+    /// disk right now.
+    pub fn read_bytes(&self) -> Option<Vec<u8>> {
+        if let Some(bytes) = &self.bytes {
+            return Some(bytes.clone());
+        }
+        std::fs::read(self.path.as_ref()?).ok()
+    }
+
+    /// The image encoded for a vision request, or `None` if it isn't an image or
+    /// can't be read.
+    pub fn as_chat_image(&self) -> Option<ChatImage> {
+        if self.kind != AttachmentKind::Image {
+            return None;
+        }
+        let bytes = self.read_bytes()?;
+        use base64::Engine as _;
+        Some(ChatImage {
+            mime_type: mime_type_for(&self.name).to_string(),
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
+    /// Render a TEXT attachment as a system message. Returns `None` for an image
+    /// (which travels as an image part) or a file that can't be read as text.
+    pub fn to_system_message(&self) -> Option<ChatMessage> {
+        if self.kind != AttachmentKind::Text {
+            return None;
+        }
+        let path = self.path.as_ref()?;
+        let raw = std::fs::read(path).ok()?;
+        // A binary file fenced into the prompt is noise that costs context and
+        // teaches the model nothing — say what it is instead.
+        let Ok(text) = String::from_utf8(raw) else {
+            return Some(ChatMessage::system(format!(
+                "The user attached `{}`, which is a binary file ({}). Its contents \
+                 are not included.",
+                self.name,
+                path.display()
+            )));
+        };
+        let mut body = format!(
+            "The user attached this file for reference. Full path: {}\n\nFile: {}\n",
+            path.display(),
+            self.name
+        );
+        body.push_str(&fenced(
+            &self.language(),
+            &clamp(&text, ATTACHMENT_MAX_LINES, ATTACHMENT_MAX_CHARS),
+        ));
+        Some(ChatMessage::system(body))
+    }
+}
+
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+}
+
+fn mime_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// Whether `model` is one that can actually look at an image.
+///
+/// A name check, because no local endpoint reliably reports modality: ollama's
+/// `/v1/models` gives ids only, and llama-server can't say whether an mmproj is
+/// loaded. Sending an image to a text-only model wastes the context window and
+/// makes some servers reject the whole request, so the default when a name isn't
+/// recognised is NO — the attachment is still named in the prompt, just not
+/// pixel-encoded.
+pub fn model_supports_vision(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    const VISION_MARKERS: &[&str] = &[
+        // Local vision stacks.
+        "llava", "bakllava", "moondream", "minicpm-v", "llama3.2-vision", "llama-3.2-vision",
+        "pixtral", "internvl", "cogvlm", "glm-4v", "-vl", "_vl", "vl-", "vision", "gemma-3",
+        "gemma3", "mistral-small-3", "granite-vision",
+        // Cloud families that are multimodal across the board.
+        "gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4-mini", "claude", "gemini",
+    ];
+    VISION_MARKERS
+        .iter()
+        .any(|marker| model.contains(marker))
+}
+
 /// Truncate context text to the line/char caps, marking it when cut.
 fn clamp_context(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_truncated = lines.len() > CONTEXT_MAX_LINES;
-    let line_capped = lines[..lines.len().min(CONTEXT_MAX_LINES)].join("\n");
+    clamp(text, CONTEXT_MAX_LINES, CONTEXT_MAX_CHARS)
+}
 
-    let (mut out, char_truncated) = if line_capped.chars().count() > CONTEXT_MAX_CHARS {
+/// Truncate text to a line and character cap, marking it when cut.
+fn clamp(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_truncated = lines.len() > max_lines;
+    let line_capped = lines[..lines.len().min(max_lines)].join("\n");
+
+    let (mut out, char_truncated) = if line_capped.chars().count() > max_chars {
         (
-            line_capped
-                .chars()
-                .take(CONTEXT_MAX_CHARS)
-                .collect::<String>(),
+            line_capped.chars().take(max_chars).collect::<String>(),
             true,
         )
     } else {
@@ -151,6 +384,20 @@ pub enum ChatStreamItem {
     /// the model's thinking into that buffer means it parses narration ("I will
     /// create the file…") instead of the `<tool:…>` tag it was looking for.
     Reasoning(String),
+    /// A fragment of a NATIVE (OpenAI-shaped) tool call. A harmony model like
+    /// gpt-oss writes the act of calling a tool to its `commentary` channel, and
+    /// llama-server's parser turns that into `delta.tool_calls` — never into
+    /// `content`. Ignoring this field is why "answer me" worked and "do
+    /// something" produced an empty reply: the model DID act, the call just went
+    /// down a channel nothing was reading.
+    ///
+    /// Fragments arrive split across chunks (the name once, the JSON arguments a
+    /// few characters at a time), so the caller accumulates them and builds the
+    /// call when the step ends.
+    ToolCall {
+        name: Option<String>,
+        arguments: String,
+    },
     /// The model finished this turn cleanly.
     Done,
 }
@@ -177,7 +424,14 @@ struct ChatRequest<'a> {
 
 /// Upper bound on one local reply. Generous enough for a full code block, small
 /// enough that a runaway model can't fill the whole context window.
-const LOCAL_MAX_TOKENS: u32 = 2048;
+///
+/// A reasoning model spends this budget TWICE over: once on its private analysis
+/// and once on the answer. At 2048 a model like gpt-oss-20b could think its way
+/// through a task, hit the cap mid-thought, and stop before writing a single
+/// token of `content` — which the agent loop then reported as "the model
+/// returned nothing". llama-server clamps this to whatever the context window
+/// actually leaves free, so raising it costs nothing on a small window.
+const LOCAL_MAX_TOKENS: u32 = 4096;
 
 #[derive(Serialize)]
 struct AnthropicChatRequest<'a> {
@@ -189,10 +443,43 @@ struct AnthropicChatRequest<'a> {
     system: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct AnthropicInputMessage {
     role: String,
     content: String,
+    images: Vec<ChatImage>,
+}
+
+/// Anthropic takes its own block shape (`source.data`, not a `data:` URI), so
+/// this mirrors the OpenAI serializer rather than sharing it.
+impl Serialize for AnthropicInputMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("role", &self.role)?;
+        if self.images.is_empty() {
+            map.serialize_entry("content", &self.content)?;
+        } else {
+            let mut blocks: Vec<serde_json::Value> = self
+                .images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.mime_type,
+                            "data": image.base64,
+                        },
+                    })
+                })
+                .collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": self.content }));
+            map.serialize_entry("content", &blocks)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -217,13 +504,58 @@ struct ChatDelta {
     /// meant such a model streamed for a while and appeared to answer nothing.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// llama.cpp also accepts `reasoning` for the same field on some builds.
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// Native tool calls — see [`ChatStreamItem::ToolCall`].
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ToolCallDelta {
+    #[serde(default)]
+    function: Option<FunctionCallDelta>,
+}
+
+#[derive(Deserialize, Default)]
+struct FunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// One message in ollama's NATIVE shape. Images are a flat array of bare base64
+/// strings on the message itself — not OpenAI content parts — so the OpenAI
+/// serializer on [`ChatMessage`] can't be reused here.
+#[derive(Serialize)]
+struct OllamaMessage {
+    role: String,
+    content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<String>,
+}
+
+impl From<ChatMessage> for OllamaMessage {
+    fn from(message: ChatMessage) -> Self {
+        Self {
+            role: message.role,
+            content: message.content,
+            images: message
+                .images
+                .into_iter()
+                .map(|image| image.base64)
+                .collect(),
+        }
+    }
 }
 
 /// Native (non-OpenAI) request body for ollama's `/api/chat`.
 #[derive(Serialize)]
 struct OllamaChatRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: &'a [OllamaMessage],
     stream: bool,
     /// Keep the model resident this long after the reply, so the next message
     /// (and the AI Mode Monitor, which shares the same ollama model) doesn't pay
@@ -316,6 +648,7 @@ fn stream_chat_ollama_native(
     messages: Vec<ChatMessage>,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     async_stream::stream! {
+        let messages: Vec<OllamaMessage> = messages.into_iter().map(Into::into).collect();
         let body = OllamaChatRequest {
             model: &model,
             messages: &messages,
@@ -448,21 +781,47 @@ fn stream_chat_openai_sse(
                 }
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
-                        // The answer and the thinking are reported separately, so
-                        // a thinking model shows progress without its reasoning
-                        // being mistaken for the answer.
+                        // The answer, the thinking and a native tool call are
+                        // reported separately, so a thinking model shows progress
+                        // without its reasoning being mistaken for the answer, and
+                        // a tool call it made on its own channel is not lost.
                         let mut answer = String::new();
                         let mut thinking = String::new();
+                        let mut tool_name: Option<String> = None;
+                        let mut tool_args = String::new();
                         for choice in chunk.choices {
                             if let Some(content) = choice.delta.content {
                                 answer.push_str(&content);
                             }
-                            if let Some(reasoning) = choice.delta.reasoning_content {
+                            if let Some(reasoning) = choice
+                                .delta
+                                .reasoning_content
+                                .or(choice.delta.reasoning)
+                            {
                                 thinking.push_str(&reasoning);
                             }
+                            for call in choice.delta.tool_calls.into_iter().flatten() {
+                                let Some(function) = call.function else {
+                                    continue;
+                                };
+                                if let Some(name) = function.name.filter(|n| !n.is_empty()) {
+                                    tool_name = Some(name);
+                                }
+                                if let Some(arguments) = function.arguments {
+                                    tool_args.push_str(&arguments);
+                                }
+                            }
                         }
+                        // A chunk carries exactly one of these in practice, so the
+                        // order below only decides an impossible tie. Answer text
+                        // wins because it is what the user reads.
                         if !answer.is_empty() {
                             Some(Ok(ChatStreamItem::Token(answer)))
+                        } else if tool_name.is_some() || !tool_args.is_empty() {
+                            Some(Ok(ChatStreamItem::ToolCall {
+                                name: tool_name,
+                                arguments: tool_args,
+                            }))
                         } else if !thinking.is_empty() {
                             Some(Ok(ChatStreamItem::Reasoning(thinking)))
                         } else {
@@ -585,10 +944,12 @@ fn stream_chat_anthropic_sse(
             "user" | "assistant" => anthropic_messages.push(AnthropicInputMessage {
                 role: message.role,
                 content: message.content,
+                images: message.images,
             }),
             _ => anthropic_messages.push(AnthropicInputMessage {
                 role: "user".to_string(),
                 content: message.content,
+                images: message.images,
             }),
         }
     }

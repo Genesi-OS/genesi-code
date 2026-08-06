@@ -126,3 +126,72 @@ fn server_detail_does_not_mark_an_exact_length_message_as_truncated() {
     assert_eq!(detail.chars().count(), 402, "': ' + 400 chars, no ellipsis");
     assert!(!detail.ends_with('…'));
 }
+
+// ── attachments ──────────────────────────────────────────────────────────────
+
+#[test]
+fn an_attachment_is_classified_by_extension() {
+    let image = ChatAttachment::from_path(PathBuf::from("/tmp/shot.PNG"));
+    assert_eq!(image.kind, AttachmentKind::Image, "case must not matter");
+    assert_eq!(image.name, "shot.PNG");
+
+    let text = ChatAttachment::from_path(PathBuf::from("/tmp/main.rs"));
+    assert_eq!(text.kind, AttachmentKind::Text);
+}
+
+#[test]
+fn a_pasted_image_without_a_name_gets_one() {
+    let pasted = ChatAttachment::from_image_bytes(String::new(), "image/png", vec![1, 2, 3]);
+    assert_eq!(pasted.name, "pasted-image.png");
+    assert!(pasted.path.is_none(), "a paste has no file behind it");
+    assert_eq!(pasted.read_bytes(), Some(vec![1, 2, 3]));
+}
+
+#[test]
+fn an_image_never_becomes_fenced_text() {
+    // Images travel as image parts; fencing their bytes would be nonsense.
+    let image = ChatAttachment::from_path(PathBuf::from("/tmp/shot.png"));
+    assert!(image.to_system_message().is_none());
+}
+
+#[test]
+fn vision_models_are_recognised_and_text_models_are_not() {
+    for model in [
+        "llava:13b",
+        "gguf:Qwen2.5-VL-7B-Instruct-q4_k_m",
+        "gemma-3-12b-it",
+        "claude-sonnet-4-6",
+        "gpt-4o-mini",
+    ] {
+        assert!(model_supports_vision(model), "{model} should be multimodal");
+    }
+    for model in [
+        "gguf:gpt-oss-20b",
+        "llama3.2:3b",
+        "qwen3-coder-30b",
+        "deepseek-r1:7b",
+    ] {
+        assert!(!model_supports_vision(model), "{model} is text-only");
+    }
+}
+
+#[test]
+fn a_text_only_message_still_serializes_content_as_a_string() {
+    // Old llama-server builds reject a content ARRAY, so the ordinary path must
+    // stay exactly as it was before images existed.
+    let json = serde_json::to_value(ChatMessage::user("hi")).expect("serializes");
+    assert_eq!(json["content"], serde_json::json!("hi"));
+}
+
+#[test]
+fn a_message_with_an_image_serializes_content_parts() {
+    let message = ChatMessage::user("what is this?").with_images(vec![ChatImage {
+        mime_type: "image/png".to_string(),
+        base64: "AAAA".to_string(),
+    }]);
+    let json = serde_json::to_value(message).expect("serializes");
+    let parts = json["content"].as_array().expect("an array of parts");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+}

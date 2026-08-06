@@ -123,6 +123,91 @@ impl AgentTool {
             AgentTool::RunCommand { .. } | AgentTool::EditFile { .. } | AgentTool::WriteFile { .. }
         )
     }
+
+    /// Render the call back into the text protocol, so a call that arrived in a
+    /// model's NATIVE tool-call format is written into the conversation in the
+    /// one shape [`parse_tool_call`] and the transcript both understand. Without
+    /// this the history would describe the call in prose, and the model would
+    /// drift away from the tag format on the next step.
+    pub fn to_tag(&self) -> String {
+        match self {
+            AgentTool::ReadFile { path } => format!("<tool:read_file path=\"{path}\"/>"),
+            AgentTool::ListFiles { path } => format!("<tool:list_files path=\"{path}\"/>"),
+            AgentTool::Grep { query, path } => {
+                format!("<tool:grep query=\"{query}\" path=\"{path}\"/>")
+            }
+            AgentTool::RunCommand { command } => {
+                format!("<tool:run_command>{command}</tool>")
+            }
+            AgentTool::WriteFile { path, content } => {
+                format!("<tool:write_file path=\"{path}\">\n{content}\n</tool>")
+            }
+            AgentTool::EditFile {
+                path,
+                search,
+                replace,
+            } => format!(
+                "<tool:edit_file path=\"{path}\">\n<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n</tool>"
+            ),
+        }
+    }
+}
+
+/// Build a tool from a model's NATIVE (OpenAI-shaped) tool call: a function name
+/// plus a JSON argument object.
+///
+/// A harmony model such as gpt-oss announces a tool on its `commentary` channel
+/// rather than in its answer, and llama-server surfaces that as `tool_calls`. It
+/// was never handed a tool schema — it calls the names the system prompt taught
+/// it — so match on those names and pull the arguments the text protocol uses.
+/// Argument names are matched leniently because the model is inventing them.
+pub fn tool_from_native_call(name: &str, arguments_json: &str) -> Option<AgentTool> {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments_json).unwrap_or(serde_json::Value::Null);
+    let arg = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| args.get(key).and_then(|value| value.as_str()))
+            .map(str::to_owned)
+    };
+    // Providers namespace the function ("functions.read_file"); keep the leaf.
+    let name = name.rsplit('.').next().unwrap_or(name).trim();
+    match name {
+        "read_file" | "open_file" | "cat" => Some(AgentTool::ReadFile {
+            path: arg(&["path", "file", "filename"])?,
+        }),
+        "list_files" | "ls" | "list_dir" | "list_directory" => Some(AgentTool::ListFiles {
+            path: arg(&["path", "dir", "directory"]).unwrap_or_else(|| ".".to_string()),
+        }),
+        "grep" | "search" | "search_files" => Some(AgentTool::Grep {
+            query: arg(&["query", "pattern", "text"])?,
+            path: arg(&["path", "dir", "directory"]).unwrap_or_else(|| ".".to_string()),
+        }),
+        "run_command" | "run" | "shell" | "bash" | "exec" => Some(AgentTool::RunCommand {
+            command: arg(&["command", "cmd", "script"])?,
+        }),
+        "write_file" | "create_file" | "save_file" => Some(AgentTool::WriteFile {
+            path: arg(&["path", "file", "filename"])?,
+            content: arg(&["content", "contents", "text", "body"]).unwrap_or_default(),
+        }),
+        "edit_file" | "replace_in_file" | "patch_file" => {
+            let path = arg(&["path", "file", "filename"])?;
+            match (
+                arg(&["search", "old", "old_string", "find"]),
+                arg(&["replace", "new", "new_string"]),
+            ) {
+                (Some(search), Some(replace)) => Some(AgentTool::EditFile {
+                    path,
+                    search,
+                    replace,
+                }),
+                // A model that "edits" by handing back the whole file is doing a
+                // write; take it as one rather than dropping the call.
+                _ => arg(&["content", "contents", "text"])
+                    .map(|content| AgentTool::WriteFile { path, content }),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The system prompt that turns the plain chat into a codebase agent. Written
@@ -161,6 +246,9 @@ console.log(\"hi\");\n\
 (result: wrote hello.js)\n\
 Assistant: Done — I created hello.js.\n\n\
 Rules:\n\
+- Write the tool tag in your ANSWER, not in your private reasoning. Thinking \
+about calling a tool does not call it: the tag must appear in the message you \
+actually send, or nothing happens.\n\
 - Use ONE tool per message. Paths are relative to the project root; use \".\" \
 for the root.\n\
 - Prefer list_files / read_file before answering questions about the code.\n\
@@ -707,3 +795,7 @@ pub fn project_root_from_file(file: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+#[path = "local_agent_tests.rs"]
+mod tests;
