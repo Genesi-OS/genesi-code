@@ -7,7 +7,7 @@
 //! story lives in one place: no account, no cloud.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -545,6 +545,8 @@ pub enum LocalAiChatAction {
     Stop,
     /// Expand/collapse the transcript entry at this index (thought/tool/command).
     ToggleCollapse(usize),
+    /// Expand/collapse the "Ran N commands" run that starts at this index.
+    ToggleStepGroup(usize),
     /// Cycle the BYOK cloud provider preset (HuggingFace / OpenAI / …).
     CycleProvider,
     /// Select a specific cloud provider from the picker.
@@ -679,6 +681,8 @@ pub struct LocalAiChatView {
     /// Keep) — each carries its captured pre-edit original so Undo can restore it.
     pending_edits: Vec<PendingEdit>,
     review_expanded: bool,
+    /// Start indices of the collapsed tool-step runs the user has opened.
+    expanded_step_groups: HashSet<usize>,
     selected_review_path: Option<String>,
     active_side_tool: GenesiSideTool,
     project_canvas_state: ProjectCanvasState,
@@ -767,6 +771,7 @@ impl LocalAiChatView {
             model_picker_open: false,
             pending_edits: Vec::new(),
             review_expanded: false,
+            expanded_step_groups: HashSet::new(),
             selected_review_path: None,
             active_side_tool: GenesiSideTool::Review,
             project_canvas_state: ProjectCanvasState::NoProject,
@@ -1835,8 +1840,11 @@ impl LocalAiChatView {
             }
             _ => {
                 // No tool call (or the step budget is spent): the reply is the
-                // final answer. Promote the thought bubble into the answer.
-                self.finalize_thought(&reply, false);
+                // final answer. Keep the model's reasoning as its own collapsed
+                // step and give the answer a bubble of its own — folding both
+                // into one entry is why every reply read as a "Thought".
+                let reasoning = self.agent_reasoning_buffer.trim().to_string();
+                self.finalize_answer(&reasoning, &reply);
                 if self.agent_step >= MAX_AGENT_STEPS {
                     if let Some(last) = self.messages.last_mut() {
                         if last.role == ChatRole::Assistant && last.text.trim().is_empty() {
@@ -1882,6 +1890,43 @@ impl LocalAiChatView {
             entry.collapsed = false;
             entry.status = StepStatus::Ok;
         }
+    }
+
+    /// Settle the streaming bubble for a step that ended in the FINAL answer.
+    ///
+    /// A thinking model produces two different things — the private analysis and
+    /// the answer — and they were being written into the same entry, so the
+    /// transcript showed the model's musings under "Genesi AI" as if that were
+    /// the reply. They now become two entries: a collapsed thought, then the
+    /// answer. When there is no reasoning (or it IS the answer, which happens
+    /// when the loop falls back to it) the single bubble is kept.
+    fn finalize_answer(&mut self, reasoning: &str, answer: &str) {
+        let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::Thought)
+        else {
+            return;
+        };
+        let split = !reasoning.is_empty() && reasoning != answer;
+        if !split {
+            let entry = &mut self.messages[idx];
+            entry.role = ChatRole::Assistant;
+            entry.text = answer.to_string();
+            entry.collapsed = false;
+            entry.status = StepStatus::Ok;
+            return;
+        }
+
+        let thought = &mut self.messages[idx];
+        thought.text = reasoning.to_string();
+        thought.collapsed = true;
+        thought.status = StepStatus::Ok;
+        self.messages.push(ChatEntry::prose(
+            ChatRole::Assistant,
+            answer.to_string(),
+            None,
+        ));
     }
 
     fn finish_agent_with_error(&mut self, turn: u64, message: String, ctx: &mut ViewContext<Self>) {
@@ -5713,20 +5758,54 @@ impl LocalAiChatView {
         color: ColorU,
         collapsed: bool,
     ) -> Box<dyn Element> {
-        let caret = if collapsed { ">" } else { "v" };
-        let row = Container::new(self.label_text(
+        self.collapsible_header(
             appearance,
-            format!("{caret} {title}"),
-            CHIP_FONT_SIZE,
+            LocalAiChatAction::ToggleCollapse(index),
+            title,
             color,
-            false,
-        ))
+            collapsed,
+        )
+    }
+
+    /// A disclosure row: chevron + title, toggling `action` when clicked.
+    fn collapsible_header(
+        &self,
+        appearance: &Appearance,
+        action: LocalAiChatAction,
+        title: String,
+        color: ColorU,
+        collapsed: bool,
+    ) -> Box<dyn Element> {
+        // A real chevron, not the literal ">" / "v" characters this used to
+        // print — those rendered as stray letters in the middle of the
+        // transcript.
+        let caret = if collapsed {
+            "bundled/svg/chevron-right-skinny.svg"
+        } else {
+            "bundled/svg/chevron-down-skinny.svg"
+        };
+        let row = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(Icon::new(caret, color).finish())
+                            .with_width(10.)
+                            .with_height(10.)
+                            .finish(),
+                    )
+                    .with_margin_right(5.)
+                    .finish(),
+                )
+                .with_child(self.label_text(appearance, title, CHIP_FONT_SIZE, color, false))
+                .finish(),
+        )
         .with_vertical_padding(2.)
         .finish();
 
         EventHandler::new(row)
             .on_left_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(LocalAiChatAction::ToggleCollapse(index));
+                ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
             .finish()
@@ -6036,6 +6115,81 @@ impl LocalAiChatView {
             .finish()
     }
 
+    /// The extent of a FINISHED run of agent steps starting at `start`, as
+    /// `(end_exclusive, tool_step_count)`.
+    ///
+    /// Returns `None` unless the run holds at least two tool steps — a lone step
+    /// reads better on its own than behind a disclosure. A step still running is
+    /// never swallowed: the user needs to see what the agent is doing right now.
+    fn finished_step_run(&self, start: usize) -> Option<(usize, usize)> {
+        let mut end = start;
+        let mut steps = 0usize;
+        while let Some(entry) = self.messages.get(end) {
+            if entry.status == StepStatus::Running {
+                break;
+            }
+            match entry.role {
+                ChatRole::Tool | ChatRole::Command => {
+                    steps += 1;
+                    end += 1;
+                }
+                ChatRole::Thought => end += 1,
+                _ => break,
+            }
+        }
+        // Trailing thoughts with no tool after them read as the model's closing
+        // reasoning; leave them out of the group.
+        while end > start
+            && steps > 0
+            && self.messages[end - 1].role == ChatRole::Thought
+        {
+            end -= 1;
+        }
+        (steps >= 2).then_some((end, steps))
+    }
+
+    /// One row standing in for a run of tool steps: "Ran 5 commands", expanding
+    /// to the individual steps.
+    fn render_step_group(
+        &self,
+        appearance: &Appearance,
+        start: usize,
+        end: usize,
+        steps: usize,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let expanded = self.expanded_step_groups.contains(&start);
+        let title = format!(
+            "Ran {steps} command{}",
+            if steps == 1 { "" } else { "s" }
+        );
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.collapsible_header(
+                appearance,
+                LocalAiChatAction::ToggleStepGroup(start),
+                title,
+                muted,
+                !expanded,
+            ));
+
+        if expanded {
+            for index in start..end {
+                column.add_child(
+                    Container::new(self.render_entry(appearance, index, &self.messages[index]))
+                        .with_padding_left(12.)
+                        .finish(),
+                );
+            }
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(6.)
+            .finish()
+    }
+
     fn render_entry(
         &self,
         appearance: &Appearance,
@@ -6242,8 +6396,19 @@ impl LocalAiChatView {
                 .finish(),
             );
         } else {
-            for (index, entry) in self.messages.iter().enumerate() {
-                column.add_child(self.render_entry(appearance, index, entry));
+            let mut index = 0;
+            while index < self.messages.len() {
+                // A finished run of tool steps collapses into one "Ran N
+                // commands" row. Interleaved thoughts belong to that run, so
+                // they fold in too — otherwise a multi-step task buries the
+                // conversation under dozens of one-line steps.
+                if let Some((end, steps)) = self.finished_step_run(index) {
+                    column.add_child(self.render_step_group(appearance, index, end, steps));
+                    index = end;
+                    continue;
+                }
+                column.add_child(self.render_entry(appearance, index, &self.messages[index]));
+                index += 1;
             }
         }
 
@@ -6627,6 +6792,12 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::Stop => {
                 self.stop_turn(ctx);
+            }
+            LocalAiChatAction::ToggleStepGroup(start) => {
+                if !self.expanded_step_groups.remove(start) {
+                    self.expanded_step_groups.insert(*start);
+                }
+                ctx.notify();
             }
             LocalAiChatAction::ToggleCollapse(index) => {
                 let expanding = self
