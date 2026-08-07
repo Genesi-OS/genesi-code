@@ -60,6 +60,7 @@ use super::project_canvas_view::{
     ProjectGraphNodeElement, FORGE_NODE_HEIGHT, FORGE_NODE_WIDTH,
 };
 use crate::appearance::Appearance;
+use crate::code::file_tree::FileTreeView;
 use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::settings_view::SettingsSection;
 use crate::util::bindings::CustomAction;
@@ -547,6 +548,12 @@ pub enum LocalAiChatAction {
     ToggleCollapse(usize),
     /// Expand/collapse the "Ran N commands" run that starts at this index.
     ToggleStepGroup(usize),
+    /// Open/close the saved-chat list.
+    ToggleChatPicker,
+    /// Switch to a saved chat.
+    PickChat(String),
+    /// Delete a saved chat.
+    DeleteChat(String),
     /// Cycle the BYOK cloud provider preset (HuggingFace / OpenAI / …).
     CycleProvider,
     /// Select a specific cloud provider from the picker.
@@ -683,6 +690,8 @@ pub struct LocalAiChatView {
     review_expanded: bool,
     /// Start indices of the collapsed tool-step runs the user has opened.
     expanded_step_groups: HashSet<usize>,
+    /// Whether the saved-chat list is showing.
+    chat_picker_open: bool,
     selected_review_path: Option<String>,
     active_side_tool: GenesiSideTool,
     project_canvas_state: ProjectCanvasState,
@@ -772,6 +781,7 @@ impl LocalAiChatView {
             pending_edits: Vec::new(),
             review_expanded: false,
             expanded_step_groups: HashSet::new(),
+            chat_picker_open: false,
             selected_review_path: None,
             active_side_tool: GenesiSideTool::Review,
             project_canvas_state: ProjectCanvasState::NoProject,
@@ -2065,6 +2075,24 @@ impl LocalAiChatView {
         }
     }
 
+    /// Tell the file tree to rescan after the agent touched the project.
+    ///
+    /// The tree only catches up on outside changes when it becomes active, so a
+    /// file the agent created stayed invisible until the user switched to search
+    /// and back. The agent writes straight to disk, which is exactly "behind the
+    /// tree's back".
+    fn refresh_file_tree(&self, ctx: &mut ViewContext<Self>) {
+        let Some(window_id) = ctx.windows().active_window() else {
+            return;
+        };
+        let Some(trees) = ctx.views_of_type::<FileTreeView>(window_id) else {
+            return;
+        };
+        for tree in trees {
+            tree.update(ctx, |tree, ctx| tree.refresh_local_directories(ctx));
+        }
+    }
+
     /// Re-apply every unreviewed edit's baseline to the editors that are open.
     ///
     /// The baseline is state of the editor VIEW, not of the file, so a file that
@@ -2192,6 +2220,22 @@ impl LocalAiChatView {
             } else {
                 StepStatus::Ok
             };
+            // The line counts were measured BEFORE the tool ran, from what the
+            // edit was going to do. When it fails — an edit_file whose SEARCH
+            // block didn't match is the common one — leaving them on screen
+            // draws a file card claiming "+53 −122" for a file that was never
+            // touched. That is the "it says it edited but nothing changed"
+            // report: the write really didn't happen, the UI just said it did.
+            if is_error {
+                last.diff_stat = None;
+                last.diff_preview = None;
+            }
+        }
+        // A tool that touched the project needs the tree to notice. run_command
+        // counts too: `npm create vite@latest` produces a whole directory the
+        // tree would otherwise never show.
+        if !is_error && matches!(tool_name, "write_file" | "edit_file" | "run_command") {
+            self.refresh_file_tree(ctx);
         }
         self.agent_messages.push(ChatMessage::user(format!(
             "TOOL RESULT ({tool_name}):\n{result}"
@@ -4872,6 +4916,11 @@ impl LocalAiChatView {
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             // Starting a fresh chat had a working action and no way to reach it.
             .with_child(self.utility_icon_button(
+                "bundled/svg/clock-rewind.svg",
+                LocalAiChatAction::ToggleChatPicker,
+                true,
+            ))
+            .with_child(self.utility_icon_button(
                 "bundled/svg/add.svg",
                 LocalAiChatAction::NewChat,
                 !self.messages.is_empty(),
@@ -5185,6 +5234,66 @@ impl LocalAiChatView {
                 .with_horizontal_padding(22.)
                 .with_padding_bottom(4.)
                 .finish(),
+            );
+        }
+        Some(self.popup_surface(list.finish()))
+    }
+
+    /// The saved-conversation list.
+    ///
+    /// It existed only in Vibe mode, so in the IDE the panel had no history at
+    /// all — a chat was reachable only while it was the active one. The data and
+    /// the open/delete calls were already there; only this list was missing.
+    fn render_chat_picker(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
+        if !self.chat_picker_open {
+            return None;
+        }
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let summaries = self.chat_summaries();
+
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        if summaries.is_empty() {
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "No saved chats yet.".to_string(),
+                    CHIP_FONT_SIZE,
+                    muted,
+                    true,
+                ))
+                .with_uniform_padding(10.)
+                .finish(),
+            );
+            return Some(self.popup_surface(list.finish()));
+        }
+
+        for summary in summaries {
+            list.add_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            self.picker_row(
+                                appearance,
+                                format!(
+                                    "{}{}",
+                                    if summary.is_active { "●  " } else { "○  " },
+                                    summary.title
+                                ),
+                                LocalAiChatAction::PickChat(summary.id.clone()),
+                                summary.is_active,
+                            ),
+                        )
+                        .finish(),
+                    )
+                    .with_child(self.utility_icon_button(
+                        "bundled/svg/trash-02.svg",
+                        LocalAiChatAction::DeleteChat(summary.id.clone()),
+                        true,
+                    ))
+                    .finish(),
             );
         }
         Some(self.popup_surface(list.finish()))
@@ -6191,7 +6300,16 @@ impl LocalAiChatView {
     /// entry is a shell command, and a Tool entry carrying a diff wrote a file.
     fn step_run_title(&self, start: usize, end: usize, steps: usize) -> String {
         let (mut commands, mut writes, mut reads) = (0usize, 0usize, 0usize);
+        let mut failed = 0usize;
         for entry in &self.messages[start..end] {
+            // A step that errored changed nothing, so it must not be counted as
+            // work done — say so instead.
+            if entry.status == StepStatus::Error {
+                if matches!(entry.role, ChatRole::Tool | ChatRole::Command) {
+                    failed += 1;
+                }
+                continue;
+            }
             match entry.role {
                 ChatRole::Command => commands += 1,
                 ChatRole::Tool if entry.diff_stat.is_some() => writes += 1,
@@ -6218,6 +6336,9 @@ impl LocalAiChatView {
         }
         if reads > 0 {
             parts.push(format!("Read {reads} {}", plural(reads, "file", "files")));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
         }
         if parts.is_empty() {
             return format!("{steps} steps");
@@ -6867,6 +6988,19 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::Stop => {
                 self.stop_turn(ctx);
             }
+            LocalAiChatAction::ToggleChatPicker => {
+                self.chat_picker_open = !self.chat_picker_open;
+                ctx.notify();
+            }
+            LocalAiChatAction::PickChat(id) => {
+                let id = id.clone();
+                self.chat_picker_open = false;
+                self.open_chat(&id, ctx);
+            }
+            LocalAiChatAction::DeleteChat(id) => {
+                let id = id.clone();
+                self.delete_chat(&id, ctx);
+            }
             LocalAiChatAction::ToggleStepGroup(start) => {
                 if !self.expanded_step_groups.remove(start) {
                     self.expanded_step_groups.insert(*start);
@@ -7206,6 +7340,9 @@ impl View for LocalAiChatView {
             root.add_child(picker);
         }
         if let Some(picker) = self.render_mode_picker(appearance) {
+            root.add_child(picker);
+        }
+        if let Some(picker) = self.render_chat_picker(appearance) {
             root.add_child(picker);
         }
 

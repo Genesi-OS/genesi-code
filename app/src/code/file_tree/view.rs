@@ -403,6 +403,25 @@ impl FileTreeView {
     pub fn set_is_active(&mut self, _is_active: bool, _ctx: &mut ViewContext<Self>) {}
 
     #[cfg(feature = "local_fs")]
+    /// Rescan the local roots on disk.
+    ///
+    /// The tree normally only catches up on outside changes when it becomes
+    /// active, which is why a file the AI agent created stayed invisible until
+    /// you switched to search and back. Anything that writes to the project
+    /// behind the tree's back can call this to make the change show up.
+    pub fn refresh_local_directories(&mut self, ctx: &mut ViewContext<Self>) {
+        let local_dirs: Vec<_> = self
+            .displayed_directories
+            .iter()
+            .filter(|p| !self.root_directories.get(p).is_some_and(|r| r.is_remote()))
+            .cloned()
+            .collect();
+        if local_dirs.is_empty() {
+            return;
+        }
+        self.update_directory_contents(&local_dirs, false, ctx);
+    }
+
     fn set_is_active_local_fs(&mut self, is_active: bool, ctx: &mut ViewContext<Self>) {
         if self.is_active == is_active {
             return;
