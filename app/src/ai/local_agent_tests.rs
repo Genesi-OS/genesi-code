@@ -171,3 +171,57 @@ fn every_advertised_tool_schema_maps_back_to_a_tool() {
         );
     }
 }
+
+#[test]
+fn a_missing_project_root_is_named_instead_of_failing_every_tool() {
+    // On hardware a phantom root made mkdir, npm, cd, pwd, read_file and even
+    // `list_files /` all fail with the same bare "No such file or directory",
+    // which pointed at nothing. The root is the one thing they share, so it is
+    // checked once and reported by name.
+    let missing = std::path::Path::new("/definitely/not/here/genesi-test");
+    let result = run_local_tool(
+        missing,
+        &AgentTool::ListFiles {
+            path: ".".to_string(),
+        },
+    );
+    assert!(result.starts_with("error:"), "should be an error: {result}");
+    assert!(
+        result.contains("/definitely/not/here/genesi-test"),
+        "the error must name the root: {result}"
+    );
+}
+
+#[test]
+fn a_real_root_still_runs_its_tools() {
+    // The guard must not reject a root that is fine.
+    let here = std::env::current_dir().expect("a working directory");
+    let result = run_local_tool(
+        &here,
+        &AgentTool::ListFiles {
+            path: ".".to_string(),
+        },
+    );
+    assert!(
+        !result.starts_with("error:"),
+        "an existing root should work: {result}"
+    );
+}
+
+#[test]
+fn a_leading_slash_cannot_escape_the_project() {
+    // Why `list_files /` reported the ROOT as missing rather than listing the
+    // filesystem: the leading slash is stripped, so "/" means the project root.
+    // That containment is deliberate and must stay.
+    let here = std::env::current_dir().expect("a working directory");
+    let escaped = run_local_tool(
+        &here,
+        &AgentTool::ReadFile {
+            path: "/etc/passwd".to_string(),
+        },
+    );
+    assert!(
+        !escaped.contains("root:x:"),
+        "a tool must not read outside the project: {escaped}"
+    );
+}

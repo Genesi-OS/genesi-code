@@ -5288,20 +5288,31 @@ impl Workspace {
             .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
             .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next());
 
+        // Every candidate has to be a directory that EXISTS. A file that was
+        // never saved, or whose folder has since gone, used to hand the agent a
+        // phantom root — and because each branch returned unconditionally, the
+        // terminal-cwd fallback below was never reached. The agent then failed
+        // every single tool with the same bare "No such file or directory": the
+        // shell can't start in a missing directory, and the read tools resolve
+        // against it, so even listing "/" reported a missing path.
+        let usable = |path: std::path::PathBuf| path.is_dir().then_some(path);
+
         if let Some(code_view) = code_view {
             if let Some(editor_handle) = code_view.as_ref(ctx).active_editor() {
                 if let Some(path) = editor_handle.as_ref(ctx).file_path() {
-                    if let Some(root) = crate::ai::local_agent::project_root_from_file(path) {
+                    if let Some(root) =
+                        crate::ai::local_agent::project_root_from_file(path).and_then(usable)
+                    {
                         return Some(root);
                     }
-                    if let Some(parent) = path.parent() {
-                        return Some(parent.to_path_buf());
+                    if let Some(parent) = path.parent().map(Path::to_path_buf).and_then(usable) {
+                        return Some(parent);
                     }
                 }
             }
         }
 
-        pane_group.active_session_path(ctx)
+        pane_group.active_session_path(ctx).and_then(usable)
     }
 
     /// This is meant to be dispatched directly by actions.

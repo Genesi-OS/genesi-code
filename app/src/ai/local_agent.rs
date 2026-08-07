@@ -616,7 +616,29 @@ fn strip_one_trailing_newline(s: &str) -> String {
 
 /// Run a read-only tool against `root`, returning a bounded text result to feed
 /// back to the model. Never reads outside `root`.
+/// Reject a project root that isn't a directory on disk.
+///
+/// Every tool resolves against the root, so a bad one fails ALL of them with the
+/// same unhelpful ENOENT: `run_command` spawns with it as its working directory
+/// ("failed to run command: No such file or directory"), and the read tools join
+/// against it, which is why even `list_files /` reported a missing path — the
+/// leading slash is stripped, so "/" resolves to the root itself. Naming the
+/// directory turns an unreadable cascade into one obvious cause.
+fn check_root(root: &Path) -> Option<String> {
+    if root.is_dir() {
+        return None;
+    }
+    Some(format!(
+        "error: the project root {} does not exist, so no tool can run. Open a \
+         file from the project you want to work in, then try again.",
+        root.display()
+    ))
+}
+
 pub fn run_local_tool(root: &Path, tool: &AgentTool) -> String {
+    if let Some(error) = check_root(root) {
+        return error;
+    }
     match tool {
         AgentTool::ReadFile { path } => read_file(root, path),
         AgentTool::ListFiles { path } => list_files(root, path),
@@ -696,6 +718,9 @@ fn edit_file(root: &Path, rel: &str, search: &str, replace: &str) -> String {
 /// wedge the agent. Uses the project's `command` crate (an `async_process`
 /// wrapper — executor-agnostic, no tokio reactor needed, unlike the SSE path).
 pub async fn run_command(root: &Path, shell_command: &str) -> String {
+    if let Some(error) = check_root(root) {
+        return error;
+    }
     let exec = async {
         let mut cmd = command::r#async::Command::new("sh");
         cmd.arg("-c").arg(shell_command).current_dir(root);
