@@ -46,10 +46,11 @@ use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
     cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
     load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
-    is_tools_unsupported_error, model_supports_vision, set_ai_mode_force, stream_chat,
-    stream_chat_cloud, transport_for, turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment,
-    ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext,
-    LocalEndpoint, CLOUD_KEYS_STORAGE_KEY, DEFAULT_LOCAL_BASE_URL,
+    estimate_tokens, is_tools_unsupported_error, model_supports_vision, reply_budget,
+    set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for, turbo_context_size,
+    turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem,
+    CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
+    ASSUMED_CONTEXT_TOKENS, CLOUD_KEYS_STORAGE_KEY, DEFAULT_LOCAL_BASE_URL, LOCAL_MAX_TOKENS,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -88,6 +89,26 @@ const SYSTEM_PROMPT: &str =
 /// its answer channel; asking again costs one round trip and usually gets the
 /// tool call. Bounded so a model that ONLY ever thinks can't spin forever.
 const MAX_AGENT_NUDGES: u32 = 2;
+
+/// Tokens held back from the prompt so the model can actually reply.
+const REPLY_RESERVE_TOKENS: usize = 768;
+
+/// A trimmed message keeps at least this much, so shrinking never reduces a tool
+/// result to something meaningless — better to drop a message whole than to feed
+/// the model a stub it will misread.
+const MIN_KEPT_MESSAGE_TOKENS: usize = 96;
+
+/// Truncate `text` to roughly `max_tokens`, keeping the START (where a tool
+/// result says what it is) and marking the cut so the model knows it is partial.
+fn clamp_to_tokens(text: &str, max_tokens: usize) -> String {
+    let max_chars = max_tokens.saturating_mul(4);
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n… [truncated to fit the model's context window]");
+    out
+}
 
 /// Marks the AI panel's compose box as a place the file tree can drop onto, so a
 /// file can be dragged straight into the conversation as a reference — the same
@@ -629,6 +650,9 @@ pub struct LocalAiChatView {
     agent_nudges: u32,
     /// Whether this session's server takes the OpenAI `tools` field.
     native_tools: NativeToolSupport,
+    /// The context window llama-server is ACTUALLY running with, read from
+    /// `/props`. `None` until probed; see [`Self::fit_to_context`].
+    server_context: Option<u32>,
     /// Summary of the tool currently running, used to render its step.
     agent_tool_summary: String,
 
@@ -732,6 +756,7 @@ impl LocalAiChatView {
             agent_native_call: None,
             agent_nudges: 0,
             native_tools: NativeToolSupport::Untried,
+            server_context: None,
             agent_tool_summary: String::new(),
             auto_approve: false,
             pending_tool: None,
@@ -859,6 +884,20 @@ impl LocalAiChatView {
         // it narrating ("I'll use list_files") instead of acting.
         let tools = (self.agent_mode && self.native_tools != NativeToolSupport::Unsupported)
             .then(local_agent::tool_schemas);
+        // Fit the conversation to the window BEFORE asking for a reply, and size
+        // the reply against what's left. Sending a fixed max_tokens was its own
+        // bug: asking for 4096 reply tokens on a 4096-token window leaves the
+        // prompt nowhere to go.
+        let messages = self.fit_to_context(messages);
+        let prompt_tokens = messages
+            .iter()
+            .map(|message| estimate_tokens(&message.content))
+            .sum();
+        let reply_tokens = if self.cloud_active {
+            LOCAL_MAX_TOKENS
+        } else {
+            reply_budget(self.effective_context(), prompt_tokens)
+        };
         if self.cloud_active && self.cloud_ready() {
             stream_chat_cloud(
                 self.cloud.provider,
@@ -866,12 +905,87 @@ impl LocalAiChatView {
                 self.active_cloud_key().to_string(),
                 messages,
                 tools,
+                reply_tokens,
             )
         } else {
             // The transport is decided by the MODEL, not by `self.endpoint`
             // alone — see transport_for.
-            stream_chat(transport_for(model, self.endpoint), model, messages, tools)
+            stream_chat(
+                transport_for(model, self.endpoint),
+                model,
+                messages,
+                tools,
+                reply_tokens,
+            )
         }
+    }
+
+    /// Shrink a request until it fits the server's context window.
+    ///
+    /// The agent loop appends every tool result to the conversation and never
+    /// dropped anything, while a single `read_file` can carry 24 KB — about 6k
+    /// tokens. On the 4K window llama-server actually runs with, the first file
+    /// the model read blew the budget and the turn died mid-task with "request
+    /// (4119 tokens) exceeds the available context size (4096 tokens)". That read
+    /// as "the AI randomly stops", because nothing in the UI connected the two.
+    ///
+    /// Order of sacrifice, least useful first: the OLDEST exchanges go before the
+    /// newest (the model needs where it is, not where it started), and only then
+    /// do we start cutting into the bodies of what is left.
+    fn fit_to_context(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        // A cloud provider's window is orders of magnitude bigger and unknown to
+        // us; trimming to a local-sized budget would throw away context for no
+        // reason.
+        if self.cloud_active {
+            return messages;
+        }
+        let n_ctx = self.server_context.unwrap_or(ASSUMED_CONTEXT_TOKENS) as usize;
+        // Leave the model room to actually answer.
+        let budget = n_ctx.saturating_sub(REPLY_RESERVE_TOKENS).max(512);
+
+        let cost = |m: &ChatMessage| estimate_tokens(&m.content);
+        let total = |ms: &[ChatMessage]| -> usize { ms.iter().map(cost).sum() };
+        if total(&messages) <= budget {
+            return messages;
+        }
+
+        // The leading system messages are the instructions plus the file context
+        // the user deliberately attached; they stay unless nothing else is left.
+        let head_len = messages.iter().take_while(|m| m.role == "system").count();
+        let mut head: Vec<ChatMessage> = messages[..head_len].to_vec();
+        let mut tail: Vec<ChatMessage> = messages[head_len..].to_vec();
+
+        // 1. Drop the oldest turns, always keeping the most recent one.
+        while total(&head) + total(&tail) > budget && tail.len() > 1 {
+            tail.remove(0);
+        }
+
+        // 2. Still over: cut into bodies, biggest first, so one huge tool result
+        //    can't starve everything else. One flat list keeps the "which is
+        //    biggest" question simple; bounded so it always terminates.
+        head.extend(tail);
+        let mut messages = head;
+        for _ in 0..64 {
+            let over = total(&messages).saturating_sub(budget);
+            if over == 0 {
+                break;
+            }
+            let Some(index) = (0..messages.len()).max_by_key(|i| cost(&messages[*i])) else {
+                break;
+            };
+            let current = cost(&messages[index]);
+            if current <= MIN_KEPT_MESSAGE_TOKENS {
+                break; // everything is already at the floor
+            }
+            let target = current.saturating_sub(over).max(MIN_KEPT_MESSAGE_TOKENS);
+            messages[index].content = clamp_to_tokens(&messages[index].content, target);
+        }
+        messages
+    }
+
+    /// The context window to budget against, and whether it is a real reading.
+    fn effective_context(&self) -> u32 {
+        self.server_context.unwrap_or(ASSUMED_CONTEXT_TOKENS)
     }
 
     /// Re-read the daemon's published AI Mode state (cheap, synchronous).
@@ -952,19 +1066,36 @@ impl LocalAiChatView {
             },
         );
 
-        ctx.spawn(async { turbo_health_ok().await }, |me, available, ctx| {
-            me.turbo_available = available;
-            // Default to the shared Turbo daemon when it's up and the user
-            // hasn't deliberately picked an endpoint — Code then inherits
-            // GPU offload, the q8 KV cache and the warm model for free
-            // (roadmap 4.1 / 4.0). One-shot: switching sets the endpoint, so
-            // the re-probe below sees `== Turbo` and won't loop.
-            if available && !me.endpoint_user_chosen && me.endpoint != LocalEndpoint::Turbo {
-                me.endpoint = LocalEndpoint::Turbo;
-                me.refresh_models(ctx);
-            }
-            ctx.notify();
-        });
+        // Probe liveness and the REAL context window together: `serve` reuses an
+        // already-running server, so the window Code asked for is routinely not
+        // the window it gets.
+        ctx.spawn(
+            async {
+                let available = turbo_health_ok().await;
+                let context = if available {
+                    turbo_context_size().await
+                } else {
+                    None
+                };
+                (available, context)
+            },
+            |me, (available, context), ctx| {
+                if let Some(context) = context {
+                    me.server_context = Some(context);
+                }
+                me.turbo_available = available;
+                // Default to the shared Turbo daemon when it's up and the user
+                // hasn't deliberately picked an endpoint — Code then inherits
+                // GPU offload, the q8 KV cache and the warm model for free
+                // (roadmap 4.1 / 4.0). One-shot: switching sets the endpoint, so
+                // the re-probe below sees `== Turbo` and won't loop.
+                if available && !me.endpoint_user_chosen && me.endpoint != LocalEndpoint::Turbo {
+                    me.endpoint = LocalEndpoint::Turbo;
+                    me.refresh_models(ctx);
+                }
+                ctx.notify();
+            },
+        );
     }
 
     fn scroll_to_bottom(&self) {

@@ -447,9 +447,19 @@ pub fn is_tools_unsupported_error(message: &str) -> bool {
 /// and once on the answer. At 2048 a model like gpt-oss-20b could think its way
 /// through a task, hit the cap mid-thought, and stop before writing a single
 /// token of `content` — which the agent loop then reported as "the model
-/// returned nothing". llama-server clamps this to whatever the context window
-/// actually leaves free, so raising it costs nothing on a small window.
-const LOCAL_MAX_TOKENS: u32 = 4096;
+/// returned nothing".
+///
+/// This is the CEILING, not the value sent: the caller reduces it to what the
+/// server's context window can actually spare. Asking for 4096 reply tokens on a
+/// 4096-token window leaves no room for the prompt at all.
+pub const LOCAL_MAX_TOKENS: u32 = 4096;
+
+/// The reply budget on a server whose window is `n_ctx`, given a prompt we
+/// estimate at `prompt_tokens`. Never returns zero — a tiny reply beats an error.
+pub fn reply_budget(n_ctx: u32, prompt_tokens: usize) -> u32 {
+    let free = (n_ctx as usize).saturating_sub(prompt_tokens);
+    (free as u32).min(LOCAL_MAX_TOKENS).max(256)
+}
 
 #[derive(Serialize)]
 struct AnthropicChatRequest<'a> {
@@ -622,13 +632,15 @@ pub fn stream_chat(
     model: &str,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
+    reply_tokens: u32,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match endpoint {
         // ollama's native API takes tools in its own shape and its support varies
         // per model; the text protocol is what works there, so leave it alone.
         LocalEndpoint::Ollama => stream_chat_ollama_native(model.to_string(), messages).boxed(),
         LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), None, messages, None, tools).boxed()
+            stream_chat_openai_sse(endpoint.base_url(), None, messages, None, tools, reply_tokens)
+                .boxed()
         }
     }
 }
@@ -644,6 +656,7 @@ pub fn stream_chat_cloud(
     api_key: String,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
+    reply_tokens: u32,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     match provider {
         CloudProviderKind::Anthropic => stream_chat_anthropic_sse(model, messages, api_key).boxed(),
@@ -653,6 +666,7 @@ pub fn stream_chat_cloud(
             messages,
             Some(api_key),
             tools,
+            reply_tokens,
         )
         .boxed(),
     }
@@ -767,6 +781,7 @@ fn stream_chat_openai_sse(
     messages: Vec<ChatMessage>,
     api_key: Option<String>,
     tools: Option<serde_json::Value>,
+    reply_tokens: u32,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // `model: None` means the local llama-server, which must NOT be sent one (see
@@ -778,7 +793,7 @@ fn stream_chat_openai_sse(
         model,
         messages: &messages,
         stream: true,
-        max_tokens: LOCAL_MAX_TOKENS,
+        max_tokens: reply_tokens,
         cache_prompt: is_local,
         tools,
     };
@@ -1229,6 +1244,63 @@ pub const TURBO_LOCAL_BASE_URL: &str = "http://localhost:11435/v1";
 /// once a model is loaded — the reliable liveness signal for Turbo, unlike
 /// `/v1/models`. This is what the AI Mode monitor polls too.
 pub const TURBO_HEALTH_URL: &str = "http://localhost:11435/health";
+
+/// llama-server's runtime settings, including the context window it was actually
+/// started with.
+pub const TURBO_PROPS_URL: &str = "http://localhost:11435/props";
+
+/// What to assume when the server won't say — llama.cpp's own default, and the
+/// value genesi-ai-turbo used to start with.
+pub const ASSUMED_CONTEXT_TOKENS: u32 = 4096;
+
+/// Ask llama-server how big its context window really is.
+///
+/// Code can ASK for a window when it launches Turbo itself, but `serve` reuses an
+/// already-running server, so the request is silently ignored whenever the model
+/// was loaded from the Monitor or by hand. The result was a 4K window the agent
+/// loop knew nothing about, and a turn that died mid-task with "request (4119
+/// tokens) exceeds the available context size (4096 tokens)".
+pub async fn turbo_context_size() -> Option<u32> {
+    #[derive(Deserialize)]
+    struct Props {
+        #[serde(default)]
+        default_generation_settings: GenerationSettings,
+        /// Some builds report it at the top level instead.
+        #[serde(default)]
+        n_ctx: Option<u32>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct GenerationSettings {
+        #[serde(default)]
+        n_ctx: Option<u32>,
+    }
+
+    let client = http_client::Client::new();
+    let response = client
+        .get(TURBO_PROPS_URL)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let props: Props = response.json().await.ok()?;
+    props
+        .default_generation_settings
+        .n_ctx
+        .or(props.n_ctx)
+        .filter(|n| *n > 0)
+}
+
+/// Rough token count for budgeting. Deliberately a cheap approximation (~4 chars
+/// per token) rather than a real tokenizer: the budget only has to keep us
+/// clear of the wall, and being a little pessimistic is free while being wrong
+/// costs the user their turn.
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
 
 /// Where `genesi-aid` publishes its live status (tmpfs, daemon-written).
 pub const AI_MODE_STATE_FILE: &str = "/run/genesi-ai-mode/state.json";

@@ -218,3 +218,35 @@ fn an_ordinary_failure_is_not_mistaken_for_a_tools_refusal() {
         "the tool returned an unexpected result"
     ));
 }
+
+// ── context budgeting ────────────────────────────────────────────────────────
+
+#[test]
+fn a_reply_never_gets_the_whole_window() {
+    // Asking for 4096 reply tokens on a 4096 window leaves the prompt nowhere to
+    // go — the 400 the server returned on hardware.
+    let budget = reply_budget(4096, 3800);
+    assert!(budget <= 296, "reply must fit what the prompt left: {budget}");
+    assert!(budget >= 256, "but never collapse to nothing: {budget}");
+}
+
+#[test]
+fn a_roomy_window_still_caps_the_reply() {
+    // A huge window shouldn't let one turn run away.
+    assert_eq!(reply_budget(131_072, 1_000), LOCAL_MAX_TOKENS);
+}
+
+#[test]
+fn an_overlong_prompt_still_leaves_room_to_answer() {
+    // Even when the prompt already blew the window, ask for something rather
+    // than sending max_tokens: 0 and getting an empty reply.
+    assert_eq!(reply_budget(4096, 999_999), 256);
+}
+
+#[test]
+fn token_estimates_are_pessimistic_not_precise() {
+    assert_eq!(estimate_tokens(""), 0);
+    // ~4 chars per token, rounding UP so the budget errs toward safety.
+    assert_eq!(estimate_tokens("abcd"), 1);
+    assert_eq!(estimate_tokens("abcde"), 2);
+}
