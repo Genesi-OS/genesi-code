@@ -510,6 +510,11 @@ impl CodeView {
                 me.pane_configuration.update(ctx, |pane_config, ctx| {
                     pane_config.refresh_pane_header_overflow_menu_items(ctx);
                 });
+                // The agent's diff baseline lives in the editor VIEW, so closing a
+                // file destroyed it and reopening showed no diff at all — even
+                // though the change was still sitting unreviewed. Ask the AI panel
+                // to put the baseline back.
+                ctx.dispatch_typed_action(&WorkspaceAction::RestoreAgentDiffs);
                 ctx.emit(CodeViewEvent::Pane(PaneEvent::AppStateChanged));
             }
             LocalCodeEditorEvent::FailedToLoad { error: err } => {

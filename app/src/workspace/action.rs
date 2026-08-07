@@ -312,6 +312,10 @@ pub enum WorkspaceAction {
     OpenGenesiReviewTool,
     OpenGenesiFilesTool,
     OpenGenesiTerminalTool,
+    /// Re-apply the local AI agent's unreviewed diff baselines to the code
+    /// editors that are open. Sent when a file finishes loading, because the
+    /// baseline lives in the editor view and does not survive a close/reopen.
+    RestoreAgentDiffs,
     OpenGenesiCanvasTool,
     CloseGenesiCanvas,
     RefreshGenesiCanvas,
@@ -1010,6 +1014,7 @@ impl WorkspaceAction {
             | OpenGenesiReviewTool
             | OpenGenesiFilesTool
             | OpenGenesiTerminalTool
+            | RestoreAgentDiffs
             | OpenGenesiCanvasTool
             | CloseGenesiCanvas
             | RefreshGenesiCanvas

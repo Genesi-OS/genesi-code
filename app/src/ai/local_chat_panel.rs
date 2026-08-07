@@ -2056,6 +2056,22 @@ impl LocalAiChatView {
         }
     }
 
+    /// Re-apply every unreviewed edit's baseline to the editors that are open.
+    ///
+    /// The baseline is state of the editor VIEW, not of the file, so a file that
+    /// gets closed and reopened comes back with no diff even though the change
+    /// has not been reviewed yet. The panel is the one that still knows the
+    /// pre-edit content, so it puts it back whenever a file finishes loading.
+    pub fn restore_pending_diffs(&self, ctx: &mut ViewContext<Self>) {
+        if self.pending_edits.is_empty() {
+            return;
+        }
+        for edit in &self.pending_edits {
+            let original = edit.original.clone().unwrap_or_default();
+            self.update_open_editor_diff(&edit.path, Some(&original), ctx);
+        }
+    }
+
     /// Begin running an (already-approved) tool: reads run inline; run_command
     /// spawns. The loop continues in [`Self::finish_tool`].
     fn start_tool(&mut self, tool: AgentTool, ctx: &mut ViewContext<Self>) {

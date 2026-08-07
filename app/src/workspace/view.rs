@@ -24463,6 +24463,10 @@ impl TypedActionView for Workspace {
                 }
                 ctx.notify();
             }
+            RestoreAgentDiffs => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.restore_pending_diffs(ctx));
+            }
             OpenGenesiTerminalTool => {
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
