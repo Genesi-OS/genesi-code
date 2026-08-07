@@ -256,8 +256,9 @@ impl WarpifyPageView {
                 send_telemetry_from_ctx!(TelemetryEvent::AddAddedSubshellCommand, ctx);
             }
             SubmittableTextInputEvent::Escape => ctx.emit(SettingsPageEvent::FocusModal),
-            // Paste isn't delegated here, so the editor already inserted it.
-            SubmittableTextInputEvent::Paste => {}
+            // Paste isn't delegated here, so the editor already inserted it,
+            // and this input owns its own copy.
+            SubmittableTextInputEvent::Paste | SubmittableTextInputEvent::Copy => {}
         }
     }
 
@@ -276,8 +277,9 @@ impl WarpifyPageView {
                 send_telemetry_from_ctx!(TelemetryEvent::AddDenylistedSubshellCommand, ctx);
             }
             SubmittableTextInputEvent::Escape => ctx.emit(SettingsPageEvent::FocusModal),
-            // Paste isn't delegated here, so the editor already inserted it.
-            SubmittableTextInputEvent::Paste => {}
+            // Paste isn't delegated here, so the editor already inserted it,
+            // and this input owns its own copy.
+            SubmittableTextInputEvent::Paste | SubmittableTextInputEvent::Copy => {}
         }
     }
 
@@ -296,8 +298,9 @@ impl WarpifyPageView {
                 send_telemetry_from_ctx!(TelemetryEvent::AddDenylistedSshTmuxWrapperHost, ctx);
             }
             SubmittableTextInputEvent::Escape => ctx.emit(SettingsPageEvent::FocusModal),
-            // Paste isn't delegated here, so the editor already inserted it.
-            SubmittableTextInputEvent::Paste => {}
+            // Paste isn't delegated here, so the editor already inserted it,
+            // and this input owns its own copy.
+            SubmittableTextInputEvent::Paste | SubmittableTextInputEvent::Copy => {}
         }
     }
 

@@ -4182,10 +4182,16 @@ impl EditorView {
         if self.can_select(ctx) {
             let text = self.selected_text(ctx);
             if text.is_empty() {
-                // Text editors such as the Genesi chat composer own Ctrl+C.
-                // Do not bubble an empty selection to terminal-style parents,
-                // where Copy is also interpreted as interrupt/clear.
-                if self.delegate_paste_handling {
+                // Nothing selected HERE, so the copy was almost certainly meant
+                // for something else the parent owns — the Genesi AI panel's
+                // transcript, for instance, whose selection lives outside this
+                // editor. Swallowing the key silently is what made ctrl-C do
+                // nothing after selecting a chat message.
+                //
+                // Terminal-style parents (`delegate_paste_handling`) already got
+                // this event; `paste_to_parent` composers now do too. Neither
+                // fires when there IS a selection, so normal copy is untouched.
+                if self.delegate_paste_handling || self.paste_to_parent {
                     ctx.emit(Event::Copy);
                 }
             } else {

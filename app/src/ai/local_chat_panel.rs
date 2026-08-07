@@ -998,6 +998,19 @@ impl LocalAiChatView {
             // Files and images become attachment chips; anything else is typed
             // in as usual. Key/model entry never attaches — a pasted API key is
             // text, always.
+            // Ctrl+C with nothing selected in the compose box: the user had
+            // selected a message in the TRANSCRIPT, whose selection the editor
+            // knows nothing about. It used to swallow the key and copy nothing.
+            SubmittableTextInputEvent::Copy => {
+                if let Some(text) = self
+                    .selected_transcript_text
+                    .read()
+                    .clone()
+                    .filter(|text| !text.is_empty())
+                {
+                    ctx.clipboard().write(ClipboardContent::plain_text(text));
+                }
+            }
             SubmittableTextInputEvent::Paste => {
                 if self.input_mode == InputMode::Chat && self.attach_from_clipboard(ctx) {
                     return;
@@ -4210,6 +4223,7 @@ impl LocalAiChatView {
 
     pub fn render_review_sidebar(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
+        let side_tool_close_color: ColorU = theme.sub_text_color(theme.background()).into();
         let mut root = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
@@ -4247,6 +4261,29 @@ impl LocalAiChatView {
                 WorkspaceAction::OpenGenesiCanvasTool,
                 self.active_side_tool == GenesiSideTool::Canvas,
             ))
+            // The panel had no way out from inside itself: once open, the only
+            // way to dismiss it was the toolbar button that opened it.
+            .with_child(
+                EventHandler::new(
+                    Container::new(
+                        ConstrainedBox::new(
+                            Icon::new("bundled/svg/x-close.svg", side_tool_close_color).finish(),
+                        )
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                    )
+                    .with_uniform_padding(6.)
+                    .with_margin_left(4.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ToggleGenesiToolsPanel);
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+            )
             .finish();
         root.add_child(
             Container::new(header)

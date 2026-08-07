@@ -144,6 +144,10 @@ impl SubmittableTextInput {
             // text. With `delegate_paste_handling` on, nothing has been inserted
             // yet — the handler decides, and calls back for the text case.
             EditorEvent::Paste => ctx.emit(SubmittableTextInputEvent::Paste),
+            // Only reaches here when the field had NO selection of its own (see
+            // `EditorView::copy`), i.e. the user meant to copy something the
+            // caller owns.
+            EditorEvent::Copy => ctx.emit(SubmittableTextInputEvent::Copy),
             _ => {}
         }
     }
@@ -273,6 +277,10 @@ pub enum SubmittableTextInputEvent {
     /// [`SubmittableTextInput::set_delegate_paste`], in which case the clipboard
     /// has NOT been inserted and the handler owns what happens next.
     Paste,
+    /// The user pressed copy while this field had nothing selected, so they meant
+    /// to copy something the caller owns. Nothing has been written to the
+    /// clipboard yet.
+    Copy,
 }
 
 impl Entity for SubmittableTextInput {

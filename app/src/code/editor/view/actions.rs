@@ -239,6 +239,18 @@ pub fn init(app: &mut AppContext) {
             "Copy",
             text_entry.clone(),
         ),
+        // CustomAction::Copy resolves to ctrl-shift-c on Linux (Warp's terminal
+        // heritage). Paste below already grew a plain ctrl-v for exactly this
+        // reason; copy never did, so ctrl-c fell through to text input and TYPED
+        // a "c" over the selection. An IDE editor follows the editing convention.
+        FixedBinding::new_per_platform(
+            PerPlatformKeystroke {
+                mac: "cmd-c",
+                linux_and_windows: "ctrl-c",
+            },
+            CodeEditorViewAction::Copy,
+            text_entry.clone(),
+        ),
         // Bindings for paste require the StandardAction and CustomAction binding to work on all platforms.
         FixedBinding::custom(
             CustomAction::Paste,
