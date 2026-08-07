@@ -975,7 +975,16 @@ impl LocalAiChatView {
             if over == 0 {
                 break;
             }
-            let Some(index) = (0..messages.len()).max_by_key(|i| cost(&messages[*i])) else {
+            // NEVER cut the agent's instructions. They are what tells the model
+            // that run_command and the other tools exist at all, so trimming
+            // them turns the agent back into a chatbot that says it "has no
+            // direct access to run commands" — silently, with nothing in the UI
+            // to explain why. Tool results and old turns are expendable; this is
+            // not.
+            let Some(index) = (0..messages.len())
+                .filter(|i| !(i == &0 && messages[0].role == "system"))
+                .max_by_key(|i| cost(&messages[*i]))
+            else {
                 break;
             };
             let current = cost(&messages[index]);
@@ -4846,10 +4855,13 @@ impl LocalAiChatView {
                 theme.active_ui_text_color().into(),
                 false,
             ))
+            // The CURRENT chat's title. This used to be the hardcoded words "New
+            // chat", which never changed and was not a button — clicking it did
+            // nothing because there was nothing there to click.
             .with_child(
                 Container::new(self.label_text(
                     appearance,
-                    "New chat",
+                    Self::chat_title_from_entries(&self.messages),
                     CHIP_FONT_SIZE,
                     theme.disabled_text_color(theme.background()).into(),
                     false,
@@ -4858,6 +4870,12 @@ impl LocalAiChatView {
                 .finish(),
             )
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
+            // Starting a fresh chat had a working action and no way to reach it.
+            .with_child(self.utility_icon_button(
+                "bundled/svg/add.svg",
+                LocalAiChatAction::NewChat,
+                !self.messages.is_empty(),
+            ))
             .with_child(self.utility_icon_button(
                 "bundled/svg/refresh-cw-04.svg",
                 LocalAiChatAction::Refresh,
@@ -6164,6 +6182,49 @@ impl LocalAiChatView {
         (steps >= 2).then_some((end, steps))
     }
 
+    /// Summarise what a run of steps actually DID, by kind.
+    ///
+    /// Calling everything "Ran N commands" was wrong: reading a file, writing
+    /// one and running a shell command are three different things, and lumping
+    /// them together hid whether the agent had touched the disk at all. The
+    /// kinds are told apart by what the transcript already records — a Command
+    /// entry is a shell command, and a Tool entry carrying a diff wrote a file.
+    fn step_run_title(&self, start: usize, end: usize, steps: usize) -> String {
+        let (mut commands, mut writes, mut reads) = (0usize, 0usize, 0usize);
+        for entry in &self.messages[start..end] {
+            match entry.role {
+                ChatRole::Command => commands += 1,
+                ChatRole::Tool if entry.diff_stat.is_some() => writes += 1,
+                ChatRole::Tool => reads += 1,
+                _ => {}
+            }
+        }
+        fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+            if n == 1 {
+                one
+            } else {
+                many
+            }
+        }
+        let mut parts = Vec::new();
+        if commands > 0 {
+            parts.push(format!(
+                "Ran {commands} {}",
+                plural(commands, "command", "commands")
+            ));
+        }
+        if writes > 0 {
+            parts.push(format!("Edited {writes} {}", plural(writes, "file", "files")));
+        }
+        if reads > 0 {
+            parts.push(format!("Read {reads} {}", plural(reads, "file", "files")));
+        }
+        if parts.is_empty() {
+            return format!("{steps} steps");
+        }
+        parts.join(" · ")
+    }
+
     /// One row standing in for a run of tool steps: "Ran 5 commands", expanding
     /// to the individual steps.
     fn render_step_group(
@@ -6176,10 +6237,7 @@ impl LocalAiChatView {
         let theme = appearance.theme();
         let muted: ColorU = theme.disabled_text_color(theme.background()).into();
         let expanded = self.expanded_step_groups.contains(&start);
-        let title = format!(
-            "Ran {steps} command{}",
-            if steps == 1 { "" } else { "s" }
-        );
+        let title = self.step_run_title(start, end, steps);
 
         let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
