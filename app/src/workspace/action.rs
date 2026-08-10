@@ -330,6 +330,29 @@ pub enum WorkspaceAction {
     UpdateGenesiCanvasDrag(Vector2F),
     EndGenesiCanvasDrag,
     SelectGenesiCanvasNode(String),
+
+    // ── Genesi Probe: the built-in API client ──
+    OpenGenesiProbeTool,
+    CloseGenesiProbe,
+    /// Re-walk the project for routes and re-survey ports.
+    RefreshGenesiProbe,
+    /// Re-check ports only — the common case, since the thing that changes
+    /// between two looks is whether the dev server came up, not the routes.
+    RescanGenesiProbePorts,
+    SendGenesiProbeRequest,
+    SelectGenesiProbeRoute(String),
+    /// Swap the host:port the request points at, keeping the path.
+    SelectGenesiProbePort(u16),
+    SetGenesiProbeMethod(String),
+    /// `true` shows the header pane, `false` the body pane.
+    ShowGenesiProbeRequestHeaders(bool),
+    ShowGenesiProbeResponseHeaders(bool),
+    ReplayGenesiProbeHistory(usize),
+    ClearGenesiProbeHistory,
+    CopyGenesiProbeResponse,
+    /// Open Probe prefilled from an endpoint node on the Project Canvas.
+    ProbeGenesiCanvasNode(String),
+
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -1026,6 +1049,20 @@ impl WorkspaceAction {
             | UpdateGenesiCanvasDrag(_)
             | EndGenesiCanvasDrag
             | SelectGenesiCanvasNode(_)
+            | OpenGenesiProbeTool
+            | CloseGenesiProbe
+            | RefreshGenesiProbe
+            | RescanGenesiProbePorts
+            | SendGenesiProbeRequest
+            | SelectGenesiProbeRoute(_)
+            | SelectGenesiProbePort(_)
+            | SetGenesiProbeMethod(_)
+            | ShowGenesiProbeRequestHeaders(_)
+            | ShowGenesiProbeResponseHeaders(_)
+            | ReplayGenesiProbeHistory(_)
+            | ClearGenesiProbeHistory
+            | CopyGenesiProbeResponse
+            | ProbeGenesiCanvasNode(_)
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

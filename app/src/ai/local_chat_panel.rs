@@ -34,7 +34,7 @@ use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::keymap::FixedBinding;
 use warpui::platform::FilePickerConfiguration;
 use warpui::presenter::ChildView;
-use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::units::Pixels;
 use warpui::{
     AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
@@ -52,6 +52,10 @@ use super::local_chat::{
     CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
     ASSUMED_CONTEXT_TOKENS, CLOUD_KEYS_STORAGE_KEY, DEFAULT_LOCAL_BASE_URL, LOCAL_MAX_TOKENS,
 };
+use super::api_probe::{
+    build_url, method_takes_body, scan_ports, send_request, survey_project, ProbePort, ProbeRequest,
+    ProbeResponse, ProbeRoute, ProbeSurvey, PROBE_METHODS,
+};
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
 };
@@ -61,6 +65,7 @@ use super::project_canvas_view::{
 };
 use crate::appearance::Appearance;
 use crate::code::file_tree::FileTreeView;
+use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions};
 use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::settings_view::SettingsSection;
 use crate::util::bindings::CustomAction;
@@ -81,6 +86,43 @@ const MEMPALACE_STORAGE_KEY: &str = "GenesiCodeMempalaceV1";
 const SCROLL_TO_BOTTOM: f32 = 1.0e7;
 const CANVAS_DRAG_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CANVAS_DRAG_MIN_DISTANCE: f32 = 3.;
+
+/// How many past Probe requests stay replayable. Deep enough to get back to the
+/// one before the one you broke, shallow enough that the list stays scannable.
+const PROBE_HISTORY_LIMIT: usize = 20;
+
+/// Turn the Canvas's body hint (`"JSON fields: name, email"`) into a JSON
+/// skeleton. Any other shape of hint — a type name, a note that the schema is
+/// only knowable at runtime — has no fields to lay out, so the body is left
+/// empty rather than filled with a guess.
+fn probe_body_template(hint: &str) -> Option<String> {
+    let fields = hint
+        .strip_prefix("JSON fields: ")?
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return None;
+    }
+    let body = fields
+        .iter()
+        .map(|field| format!("  \"{field}\": \"\""))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    Some(format!("{{\n{body}\n}}"))
+}
+
+/// The path (and query) of a URL that may have been typed by hand, so switching
+/// ports keeps the request pointed at the same route.
+fn probe_path_of(url: &str) -> String {
+    let url = url.trim();
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    match after_scheme.find('/') {
+        Some(slash) => after_scheme[slash..].to_string(),
+        None => "/".to_string(),
+    }
+}
 
 const SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant running locally on Genesi OS. Be concise.";
@@ -345,6 +387,40 @@ enum ProjectCanvasDragState {
         pointer: Vector2F,
         position: Vector2F,
     },
+}
+
+/// What Genesi Probe knows about the project it is pointed at.
+#[derive(Debug)]
+enum ProbeState {
+    NoProject,
+    Loading(PathBuf),
+    Ready(Arc<ProbeSurvey>),
+    Error(String),
+}
+
+/// Where the current request is. Separate from [`ProbeState`] because a failed
+/// request says nothing about the survey — the routes are still valid, the
+/// server just isn't up.
+#[derive(Debug)]
+enum ProbeResponseState {
+    Idle,
+    InFlight,
+    /// Boxed: [`ProbeResponse`] carries the whole body, and this enum is a field
+    /// on a view that is moved around on every update.
+    Ready(Box<ProbeResponse>),
+    Failed(String),
+}
+
+/// A request the user already sent, kept so it can be fired again unchanged.
+#[derive(Debug, Clone)]
+struct ProbeHistoryEntry {
+    method: String,
+    url: String,
+    headers: String,
+    body: String,
+    /// `None` when the request never reached a server.
+    status: Option<u16>,
+    elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -709,6 +785,28 @@ pub struct LocalAiChatView {
     /// Size of the graph surface, measured by the canvas element during layout
     /// and read back here so off-screen nodes are never even built.
     pub(super) project_canvas_viewport: CanvasViewport,
+
+    // ── Genesi Probe ──
+    probe_state: ProbeState,
+    /// Bumped on every survey so a slow scan that finishes after the user moved
+    /// to another project cannot overwrite the newer result.
+    probe_generation: u64,
+    /// Same guard for in-flight requests: pressing Send twice must not let the
+    /// first response land on top of the second.
+    probe_request_generation: u64,
+    probe_method: String,
+    probe_url: ViewHandle<EditorView>,
+    probe_headers_input: ViewHandle<EditorView>,
+    probe_body_input: ViewHandle<EditorView>,
+    probe_selected_route: Option<String>,
+    probe_response: ProbeResponseState,
+    probe_history: Vec<ProbeHistoryEntry>,
+    /// Which pane the request editor shows: headers when set, body otherwise.
+    probe_show_request_headers: bool,
+    probe_show_response_headers: bool,
+    probe_sidebar_scroll: ClippedScrollStateHandle,
+    probe_response_scroll: ClippedScrollStateHandle,
+
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -732,6 +830,28 @@ impl LocalAiChatView {
         ctx.subscribe_to_view(&input, |me, _, event, ctx| {
             me.handle_input_event(event, ctx);
         });
+
+        // Probe's three fields are plain editors rather than
+        // `SubmittableTextInput`s: that component clears its buffer on submit,
+        // which is right for a chat compose box and wrong for a URL you want to
+        // tweak and send again.
+        let probe_url = Self::probe_editor(
+            ctx,
+            true,
+            "http://127.0.0.1:3000/api/users  ·  or just localhost:8080/health",
+        );
+        ctx.subscribe_to_view(&probe_url, |me, _, event, ctx| {
+            // Enter in the URL field sends, the way every API client behaves.
+            if matches!(event, EditorEvent::Enter) {
+                me.send_probe_request(ctx);
+            }
+        });
+        let probe_headers_input = Self::probe_editor(
+            ctx,
+            false,
+            "Authorization: Bearer …\nAccept: application/json",
+        );
+        let probe_body_input = Self::probe_editor(ctx, false, "{\n  \"name\": \"value\"\n}");
 
         let mut view = Self {
             weak_handle: ctx.handle(),
@@ -797,6 +917,20 @@ impl LocalAiChatView {
             project_canvas_palette_scroll: ClippedScrollStateHandle::default(),
             project_canvas_inspector_scroll: ClippedScrollStateHandle::default(),
             project_canvas_viewport: CanvasViewport::default(),
+            probe_state: ProbeState::NoProject,
+            probe_generation: 0,
+            probe_request_generation: 0,
+            probe_method: "GET".to_string(),
+            probe_url,
+            probe_headers_input,
+            probe_body_input,
+            probe_selected_route: None,
+            probe_response: ProbeResponseState::Idle,
+            probe_history: Vec::new(),
+            probe_show_request_headers: false,
+            probe_show_response_headers: false,
+            probe_sidebar_scroll: ClippedScrollStateHandle::default(),
+            probe_response_scroll: ClippedScrollStateHandle::default(),
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -3021,6 +3155,22 @@ impl LocalAiChatView {
                 .finish(),
             );
 
+            // An endpoint on the Canvas is a thing you can *call*, not just read
+            // about. This hands it to Probe already filled in.
+            if node.kind == CanvasNodeKind::Endpoint {
+                content.add_child(
+                    Container::new(self.workspace_chip(
+                        appearance,
+                        "Send request in Probe".to_string(),
+                        None,
+                        WorkspaceAction::ProbeGenesiCanvasNode(node.id.clone()),
+                        false,
+                    ))
+                    .with_margin_top(14.)
+                    .finish(),
+                );
+            }
+
             if let Some(route) = &node.route {
                 content.add_child(
                     Container::new(self.render_canvas_inspector_field(
@@ -3636,6 +3786,932 @@ impl LocalAiChatView {
         Container::new(root.finish())
             .with_background(theme.background())
             .finish()
+    }
+
+    // ───────────────────── Genesi Probe — rendering ─────────────────────
+
+    pub fn render_api_probe_workspace(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut root = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(self.render_probe_header(appearance))
+                    .with_padding_left(16.)
+                    .with_padding_right(16.)
+                    .with_padding_top(12.)
+                    .with_padding_bottom(12.)
+                    .finish(),
+            );
+
+        match &self.probe_state {
+            ProbeState::NoProject => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "No project detected",
+                        "Open a project folder or focus a source file, then refresh Probe. You can still type a URL by hand once a project is open.",
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            ProbeState::Loading(path) => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "Surveying project…",
+                        &format!(
+                            "Reading {} for endpoints and declared ports, and checking which ports are listening. No request is sent while scanning.",
+                            path.display()
+                        ),
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            ProbeState::Error(error) => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(appearance, "Survey failed", error))
+                        .with_uniform_padding(120.)
+                        .finish(),
+                )
+                .finish(),
+            ),
+            ProbeState::Ready(survey) => {
+                root.add_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(
+                            Flex::row()
+                                .with_main_axis_size(MainAxisSize::Max)
+                                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                                .with_child(
+                                    ConstrainedBox::new(
+                                        self.render_probe_sidebar(appearance, survey),
+                                    )
+                                    .with_width(272.)
+                                    .finish(),
+                                )
+                                .with_child(
+                                    Expanded::new(
+                                        1.,
+                                        Container::new(self.render_probe_console(appearance))
+                                            .with_margin_left(12.)
+                                            .finish(),
+                                    )
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_padding_left(16.)
+                        .with_padding_right(16.)
+                        .finish(),
+                    )
+                    .finish(),
+                );
+                root.add_child(self.render_probe_status_bar(appearance, survey));
+            }
+        }
+
+        Container::new(root.finish())
+            .with_background(theme.background())
+            .finish()
+    }
+
+    fn render_probe_header(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent: ColorU = theme.terminal_colors().normal.cyan.into();
+        let subtitle = match &self.probe_state {
+            ProbeState::Ready(survey) => format!(
+                "{}  ·  {} endpoints  ·  {} of {} ports open",
+                survey.project_name,
+                survey.routes.len(),
+                survey.open_port_count(),
+                survey.ports.len()
+            ),
+            _ => "Endpoints, ports, and requests — without leaving the editor".to_string(),
+        };
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ConstrainedBox::new(
+                    Container::new(
+                        CoreIcon::Globe
+                            .to_warpui_icon(ThemeFill::Solid(accent))
+                            .finish(),
+                    )
+                    .with_uniform_padding(8.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                    .with_background(
+                        theme
+                            .surface_1()
+                            .blend(&ThemeFill::Solid(accent).with_opacity(42)),
+                    )
+                    .finish(),
+                )
+                .with_width(34.)
+                .with_height(34.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_child(self.label_text(
+                            appearance,
+                            "Genesi Probe".to_string(),
+                            18.,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .with_child(self.label_text(
+                            appearance,
+                            subtitle,
+                            11.,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                )
+                .with_margin_left(12.)
+                .finish(),
+            )
+            .with_child(Expanded::new(1., Empty::new().finish()).finish())
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Rescan ports".to_string(),
+                    None,
+                    WorkspaceAction::RescanGenesiProbePorts,
+                    false,
+                ))
+                .with_margin_left(10.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Refresh".to_string(),
+                    None,
+                    WorkspaceAction::RefreshGenesiProbe,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Canvas".to_string(),
+                    None,
+                    WorkspaceAction::OpenGenesiCanvasTool,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Close".to_string(),
+                    None,
+                    WorkspaceAction::CloseGenesiProbe,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .finish()
+    }
+
+    fn render_probe_status_bar(
+        &self,
+        appearance: &Appearance,
+        survey: &ProbeSurvey,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let colors = &theme.terminal_colors().normal;
+        let (dot, label): (ColorU, String) = match survey.preferred_port() {
+            Some(port) => (colors.green.into(), format!("Target:  {}", port.base_url())),
+            None => (
+                colors.yellow.into(),
+                "No listening port found — start the server, or send to any URL by hand".to_string(),
+            ),
+        };
+        let stacks = if survey.stacks.is_empty() {
+            "source-only analysis".to_string()
+        } else {
+            survey.stacks.join(" · ")
+        };
+
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(Empty::new().finish())
+                            .with_background_color(dot)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                            .finish(),
+                    )
+                    .with_width(8.)
+                    .with_height(8.)
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(self.label_text(appearance, label, 12., dot, false))
+                        .with_margin_left(8.)
+                        .finish(),
+                )
+                .with_child(Expanded::new(1., Empty::new().finish()).finish())
+                .with_child(self.label_text(
+                    appearance,
+                    stacks,
+                    11.,
+                    theme.disabled_text_color(theme.background()).into(),
+                    false,
+                ))
+                .finish(),
+        )
+        .with_uniform_padding(14.)
+        .finish()
+    }
+
+    fn render_probe_section_label(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        top_margin: f32,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(self.label_text(
+            appearance,
+            label,
+            10.,
+            theme.disabled_text_color(theme.background()).into(),
+            false,
+        ))
+        .with_margin_top(top_margin)
+        .with_margin_bottom(6.)
+        .with_padding_left(2.)
+        .finish()
+    }
+
+    fn render_probe_sidebar(
+        &self,
+        appearance: &Appearance,
+        survey: &ProbeSurvey,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        list.add_child(self.render_probe_section_label(
+            appearance,
+            format!("PORTS  ·  {} OPEN", survey.open_port_count()),
+            0.,
+        ));
+        for port in &survey.ports {
+            list.add_child(self.render_probe_port_row(appearance, port));
+        }
+
+        list.add_child(self.render_probe_section_label(
+            appearance,
+            format!("ENDPOINTS  ·  {}", survey.routes.len()),
+            16.,
+        ));
+        if survey.routes.is_empty() {
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "No endpoints found in source. Type a URL above and send anyway."
+                        .to_string(),
+                    11.,
+                    muted,
+                    true,
+                ))
+                .with_uniform_padding(8.)
+                .finish(),
+            );
+        }
+        for route in &survey.routes {
+            list.add_child(self.render_probe_route_row(appearance, route));
+        }
+
+        if !self.probe_history.is_empty() {
+            list.add_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            self.render_probe_section_label(
+                                appearance,
+                                "HISTORY".to_string(),
+                                16.,
+                            ),
+                        )
+                        .finish(),
+                    )
+                    .with_child(self.workspace_chip(
+                        appearance,
+                        "Clear".to_string(),
+                        None,
+                        WorkspaceAction::ClearGenesiProbeHistory,
+                        false,
+                    ))
+                    .finish(),
+            );
+            for (index, entry) in self.probe_history.iter().enumerate() {
+                list.add_child(self.render_probe_history_row(appearance, index, entry));
+            }
+        }
+
+        Container::new(
+            ClippedScrollable::vertical(
+                self.probe_sidebar_scroll.clone(),
+                Container::new(list.finish()).with_uniform_padding(10.).finish(),
+                ScrollbarWidth::Auto,
+                theme.disabled_ui_text_color().into(),
+                theme.active_ui_text_color().into(),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_probe_port_row(&self, appearance: &Appearance, port: &ProbePort) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let port_number = port.port;
+        let accent: ColorU = if port.open {
+            theme.terminal_colors().normal.green.into()
+        } else {
+            theme.disabled_text_color(theme.background()).into()
+        };
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ConstrainedBox::new(
+                    Container::new(Empty::new().finish())
+                        .with_background_color(accent)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        .finish(),
+                )
+                .with_width(7.)
+                .with_height(7.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                        .with_child(self.mono_text(
+                            appearance,
+                            port.port.to_string(),
+                            13.,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .with_child(self.label_text(
+                            appearance,
+                            port.detail(),
+                            10.,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                )
+                .with_margin_left(9.)
+                .finish(),
+            )
+            .finish();
+
+        EventHandler::new(
+            Container::new(row)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(7.)
+                .with_margin_bottom(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_background(theme.background())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::SelectGenesiProbePort(port_number));
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    fn render_probe_route_row(
+        &self,
+        appearance: &Appearance,
+        route: &ProbeRoute,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let selected = self.probe_selected_route.as_deref() == Some(route.id.as_str());
+        let accent = self.probe_method_color(appearance, &route.method);
+        let subtitle = match route.placeholders().as_slice() {
+            [] => format!("{}:{}", route.source.display(), route.line),
+            parameters => format!("fill in {}", parameters.join(", ")),
+        };
+
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(self.render_probe_method_badge(appearance, &route.method))
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Container::new(
+                        Flex::column()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                            .with_child(self.mono_text(
+                                appearance,
+                                route.route.clone(),
+                                12.,
+                                theme.main_text_color(theme.background()).into(),
+                                false,
+                            ))
+                            .with_child(self.label_text(
+                                appearance,
+                                subtitle,
+                                10.,
+                                theme.disabled_text_color(theme.background()).into(),
+                                false,
+                            ))
+                            .finish(),
+                    )
+                    .with_margin_left(8.)
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish();
+
+        let background = if selected {
+            theme
+                .surface_1()
+                .blend(&ThemeFill::Solid(accent).with_opacity(34))
+        } else {
+            theme.background()
+        };
+        let border = if selected {
+            Border::all(1.).with_border_color(accent)
+        } else {
+            Border::all(1.).with_border_fill(theme.outline())
+        };
+        let id = route.id.clone();
+
+        EventHandler::new(
+            Container::new(row)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(7.)
+                .with_margin_bottom(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_background(background)
+                .with_border(border)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::SelectGenesiProbeRoute(id.clone()));
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    fn render_probe_history_row(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        entry: &ProbeHistoryEntry,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let colors = &theme.terminal_colors().normal;
+        let (status_color, status_label): (ColorU, String) = match entry.status {
+            Some(status) if (200..300).contains(&status) => {
+                (colors.green.into(), format!("{status} · {} ms", entry.elapsed_ms))
+            }
+            Some(status) if (300..400).contains(&status) => {
+                (colors.yellow.into(), format!("{status} · {} ms", entry.elapsed_ms))
+            }
+            Some(status) => (colors.red.into(), format!("{status} · {} ms", entry.elapsed_ms)),
+            None => (colors.red.into(), "no response".to_string()),
+        };
+
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(self.render_probe_method_badge(appearance, &entry.method))
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Container::new(
+                        Flex::column()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                            .with_child(self.mono_text(
+                                appearance,
+                                probe_path_of(&entry.url),
+                                11.,
+                                theme.main_text_color(theme.background()).into(),
+                                false,
+                            ))
+                            .with_child(self.label_text(
+                                appearance,
+                                status_label,
+                                10.,
+                                status_color,
+                                false,
+                            ))
+                            .finish(),
+                    )
+                    .with_margin_left(8.)
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish();
+
+        EventHandler::new(
+            Container::new(row)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .with_margin_bottom(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_background(theme.background())
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ReplayGenesiProbeHistory(index));
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    /// Methods are colour-coded the way every API client does it, because the
+    /// method is what tells you whether a click is safe.
+    fn probe_method_color(&self, appearance: &Appearance, method: &str) -> ColorU {
+        let colors = &appearance.theme().terminal_colors().normal;
+        match method.trim().to_ascii_uppercase().as_str() {
+            "GET" | "HEAD" => colors.green.into(),
+            "POST" => colors.yellow.into(),
+            "PUT" | "PATCH" => colors.blue.into(),
+            "DELETE" => colors.red.into(),
+            _ => colors.magenta.into(),
+        }
+    }
+
+    fn render_probe_method_badge(
+        &self,
+        appearance: &Appearance,
+        method: &str,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent = self.probe_method_color(appearance, method);
+        ConstrainedBox::new(
+            Container::new(self.mono_text(appearance, method.to_string(), 9., accent, false))
+                .with_horizontal_padding(5.)
+                .with_vertical_padding(3.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+                .with_background(
+                    theme
+                        .surface_1()
+                        .blend(&ThemeFill::Solid(accent).with_opacity(46)),
+                )
+                .finish(),
+        )
+        .with_width(52.)
+        .finish()
+    }
+
+    fn render_probe_console(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.render_probe_request_pane(appearance))
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_probe_response_pane(appearance))
+                        .with_margin_top(12.)
+                        .finish(),
+                )
+                .finish(),
+            )
+            .finish()
+    }
+
+    /// Wrap one of Probe's editors in a surface. The editor draws no frame of
+    /// its own, so the container is what makes it read as a field.
+    fn render_probe_input(
+        &self,
+        appearance: &Appearance,
+        field: &ViewHandle<EditorView>,
+    ) -> Box<dyn Element> {
+        appearance
+            .ui_builder()
+            .text_input(field.clone())
+            .with_style(UiComponentStyles {
+                background: Some(Fill::Solid(ColorU::transparent_black())),
+                border_color: Some(Fill::Solid(ColorU::transparent_black())),
+                padding: Some(Coords::uniform(8.)),
+                ..Default::default()
+            })
+            .build()
+            .finish()
+    }
+
+    fn render_probe_request_pane(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let sending = matches!(self.probe_response, ProbeResponseState::InFlight);
+
+        let mut methods = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        for method in PROBE_METHODS {
+            methods.add_child(self.workspace_chip(
+                appearance,
+                (*method).to_string(),
+                None,
+                WorkspaceAction::SetGenesiProbeMethod((*method).to_string()),
+                self.probe_method.eq_ignore_ascii_case(method),
+            ));
+        }
+
+        let url_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_probe_input(appearance, &self.probe_url))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                        .with_background(theme.background())
+                        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    if sending {
+                        "Sending…".to_string()
+                    } else {
+                        "Send".to_string()
+                    },
+                    None,
+                    WorkspaceAction::SendGenesiProbeRequest,
+                    !sending,
+                ))
+                .with_margin_left(10.)
+                .finish(),
+            )
+            .finish();
+
+        // The body pane is hidden for methods that do not carry one, so a GET
+        // does not offer a field whose contents would be silently dropped.
+        let takes_body = method_takes_body(&self.probe_method);
+        let showing_headers = self.probe_show_request_headers || !takes_body;
+        let mut tabs = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if takes_body {
+            tabs.add_child(self.workspace_chip(
+                appearance,
+                "Body".to_string(),
+                None,
+                WorkspaceAction::ShowGenesiProbeRequestHeaders(false),
+                !showing_headers,
+            ));
+        }
+        tabs.add_child(self.workspace_chip(
+            appearance,
+            "Headers".to_string(),
+            None,
+            WorkspaceAction::ShowGenesiProbeRequestHeaders(true),
+            showing_headers,
+        ));
+        if !takes_body {
+            tabs.add_child(self.label_text(
+                appearance,
+                format!("{} sends no body", self.probe_method.to_ascii_uppercase()),
+                10.,
+                theme.disabled_text_color(theme.background()).into(),
+                false,
+            ));
+        }
+
+        let field = if showing_headers {
+            &self.probe_headers_input
+        } else {
+            &self.probe_body_input
+        };
+
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(methods.finish())
+                .with_child(Container::new(url_row).with_margin_top(10.).finish())
+                .with_child(Container::new(tabs.finish()).with_margin_top(12.).finish())
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(self.render_probe_input(appearance, field))
+                            .with_height(132.)
+                            .finish(),
+                    )
+                    .with_margin_top(8.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_background(theme.background())
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(14.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_probe_response_pane(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let colors = &theme.terminal_colors().normal;
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+
+        let mut header = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        let body: Box<dyn Element> = match &self.probe_response {
+            ProbeResponseState::Idle => {
+                header.add_child(self.label_text(
+                    appearance,
+                    "Response".to_string(),
+                    12.,
+                    muted,
+                    false,
+                ));
+                self.label_text(
+                    appearance,
+                    "Pick an endpoint on the left, or type a URL, then press Send. Enter in the URL field sends too."
+                        .to_string(),
+                    12.,
+                    muted,
+                    true,
+                )
+            }
+            ProbeResponseState::InFlight => {
+                header.add_child(self.label_text(
+                    appearance,
+                    "Waiting for the server…".to_string(),
+                    12.,
+                    colors.yellow.into(),
+                    false,
+                ));
+                self.label_text(appearance, String::new(), 12., muted, false)
+            }
+            ProbeResponseState::Failed(error) => {
+                header.add_child(self.label_text(
+                    appearance,
+                    "Request failed".to_string(),
+                    12.,
+                    colors.red.into(),
+                    false,
+                ));
+                header.add_child(Expanded::new(1., Empty::new().finish()).finish());
+                header.add_child(self.workspace_chip(
+                    appearance,
+                    "Copy".to_string(),
+                    None,
+                    WorkspaceAction::CopyGenesiProbeResponse,
+                    false,
+                ));
+                self.mono_text(
+                    appearance,
+                    error.clone(),
+                    MONO_FONT_SIZE,
+                    colors.red.into(),
+                    true,
+                )
+            }
+            ProbeResponseState::Ready(response) => {
+                let status_color: ColorU = if response.is_success() {
+                    colors.green.into()
+                } else if response.status >= 500 {
+                    colors.red.into()
+                } else {
+                    colors.yellow.into()
+                };
+                header.add_child(
+                    Container::new(self.mono_text(
+                        appearance,
+                        response.status_line(),
+                        12.,
+                        status_color,
+                        false,
+                    ))
+                    .with_horizontal_padding(8.)
+                    .with_vertical_padding(4.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .with_background(
+                        theme
+                            .surface_1()
+                            .blend(&ThemeFill::Solid(status_color).with_opacity(46)),
+                    )
+                    .finish(),
+                );
+                let mut summary = format!(
+                    "{} ms  ·  {}",
+                    response.elapsed_ms,
+                    response.size_label()
+                );
+                if response.truncated {
+                    summary.push_str("  ·  body truncated for display");
+                }
+                header.add_child(
+                    Container::new(self.label_text(appearance, summary, 11., muted, false))
+                        .with_margin_left(10.)
+                        .finish(),
+                );
+                header.add_child(Expanded::new(1., Empty::new().finish()).finish());
+                header.add_child(self.workspace_chip(
+                    appearance,
+                    "Body".to_string(),
+                    None,
+                    WorkspaceAction::ShowGenesiProbeResponseHeaders(false),
+                    !self.probe_show_response_headers,
+                ));
+                header.add_child(self.workspace_chip(
+                    appearance,
+                    format!("Headers ({})", response.headers.len()),
+                    None,
+                    WorkspaceAction::ShowGenesiProbeResponseHeaders(true),
+                    self.probe_show_response_headers,
+                ));
+                header.add_child(self.workspace_chip(
+                    appearance,
+                    "Copy".to_string(),
+                    None,
+                    WorkspaceAction::CopyGenesiProbeResponse,
+                    false,
+                ));
+
+                let text = if self.probe_show_response_headers {
+                    response
+                        .headers
+                        .iter()
+                        .map(|(key, value)| format!("{key}: {value}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else if response.body.trim().is_empty() {
+                    "<empty body>".to_string()
+                } else {
+                    response.body.clone()
+                };
+                self.mono_text(
+                    appearance,
+                    text,
+                    MONO_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                )
+            }
+        };
+
+        Container::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(header.finish())
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(
+                            ClippedScrollable::vertical(
+                                self.probe_response_scroll.clone(),
+                                body,
+                                ScrollbarWidth::Auto,
+                                theme.disabled_ui_text_color().into(),
+                                theme.active_ui_text_color().into(),
+                                Fill::None,
+                            )
+                            .finish(),
+                        )
+                        .with_margin_top(10.)
+                        .finish(),
+                    )
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(14.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
     }
 
     fn canvas_node_accent(&self, appearance: &Appearance, kind: CanvasNodeKind) -> ColorU {
@@ -4340,6 +5416,354 @@ impl LocalAiChatView {
         if ended {
             ctx.notify();
         }
+    }
+
+    // ──────────────────────────── Genesi Probe ────────────────────────────
+    //
+    // The API client. Discovery is shared with the Canvas (same walk, same
+    // routes); what Probe adds is the port survey and the round trip.
+
+    /// One of Probe's three input fields.
+    ///
+    /// These are plain [`EditorView`]s rather than [`SubmittableTextInput`]s
+    /// because that component clears its buffer on submit — correct for a chat
+    /// compose box, wrong for a URL you send, adjust, and send again.
+    fn probe_editor(
+        ctx: &mut ViewContext<Self>,
+        single_line: bool,
+        placeholder: &'static str,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = EditorOptions {
+                // The URL grows to its content; the body and header panes get a
+                // fixed box and scroll inside it, the way a code editor does.
+                autogrow: single_line,
+                soft_wrap: !single_line,
+                single_line,
+                text: TextOptions::ui_font_size(appearance),
+                ..Default::default()
+            };
+            EditorView::new(options, ctx)
+        });
+        editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text(placeholder, ctx);
+        });
+        editor
+    }
+
+    fn probe_field_text(
+        &self,
+        field: &ViewHandle<EditorView>,
+        ctx: &mut ViewContext<Self>,
+    ) -> String {
+        field.read(ctx, |editor, ctx| editor.buffer_text(ctx))
+    }
+
+    fn set_probe_field(
+        &self,
+        field: &ViewHandle<EditorView>,
+        value: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        field.update(ctx, |editor, ctx| editor.set_buffer_text(value, ctx));
+    }
+
+    pub fn open_api_probe(&mut self, project_root: Option<PathBuf>, ctx: &mut ViewContext<Self>) {
+        // Reopening Probe on the project it already surveyed must not throw the
+        // survey away — the ports it found are the expensive part.
+        let already_surveyed = match (&self.probe_state, &project_root) {
+            (ProbeState::Ready(survey), Some(root)) => &survey.root == root,
+            _ => false,
+        };
+        if already_surveyed {
+            ctx.notify();
+            return;
+        }
+        self.refresh_api_probe(project_root, ctx);
+    }
+
+    pub fn refresh_api_probe(
+        &mut self,
+        project_root: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.probe_generation = self.probe_generation.wrapping_add(1);
+        let generation = self.probe_generation;
+        let Some(root) = project_root else {
+            self.probe_state = ProbeState::NoProject;
+            self.probe_selected_route = None;
+            ctx.notify();
+            return;
+        };
+
+        self.agent_root = Some(root.clone());
+        self.probe_state = ProbeState::Loading(root.clone());
+        ctx.notify();
+
+        // Hand the Canvas its graph back when it already analysed this exact
+        // project: the route half of the survey IS that walk, and repeating it
+        // is the difference between Probe opening instantly and stalling.
+        let graph = match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) if graph.root == root => Some(graph.clone()),
+            _ => None,
+        };
+
+        ctx.spawn(
+            async move { tokio::task::spawn_blocking(move || survey_project(&root, graph)).await },
+            move |me, result, ctx| {
+                if me.probe_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(survey) => me.apply_probe_survey(Arc::new(survey), ctx),
+                    Err(error) => {
+                        me.probe_state = ProbeState::Error(format!(
+                            "The background scanner stopped unexpectedly: {error}"
+                        ));
+                        me.probe_selected_route = None;
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    fn apply_probe_survey(&mut self, survey: Arc<ProbeSurvey>, ctx: &mut ViewContext<Self>) {
+        // Seed the request only when the field is untouched. A rescan that
+        // landed while the user was typing a URL must not rewrite it.
+        let current = self.probe_field_text(&self.probe_url, ctx);
+        if current.trim().is_empty() {
+            let url = match survey.routes.first() {
+                Some(route) => {
+                    self.probe_method = route.method.clone();
+                    self.probe_selected_route = Some(route.id.clone());
+                    build_url(&survey.base_url(), &route.route)
+                }
+                None => survey.base_url(),
+            };
+            self.set_probe_field(&self.probe_url, &url, ctx);
+        }
+        self.probe_state = ProbeState::Ready(survey);
+    }
+
+    /// Re-check ports without re-walking the project. This is the button people
+    /// press, because the thing that changes between two looks is whether the
+    /// dev server came up — not the routes.
+    pub fn rescan_probe_ports(&mut self, ctx: &mut ViewContext<Self>) {
+        let ProbeState::Ready(survey) = &self.probe_state else {
+            return;
+        };
+        let survey = survey.clone();
+        let root = survey.root.clone();
+        let generation = self.probe_generation;
+        ctx.spawn(
+            async move { tokio::task::spawn_blocking(move || scan_ports(&root)).await },
+            move |me, result, ctx| {
+                if me.probe_generation != generation {
+                    return;
+                }
+                if let Ok(ports) = result {
+                    let mut refreshed = (*survey).clone();
+                    refreshed.ports = ports;
+                    me.probe_state = ProbeState::Ready(Arc::new(refreshed));
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    pub fn select_probe_route(&mut self, id: &str, ctx: &mut ViewContext<Self>) {
+        let ProbeState::Ready(survey) = &self.probe_state else {
+            return;
+        };
+        let Some(route) = survey.route(id) else {
+            return;
+        };
+        let method = route.method.clone();
+        let url = build_url(&survey.base_url(), &route.route);
+        let body_hint = route.body_hint.clone();
+
+        self.probe_selected_route = Some(id.to_string());
+        self.probe_method = method.clone();
+        self.set_probe_field(&self.probe_url, &url, ctx);
+        if method_takes_body(&method) {
+            self.seed_probe_body(body_hint.as_deref(), ctx);
+            self.probe_show_request_headers = false;
+        }
+        ctx.notify();
+    }
+
+    /// Lay out the fields the handler appears to read, so a POST is one edit
+    /// away from sendable instead of an empty box. Never overwrites a body the
+    /// user already wrote.
+    fn seed_probe_body(&mut self, hint: Option<&str>, ctx: &mut ViewContext<Self>) {
+        let Some(template) = hint.and_then(probe_body_template) else {
+            return;
+        };
+        let current = self.probe_field_text(&self.probe_body_input, ctx);
+        if current.trim().is_empty() {
+            self.set_probe_field(&self.probe_body_input, &template, ctx);
+        }
+    }
+
+    /// Retarget the current request at another port, keeping the path — that is
+    /// the whole point of having the port list next to the request.
+    pub fn select_probe_port(&mut self, port: u16, ctx: &mut ViewContext<Self>) {
+        let current = self.probe_field_text(&self.probe_url, ctx);
+        let url = build_url(&format!("http://127.0.0.1:{port}"), &probe_path_of(&current));
+        self.set_probe_field(&self.probe_url, &url, ctx);
+        ctx.notify();
+    }
+
+    pub fn set_probe_method(&mut self, method: &str, ctx: &mut ViewContext<Self>) {
+        self.probe_method = method.to_string();
+        ctx.notify();
+    }
+
+    pub fn show_probe_request_headers(&mut self, show: bool, ctx: &mut ViewContext<Self>) {
+        self.probe_show_request_headers = show;
+        ctx.notify();
+    }
+
+    pub fn show_probe_response_headers(&mut self, show: bool, ctx: &mut ViewContext<Self>) {
+        self.probe_show_response_headers = show;
+        ctx.notify();
+    }
+
+    pub fn send_probe_request(&mut self, ctx: &mut ViewContext<Self>) {
+        if matches!(self.probe_response, ProbeResponseState::InFlight) {
+            return;
+        }
+        let url = self.probe_field_text(&self.probe_url, ctx);
+        if url.trim().is_empty() {
+            self.probe_response = ProbeResponseState::Failed("Enter a URL first.".to_string());
+            ctx.notify();
+            return;
+        }
+        let request = ProbeRequest {
+            method: self.probe_method.clone(),
+            url: url.trim().to_string(),
+            headers: self.probe_field_text(&self.probe_headers_input, ctx),
+            body: self.probe_field_text(&self.probe_body_input, ctx),
+        };
+
+        self.probe_request_generation = self.probe_request_generation.wrapping_add(1);
+        let generation = self.probe_request_generation;
+        let record = request.clone();
+        self.probe_response = ProbeResponseState::InFlight;
+        self.probe_show_response_headers = false;
+        ctx.notify();
+
+        ctx.spawn(
+            async move { send_request(request).await },
+            move |me, result, ctx| {
+                // A second Send while the first was in flight wins; this guard
+                // stops the slower response from landing on top of it.
+                if me.probe_request_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(response) => {
+                        me.push_probe_history(&record, Some(response.status), response.elapsed_ms);
+                        me.probe_response = ProbeResponseState::Ready(Box::new(response));
+                    }
+                    Err(error) => {
+                        me.push_probe_history(&record, None, 0);
+                        me.probe_response = ProbeResponseState::Failed(format!("{error}"));
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    fn push_probe_history(
+        &mut self,
+        request: &ProbeRequest,
+        status: Option<u16>,
+        elapsed_ms: u128,
+    ) {
+        self.probe_history.insert(
+            0,
+            ProbeHistoryEntry {
+                method: request.method.clone(),
+                url: request.url.clone(),
+                headers: request.headers.clone(),
+                body: request.body.clone(),
+                status,
+                elapsed_ms,
+            },
+        );
+        self.probe_history.truncate(PROBE_HISTORY_LIMIT);
+    }
+
+    pub fn replay_probe_history(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(entry) = self.probe_history.get(index).cloned() else {
+            return;
+        };
+        self.probe_method = entry.method;
+        self.probe_selected_route = None;
+        self.set_probe_field(&self.probe_url, &entry.url, ctx);
+        self.set_probe_field(&self.probe_headers_input, &entry.headers, ctx);
+        self.set_probe_field(&self.probe_body_input, &entry.body, ctx);
+        ctx.notify();
+    }
+
+    pub fn clear_probe_history(&mut self, ctx: &mut ViewContext<Self>) {
+        self.probe_history.clear();
+        ctx.notify();
+    }
+
+    pub fn copy_probe_response(&mut self, ctx: &mut ViewContext<Self>) {
+        let body = match &self.probe_response {
+            ProbeResponseState::Ready(response) => response.body.clone(),
+            ProbeResponseState::Failed(error) => error.clone(),
+            _ => return,
+        };
+        ctx.clipboard().write(ClipboardContent::plain_text(body));
+    }
+
+    /// Open Probe already aimed at an endpoint the user clicked on the Canvas.
+    ///
+    /// The seed comes from the Canvas graph rather than the survey, so the
+    /// request is filled in immediately instead of after the port scan — the
+    /// button would otherwise feel like it did nothing.
+    pub fn probe_canvas_node(
+        &mut self,
+        node_id: &str,
+        project_root: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let seed = match &self.project_canvas_state {
+            ProjectCanvasState::Ready(graph) => graph.node(node_id).and_then(|node| {
+                let route = node.route.clone()?;
+                Some((
+                    node.method.clone().unwrap_or_else(|| "GET".to_string()),
+                    route,
+                    node.request_body.clone(),
+                ))
+            }),
+            _ => None,
+        };
+
+        self.open_api_probe(project_root, ctx);
+
+        if let Some((method, route, body_hint)) = seed {
+            let base = match &self.probe_state {
+                ProbeState::Ready(survey) => survey.base_url(),
+                _ => "http://127.0.0.1:3000".to_string(),
+            };
+            // Route ids are shared with the Canvas, so the sidebar highlights
+            // this endpoint as soon as the survey lands behind us.
+            self.probe_selected_route = Some(node_id.to_string());
+            self.probe_method = method.clone();
+            self.set_probe_field(&self.probe_url, &build_url(&base, &route), ctx);
+            if method_takes_body(&method) {
+                self.seed_probe_body(body_hint.as_deref(), ctx);
+            }
+        }
+        ctx.notify();
     }
 
     pub fn open_project_canvas(

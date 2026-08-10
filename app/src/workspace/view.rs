@@ -1082,6 +1082,9 @@ pub struct Workspace {
     local_ai_panel: ViewHandle<LocalAiChatView>,
     genesi_vibe_mode: bool,
     genesi_tools_panel_open: bool,
+    /// Genesi Probe takes over the main area the same way the Canvas does — the
+    /// two are mutually exclusive surfaces, not panels.
+    genesi_probe_open: bool,
     genesi_canvas_open: bool,
     // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
     // sidebar's "New Chat" button. These MUST live in the view (not be
@@ -3371,6 +3374,7 @@ impl Workspace {
             working_directories_model,
             genesi_vibe_mode: false,
             genesi_tools_panel_open: false,
+            genesi_probe_open: false,
             genesi_canvas_open: false,
             genesi_vibe_button_mouse_state: Default::default(),
             genesi_ide_button_mouse_state: Default::default(),
@@ -21384,18 +21388,38 @@ impl Workspace {
     }
 
     fn render_genesi_tools_entrypoint_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        // Canvas and Probe are two views of the same project graph — one shows
+        // how it is wired, the other calls it — so they sit together.
         Align::new(
-            self.render_tab_bar_icon_button(
-                appearance,
-                icons::Icon::Dataflow02,
-                &self.mouse_states.right_panel_icon,
-                WorkspaceAction::OpenGenesiCanvasTool,
-                "Project Canvas".to_owned(),
-                None,
-                self.genesi_canvas_open,
-                false,
-            )
-            .finish(),
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::Dataflow02,
+                        &self.mouse_states.right_panel_icon,
+                        WorkspaceAction::OpenGenesiCanvasTool,
+                        "Project Canvas".to_owned(),
+                        None,
+                        self.genesi_canvas_open,
+                        false,
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::Globe,
+                        &self.mouse_states.genesi_probe_icon,
+                        WorkspaceAction::OpenGenesiProbeTool,
+                        "Genesi Probe".to_owned(),
+                        Some("Endpoints, ports, and requests".to_owned()),
+                        self.genesi_probe_open,
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
         )
         .finish()
     }
@@ -22283,6 +22307,24 @@ impl Workspace {
                             self.local_ai_panel
                                 .as_ref(app)
                                 .render_project_canvas_workspace(appearance),
+                        ),
+                    )
+                    .finish(),
+                )
+                .finish();
+        }
+
+        if self.genesi_probe_open {
+            let appearance = Appearance::as_ref(app);
+            return Flex::row()
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.wrap_in_main_surface(
+                            appearance,
+                            self.local_ai_panel
+                                .as_ref(app)
+                                .render_api_probe_workspace(appearance),
                         ),
                     )
                     .finish(),
@@ -24448,6 +24490,7 @@ impl TypedActionView for Workspace {
             }
             ToggleLocalAi => {
                 self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
@@ -24455,11 +24498,13 @@ impl TypedActionView for Workspace {
             }
             ToggleGenesiToolsPanel => {
                 self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
                 self.genesi_tools_panel_open = !self.genesi_tools_panel_open;
                 ctx.notify();
             }
             OpenGenesiReviewTool => {
                 self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
                 self.genesi_tools_panel_open = true;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.open_review_tool(ctx));
@@ -24499,6 +24544,7 @@ impl TypedActionView for Workspace {
                 }
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_canvas_open = true;
+                self.genesi_probe_open = false;
                 self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.open_project_canvas(project_root, ctx)
@@ -24572,6 +24618,102 @@ impl TypedActionView for Workspace {
                     .update(ctx, |panel, ctx| panel.select_project_canvas_node(id, ctx));
                 ctx.notify();
             }
+
+            // Probe's actions notify the WORKSPACE for the same reason the
+            // Canvas ones do: `render_panels` renders the surface inline from
+            // `local_ai_panel.as_ref(app)`, not as a ChildView, so the elements
+            // belong to this view's tree. Notifying only the panel would change
+            // the state and repaint nothing.
+            OpenGenesiProbeTool => {
+                if self.genesi_probe_open {
+                    self.genesi_probe_open = false;
+                    ctx.notify();
+                    return;
+                }
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_probe_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_tools_panel_open = false;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.open_api_probe(project_root, ctx));
+                ctx.notify();
+            }
+            CloseGenesiProbe => {
+                self.genesi_probe_open = false;
+                ctx.notify();
+            }
+            RefreshGenesiProbe => {
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_probe_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_tools_panel_open = false;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.refresh_api_probe(project_root, ctx)
+                });
+                ctx.notify();
+            }
+            RescanGenesiProbePorts => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.rescan_probe_ports(ctx));
+                ctx.notify();
+            }
+            SendGenesiProbeRequest => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.send_probe_request(ctx));
+                ctx.notify();
+            }
+            SelectGenesiProbeRoute(id) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.select_probe_route(id, ctx));
+                ctx.notify();
+            }
+            SelectGenesiProbePort(port) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.select_probe_port(*port, ctx));
+                ctx.notify();
+            }
+            SetGenesiProbeMethod(method) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.set_probe_method(method, ctx));
+                ctx.notify();
+            }
+            ShowGenesiProbeRequestHeaders(show) => {
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.show_probe_request_headers(*show, ctx)
+                });
+                ctx.notify();
+            }
+            ShowGenesiProbeResponseHeaders(show) => {
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.show_probe_response_headers(*show, ctx)
+                });
+                ctx.notify();
+            }
+            ReplayGenesiProbeHistory(index) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.replay_probe_history(*index, ctx));
+                ctx.notify();
+            }
+            ClearGenesiProbeHistory => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.clear_probe_history(ctx));
+                ctx.notify();
+            }
+            CopyGenesiProbeResponse => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.copy_probe_response(ctx));
+            }
+            ProbeGenesiCanvasNode(node_id) => {
+                let project_root = self.focused_project_root(ctx);
+                self.genesi_probe_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_tools_panel_open = false;
+                let node_id = node_id.clone();
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.probe_canvas_node(&node_id, project_root, ctx)
+                });
+                ctx.notify();
+            }
             SelectGenesiReviewFile(path) => {
                 self.genesi_tools_panel_open = true;
                 self.local_ai_panel
@@ -24590,6 +24732,10 @@ impl TypedActionView for Workspace {
             }
             SetGenesiModeVibe => {
                 self.genesi_vibe_mode = true;
+                // `render_panels` checks the Canvas and Probe surfaces before
+                // Vibe, so leaving either open would keep Vibe from showing.
+                self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
                 self.current_workspace_state.is_local_ai_panel_open = false;
                 self.current_workspace_state.is_ai_assistant_panel_open = false;
                 self.current_workspace_state.is_resource_center_open = false;
