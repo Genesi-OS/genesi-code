@@ -1085,6 +1085,7 @@ pub struct Workspace {
     /// Genesi Probe takes over the main area the same way the Canvas does — the
     /// two are mutually exclusive surfaces, not panels.
     genesi_probe_open: bool,
+    genesi_bench_open: bool,
     genesi_canvas_open: bool,
     // Persistent mouse-state handles for the Vibe/IDE switch and the vibe
     // sidebar's "New Chat" button. These MUST live in the view (not be
@@ -3375,6 +3376,7 @@ impl Workspace {
             genesi_vibe_mode: false,
             genesi_tools_panel_open: false,
             genesi_probe_open: false,
+            genesi_bench_open: false,
             genesi_canvas_open: false,
             genesi_vibe_button_mouse_state: Default::default(),
             genesi_ide_button_mouse_state: Default::default(),
@@ -5280,6 +5282,50 @@ impl Workspace {
             language,
             selection,
             file_text,
+        })
+    }
+
+    /// Genesi: what Bench needs about the editor the user is looking at.
+    ///
+    /// Distinct from [`Self::focused_code_context`], which reports the file by
+    /// display name for the chat to show. A test runner is handed the file on a
+    /// command line, so Bench needs it project-relative and needs the root it is
+    /// relative TO — plus the caret row, which the chat context never carries.
+    fn focused_bench_context(&self, ctx: &AppContext) -> Option<crate::ai::bench::BenchContext> {
+        let root = self.focused_project_root(ctx)?;
+        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+        let code_view = pane_group
+            .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
+            .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next())?;
+
+        let editor_handle = code_view.as_ref(ctx).active_editor()?;
+        let editor = editor_handle.as_ref(ctx);
+        let absolute = editor.file_path()?;
+        // A file outside the detected root cannot be addressed by a runner
+        // rooted there, so fall back to the file name rather than emitting a
+        // path with `..` in it that no runner would accept.
+        let file = absolute
+            .strip_prefix(&root)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(
+                    absolute.file_name().unwrap_or_default().to_os_string(),
+                )
+            });
+
+        let inner = editor.editor().as_ref(ctx);
+        // A selection means "test this"; without one the caret is the intent.
+        let line = inner
+            .selected_lines(ctx)
+            .map(|(start, _)| start)
+            .unwrap_or_else(|| inner.cursor_line(ctx)) as usize
+            + 1;
+
+        Some(crate::ai::bench::BenchContext {
+            root,
+            file,
+            source: inner.text(ctx).as_str().to_string(),
+            line,
         })
     }
 
@@ -21419,6 +21465,19 @@ impl Workspace {
                     )
                     .finish(),
                 )
+                .with_child(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::CheckCircleBroken,
+                        &self.mouse_states.genesi_bench_icon,
+                        WorkspaceAction::OpenGenesiBenchTool,
+                        "Genesi Bench".to_owned(),
+                        Some("Run the test at the cursor".to_owned()),
+                        self.genesi_bench_open,
+                        false,
+                    )
+                    .finish(),
+                )
                 .finish(),
         )
         .finish()
@@ -22325,6 +22384,24 @@ impl Workspace {
                             self.local_ai_panel
                                 .as_ref(app)
                                 .render_api_probe_workspace(appearance),
+                        ),
+                    )
+                    .finish(),
+                )
+                .finish();
+        }
+
+        if self.genesi_bench_open {
+            let appearance = Appearance::as_ref(app);
+            return Flex::row()
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.wrap_in_main_surface(
+                            appearance,
+                            self.local_ai_panel
+                                .as_ref(app)
+                                .render_bench_workspace(appearance),
                         ),
                     )
                     .finish(),
@@ -24491,6 +24568,7 @@ impl TypedActionView for Workspace {
             ToggleLocalAi => {
                 self.genesi_canvas_open = false;
                 self.genesi_probe_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_vibe_mode = false;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.set_vibe_mode(false, ctx));
@@ -24499,12 +24577,14 @@ impl TypedActionView for Workspace {
             ToggleGenesiToolsPanel => {
                 self.genesi_canvas_open = false;
                 self.genesi_probe_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = !self.genesi_tools_panel_open;
                 ctx.notify();
             }
             OpenGenesiReviewTool => {
                 self.genesi_canvas_open = false;
                 self.genesi_probe_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = true;
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.open_review_tool(ctx));
@@ -24545,6 +24625,7 @@ impl TypedActionView for Workspace {
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_canvas_open = true;
                 self.genesi_probe_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.open_project_canvas(project_root, ctx)
@@ -24633,6 +24714,7 @@ impl TypedActionView for Workspace {
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_probe_open = true;
                 self.genesi_canvas_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = false;
                 self.local_ai_panel
                     .update(ctx, move |panel, ctx| panel.open_api_probe(project_root, ctx));
@@ -24646,6 +24728,7 @@ impl TypedActionView for Workspace {
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_probe_open = true;
                 self.genesi_canvas_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = false;
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
                     panel.refresh_api_probe(project_root, ctx)
@@ -24703,10 +24786,74 @@ impl TypedActionView for Workspace {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.copy_probe_response(ctx));
             }
+            OpenGenesiBenchTool => {
+                if self.genesi_bench_open {
+                    self.genesi_bench_open = false;
+                    ctx.notify();
+                    return;
+                }
+                // Read the editor BEFORE the surface takes over the main area:
+                // once Bench is showing, the code pane it was reading is gone.
+                let context = self.focused_bench_context(ctx);
+                self.genesi_bench_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
+                self.genesi_tools_panel_open = false;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.inspect_bench(context, false, ctx));
+                ctx.notify();
+            }
+            CloseGenesiBench => {
+                self.genesi_bench_open = false;
+                ctx.notify();
+            }
+            InspectGenesiBench | RunGenesiBenchAtCursor => {
+                let and_run = matches!(action, RunGenesiBenchAtCursor);
+                let context = self.focused_bench_context(ctx);
+                self.genesi_bench_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
+                self.genesi_tools_panel_open = false;
+                self.local_ai_panel.update(ctx, move |panel, ctx| {
+                    panel.inspect_bench(context, and_run, ctx)
+                });
+                ctx.notify();
+            }
+            RunGenesiBench => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.run_bench(ctx));
+                ctx.notify();
+            }
+            RunGenesiBenchTarget(index) => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.run_bench_target(*index, ctx));
+                ctx.notify();
+            }
+            GenerateGenesiBenchTest => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.generate_bench_test(ctx));
+                ctx.notify();
+            }
+            AcceptGenesiBenchTest => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.accept_bench_test(ctx));
+                ctx.notify();
+            }
+            DiscardGenesiBenchTest => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.discard_bench_test(ctx));
+                ctx.notify();
+            }
+            CopyGenesiBenchOutput => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.copy_bench_output(ctx));
+            }
+
             ProbeGenesiCanvasNode(node_id) => {
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_probe_open = true;
                 self.genesi_canvas_open = false;
+                self.genesi_bench_open = false;
                 self.genesi_tools_panel_open = false;
                 let node_id = node_id.clone();
                 self.local_ai_panel.update(ctx, move |panel, ctx| {
@@ -24736,6 +24883,7 @@ impl TypedActionView for Workspace {
                 // Vibe, so leaving either open would keep Vibe from showing.
                 self.genesi_canvas_open = false;
                 self.genesi_probe_open = false;
+                self.genesi_bench_open = false;
                 self.current_workspace_state.is_local_ai_panel_open = false;
                 self.current_workspace_state.is_ai_assistant_panel_open = false;
                 self.current_workspace_state.is_resource_center_open = false;

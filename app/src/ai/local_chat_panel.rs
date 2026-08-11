@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use futures::stream::StreamExt as _;
 use markdown_parser::{parse_markdown, FormattedText, FormattedTextFragment, FormattedTextLine};
 use parking_lot::RwLock;
 use pathfinder_geometry::rect::RectF;
@@ -55,6 +56,11 @@ use super::local_chat::{
 use super::api_probe::{
     build_url, method_takes_body, scan_ports, send_request, survey_project, ProbePort, ProbeRequest,
     ProbeResponse, ProbeRoute, ProbeSurvey, PROBE_METHODS,
+};
+use super::bench::{
+    build_command, extract_code_block, generation_prompt, read_outcome, subject_for,
+    suggested_test_path, tests_in, BenchContext, BenchOutcome, BenchSubject, TargetOrigin,
+    TestTarget,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -111,6 +117,33 @@ fn probe_body_template(hint: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(",\n");
     Some(format!("{{\n{body}\n}}"))
+}
+
+/// How much source goes to the model with a "write me a test" prompt. Enough to
+/// see a function and its neighbours, small enough to leave the reply room in a
+/// 4K context window.
+const BENCH_EXCERPT_LINES: usize = 80;
+
+/// `local_agent::run_command` formats its result for a model to read, starting
+/// with `exit code: N`. Bench needs the number back out of that to tell a pass
+/// from a failure.
+fn parse_bench_exit_code(output: &str) -> Option<i32> {
+    output
+        .lines()
+        .next()?
+        .strip_prefix("exit code: ")?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The window of source around `line` that the generator gets to see.
+fn bench_excerpt(source: &str, line: usize) -> String {
+    let lines = source.lines().collect::<Vec<_>>();
+    let cursor = line.saturating_sub(1).min(lines.len().saturating_sub(1));
+    let start = cursor.saturating_sub(BENCH_EXCERPT_LINES / 4);
+    let end = (start + BENCH_EXCERPT_LINES).min(lines.len());
+    lines[start..end].join("\n")
 }
 
 /// The path (and query) of a URL that may have been typed by hand, so switching
@@ -408,6 +441,37 @@ enum ProbeResponseState {
     /// Boxed: [`ProbeResponse`] carries the whole body, and this enum is a field
     /// on a view that is moved around on every update.
     Ready(Box<ProbeResponse>),
+    Failed(String),
+}
+
+/// What Bench found for the cursor's current position.
+#[derive(Debug)]
+enum BenchState {
+    /// Bench has never been pointed at anything this session.
+    Idle,
+    /// No code editor is open, so there is nothing to inspect.
+    NoEditor,
+    Inspecting,
+    Ready(Box<BenchSubject>),
+}
+
+/// Where the current test run is.
+#[derive(Debug)]
+enum BenchRunState {
+    Idle,
+    /// Carries the command, so the UI can show what is running.
+    Running(String),
+    Done(Box<BenchOutcome>),
+}
+
+/// The generated-test flow. The draft is held for review before anything is
+/// written: a local model's first attempt is often close but not right, and a
+/// Bench that silently creates files is a Bench you have to undo.
+#[derive(Debug)]
+enum BenchDraftState {
+    Idle,
+    Generating,
+    Ready { path: PathBuf, code: String },
     Failed(String),
 }
 
@@ -807,6 +871,27 @@ pub struct LocalAiChatView {
     probe_sidebar_scroll: ClippedScrollStateHandle,
     probe_response_scroll: ClippedScrollStateHandle,
 
+    // ── Genesi Bench ──
+    bench_state: BenchState,
+    /// Guards a slow inspection against a newer one, the same way the Canvas
+    /// and Probe surveys do.
+    bench_generation: u64,
+    bench_run: BenchRunState,
+    bench_run_generation: u64,
+    bench_draft: BenchDraftState,
+    bench_draft_generation: u64,
+    /// The editor snapshot the current subject was derived from. Kept because
+    /// generating a test needs the source long after the inspection, and
+    /// re-reading the editor could pick up a different file.
+    bench_context: Option<BenchContext>,
+    /// Every test in the focused file, for the sidebar list.
+    bench_file_tests: Vec<TestTarget>,
+    bench_sidebar_scroll: ClippedScrollStateHandle,
+    bench_output_scroll: ClippedScrollStateHandle,
+    /// Its own handle: the draft preview and the result pane are on screen at
+    /// the same time, and sharing one would scroll them in lockstep.
+    bench_draft_scroll: ClippedScrollStateHandle,
+
     soundscape_enabled: bool,
     soundscape_index: usize,
     keyboard_asmr_enabled: bool,
@@ -931,6 +1016,17 @@ impl LocalAiChatView {
             probe_show_response_headers: false,
             probe_sidebar_scroll: ClippedScrollStateHandle::default(),
             probe_response_scroll: ClippedScrollStateHandle::default(),
+            bench_state: BenchState::Idle,
+            bench_generation: 0,
+            bench_run: BenchRunState::Idle,
+            bench_run_generation: 0,
+            bench_draft: BenchDraftState::Idle,
+            bench_draft_generation: 0,
+            bench_context: None,
+            bench_file_tests: Vec::new(),
+            bench_sidebar_scroll: ClippedScrollStateHandle::default(),
+            bench_output_scroll: ClippedScrollStateHandle::default(),
+            bench_draft_scroll: ClippedScrollStateHandle::default(),
             soundscape_enabled: false,
             soundscape_index: 0,
             keyboard_asmr_enabled: false,
@@ -1024,6 +1120,7 @@ impl LocalAiChatView {
         &mut self,
         model: &str,
         messages: Vec<ChatMessage>,
+        allow_tools: bool,
         ctx: &mut ViewContext<Self>,
     ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
         self.load_cloud_keys(ctx);
@@ -1031,7 +1128,13 @@ impl LocalAiChatView {
         // the server is known to take one. gpt-oss reaches for its own tool
         // channel however the prompt is worded, so the text protocol alone leaves
         // it narrating ("I'll use list_files") instead of acting.
-        let tools = (self.agent_mode && self.native_tools != NativeToolSupport::Unsupported)
+        //
+        // `allow_tools` is how a caller that wants a plain answer says so: Bench
+        // asks for the text of a test, and a tool-native model handed schemas
+        // will reach for `create_file` instead of replying with the code.
+        let tools = (allow_tools
+            && self.agent_mode
+            && self.native_tools != NativeToolSupport::Unsupported)
             .then(local_agent::tool_schemas);
         // Fit the conversation to the window BEFORE asking for a reply, and size
         // the reply against what's left. Sending a fixed max_tokens was its own
@@ -1621,7 +1724,7 @@ impl LocalAiChatView {
         self.messages
             .push(ChatEntry::prose(ChatRole::Assistant, String::new(), None));
         let turn = self.current_turn;
-        let stream = self.build_stream(&model, request, ctx);
+        let stream = self.build_stream(&model, request, true, ctx);
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_stream_item(turn, item, ctx),
@@ -1788,7 +1891,7 @@ impl LocalAiChatView {
         let turn = self.current_turn;
         let agent_model = self.agent_model.clone();
         let agent_messages = self.agent_messages.clone();
-        let stream = self.build_stream(&agent_model, agent_messages, ctx);
+        let stream = self.build_stream(&agent_model, agent_messages, true, ctx);
         ctx.spawn_stream_local(
             stream,
             move |me, item, ctx| me.on_agent_token(turn, item, ctx),
@@ -4714,6 +4817,664 @@ impl LocalAiChatView {
         .finish()
     }
 
+    // ───────────────────── Genesi Bench — rendering ─────────────────────
+
+    pub fn render_bench_workspace(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut root = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(self.render_bench_header(appearance))
+                    .with_padding_left(16.)
+                    .with_padding_right(16.)
+                    .with_padding_top(12.)
+                    .with_padding_bottom(12.)
+                    .finish(),
+            );
+
+        match &self.bench_state {
+            BenchState::Idle | BenchState::NoEditor => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "No file to test",
+                        "Open a source file and put the cursor in a test — or in the function you want tested — then press Re-read.",
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            BenchState::Inspecting => root.add_child(
+                Expanded::new(
+                    1.,
+                    Container::new(self.render_canvas_message(
+                        appearance,
+                        "Reading the file…",
+                        "Working out which test the cursor is in, and which runner this project uses.",
+                    ))
+                    .with_uniform_padding(120.)
+                    .finish(),
+                )
+                .finish(),
+            ),
+            BenchState::Ready(subject) => {
+                root.add_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(
+                            Flex::row()
+                                .with_main_axis_size(MainAxisSize::Max)
+                                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                                .with_child(
+                                    ConstrainedBox::new(self.render_bench_sidebar(appearance))
+                                        .with_width(258.)
+                                        .finish(),
+                                )
+                                .with_child(
+                                    Expanded::new(
+                                        1.,
+                                        Container::new(
+                                            Flex::column()
+                                                .with_main_axis_size(MainAxisSize::Max)
+                                                .with_cross_axis_alignment(
+                                                    CrossAxisAlignment::Stretch,
+                                                )
+                                                .with_child(
+                                                    self.render_bench_subject(appearance, subject),
+                                                )
+                                                .with_child(
+                                                    Expanded::new(
+                                                        1.,
+                                                        Container::new(
+                                                            self.render_bench_result(appearance),
+                                                        )
+                                                        .with_margin_top(12.)
+                                                        .finish(),
+                                                    )
+                                                    .finish(),
+                                                )
+                                                .finish(),
+                                        )
+                                        .with_margin_left(12.)
+                                        .finish(),
+                                    )
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_padding_left(16.)
+                        .with_padding_right(16.)
+                        .finish(),
+                    )
+                    .finish(),
+                );
+            }
+        }
+
+        Container::new(root.finish())
+            .with_background(theme.background())
+            .finish()
+    }
+
+    fn render_bench_header(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let accent: ColorU = theme.terminal_colors().normal.magenta.into();
+        let subtitle = match (&self.bench_state, &self.bench_context) {
+            (BenchState::Ready(_), Some(context)) => format!(
+                "{}:{}  ·  {} tests in this file",
+                context.file.display(),
+                context.line,
+                self.bench_file_tests.len()
+            ),
+            _ => "Run one test, in any language, without leaving the editor".to_string(),
+        };
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ConstrainedBox::new(
+                    Container::new(
+                        CoreIcon::CheckCircleBroken
+                            .to_warpui_icon(ThemeFill::Solid(accent))
+                            .finish(),
+                    )
+                    .with_uniform_padding(8.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                    .with_background(
+                        theme
+                            .surface_1()
+                            .blend(&ThemeFill::Solid(accent).with_opacity(42)),
+                    )
+                    .finish(),
+                )
+                .with_width(34.)
+                .with_height(34.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_child(self.label_text(
+                            appearance,
+                            "Genesi Bench".to_string(),
+                            18.,
+                            theme.main_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .with_child(self.label_text(
+                            appearance,
+                            subtitle,
+                            11.,
+                            theme.disabled_text_color(theme.background()).into(),
+                            false,
+                        ))
+                        .finish(),
+                )
+                .with_margin_left(12.)
+                .finish(),
+            )
+            .with_child(Expanded::new(1., Empty::new().finish()).finish())
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Re-read cursor".to_string(),
+                    None,
+                    WorkspaceAction::InspectGenesiBench,
+                    false,
+                ))
+                .with_margin_left(10.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(self.workspace_chip(
+                    appearance,
+                    "Close".to_string(),
+                    None,
+                    WorkspaceAction::CloseGenesiBench,
+                    false,
+                ))
+                .with_margin_left(8.)
+                .finish(),
+            )
+            .finish()
+    }
+
+    fn render_bench_sidebar(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        list.add_child(self.render_probe_section_label(
+            appearance,
+            format!("TESTS IN THIS FILE  ·  {}", self.bench_file_tests.len()),
+            0.,
+        ));
+
+        if self.bench_file_tests.is_empty() {
+            list.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "No tests in this file yet.".to_string(),
+                    11.,
+                    muted,
+                    true,
+                ))
+                .with_uniform_padding(8.)
+                .finish(),
+            );
+        }
+
+        let running = matches!(self.bench_run, BenchRunState::Running(_));
+        let current = match &self.bench_state {
+            BenchState::Ready(subject) => match subject.as_ref() {
+                BenchSubject::Runnable(plan) => Some(plan.target.line),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        for (index, target) in self.bench_file_tests.iter().enumerate() {
+            let selected = current == Some(target.line);
+            let accent: ColorU = if selected {
+                theme.terminal_colors().normal.magenta.into()
+            } else {
+                muted
+            };
+            let row = Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_child(self.mono_text(
+                    appearance,
+                    target.name.clone(),
+                    12.,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_child(self.label_text(
+                    appearance,
+                    format!("line {}", target.line),
+                    10.,
+                    accent,
+                    false,
+                ))
+                .finish();
+
+            let background = if selected {
+                theme
+                    .surface_1()
+                    .blend(&ThemeFill::Solid(accent).with_opacity(34))
+            } else {
+                theme.background()
+            };
+            let border = if selected {
+                Border::all(1.).with_border_color(accent)
+            } else {
+                Border::all(1.).with_border_fill(theme.outline())
+            };
+
+            let card = Container::new(row)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(7.)
+                .with_margin_bottom(2.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_background(background)
+                .with_border(border)
+                .finish();
+
+            // While a run is in flight the list stops accepting clicks: a second
+            // run would be dropped by the guard in `start_bench_command` and the
+            // row would look broken rather than busy.
+            list.add_child(if running {
+                card
+            } else {
+                EventHandler::new(card)
+                    .on_left_mouse_down(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(WorkspaceAction::RunGenesiBenchTarget(index));
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish()
+            });
+        }
+
+        Container::new(
+            ClippedScrollable::vertical(
+                self.bench_sidebar_scroll.clone(),
+                Container::new(list.finish()).with_uniform_padding(10.).finish(),
+                ScrollbarWidth::Auto,
+                theme.disabled_ui_text_color().into(),
+                theme.active_ui_text_color().into(),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_bench_subject(
+        &self,
+        appearance: &Appearance,
+        subject: &BenchSubject,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let accent: ColorU = theme.terminal_colors().normal.magenta.into();
+        let running = matches!(self.bench_run, BenchRunState::Running(_));
+        let mut content = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        match subject {
+            BenchSubject::Runnable(plan) => {
+                let origin = match plan.origin {
+                    TargetOrigin::AtCursor => "the test your cursor is in".to_string(),
+                    // Saying WHY this test was picked matters: the user selected
+                    // a function, and running something with a different name
+                    // would otherwise look like a bug.
+                    TargetOrigin::CoversSymbol => {
+                        "found by name — no test at the cursor, this one covers it".to_string()
+                    }
+                };
+                content.add_child(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Flex::column()
+                                    .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                                    .with_child(self.mono_text(
+                                        appearance,
+                                        plan.target.qualified_name(),
+                                        15.,
+                                        theme.main_text_color(theme.background()).into(),
+                                        true,
+                                    ))
+                                    .with_child(self.label_text(
+                                        appearance,
+                                        format!("{}  ·  {origin}", plan.target.location()),
+                                        11.,
+                                        muted,
+                                        true,
+                                    ))
+                                    .finish(),
+                            )
+                            .finish(),
+                        )
+                        .with_child(self.workspace_chip(
+                            appearance,
+                            if running {
+                                "Running…".to_string()
+                            } else {
+                                "Run test".to_string()
+                            },
+                            None,
+                            WorkspaceAction::RunGenesiBench,
+                            !running,
+                        ))
+                        .finish(),
+                );
+                content.add_child(
+                    Container::new(self.render_canvas_inspector_field(
+                        appearance,
+                        &format!("Command · {}", plan.runner.label()),
+                        plan.command.clone(),
+                        true,
+                    ))
+                    .with_margin_top(12.)
+                    .finish(),
+                );
+            }
+            BenchSubject::Untested { symbol, runner, .. } => {
+                content.add_child(self.mono_text(
+                    appearance,
+                    symbol.clone(),
+                    15.,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ));
+                content.add_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        match runner {
+                            Some(runner) => format!(
+                                "No test covers this yet. This project uses {}.",
+                                runner.label()
+                            ),
+                            None => "No test covers this, and no test runner was detected for this project.".to_string(),
+                        },
+                        11.,
+                        muted,
+                        true,
+                    ))
+                    .with_margin_top(4.)
+                    .finish(),
+                );
+                content.add_child(
+                    Container::new(self.render_bench_draft(appearance))
+                        .with_margin_top(12.)
+                        .finish(),
+                );
+            }
+            BenchSubject::Nothing(message) => {
+                content.add_child(self.label_text(
+                    appearance,
+                    "Nothing to run here".to_string(),
+                    15.,
+                    theme.main_text_color(theme.background()).into(),
+                    false,
+                ));
+                content.add_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        message.clone(),
+                        11.,
+                        muted,
+                        true,
+                    ))
+                    .with_margin_top(6.)
+                    .finish(),
+                );
+            }
+        }
+
+        let _ = accent;
+        Container::new(content.finish())
+            .with_uniform_padding(14.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .with_background(theme.surface_1())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .finish()
+    }
+
+    /// The generate-a-test flow, shown inside the subject card when the symbol
+    /// has no test.
+    fn render_bench_draft(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let colors = &theme.terminal_colors().normal;
+
+        match &self.bench_draft {
+            BenchDraftState::Idle => self.workspace_chip(
+                appearance,
+                "Generate a test with the local model".to_string(),
+                None,
+                WorkspaceAction::GenerateGenesiBenchTest,
+                true,
+            ),
+            BenchDraftState::Generating => self.label_text(
+                appearance,
+                "Writing a test…".to_string(),
+                12.,
+                colors.yellow.into(),
+                false,
+            ),
+            BenchDraftState::Failed(error) => Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    error.clone(),
+                    11.,
+                    colors.red.into(),
+                    true,
+                ))
+                .with_child(
+                    Container::new(self.workspace_chip(
+                        appearance,
+                        "Try again".to_string(),
+                        None,
+                        WorkspaceAction::GenerateGenesiBenchTest,
+                        true,
+                    ))
+                    .with_margin_top(8.)
+                    .finish(),
+                )
+                .finish(),
+            BenchDraftState::Ready { path, code } => Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(self.label_text(
+                    appearance,
+                    format!("Will be written to {}", path.display()),
+                    11.,
+                    muted,
+                    true,
+                ))
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            ClippedScrollable::vertical(
+                                self.bench_draft_scroll.clone(),
+                                self.mono_text(
+                                    appearance,
+                                    code.clone(),
+                                    MONO_FONT_SIZE,
+                                    theme.main_text_color(theme.background()).into(),
+                                    true,
+                                ),
+                                ScrollbarWidth::Auto,
+                                theme.disabled_ui_text_color().into(),
+                                theme.active_ui_text_color().into(),
+                                Fill::None,
+                            )
+                            .finish(),
+                        )
+                        .with_height(180.)
+                        .finish(),
+                    )
+                    .with_margin_top(8.)
+                    .with_uniform_padding(10.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_background(theme.background())
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        Flex::row()
+                            .with_child(self.workspace_chip(
+                                appearance,
+                                "Write and run".to_string(),
+                                None,
+                                WorkspaceAction::AcceptGenesiBenchTest,
+                                true,
+                            ))
+                            .with_child(self.workspace_chip(
+                                appearance,
+                                "Discard".to_string(),
+                                None,
+                                WorkspaceAction::DiscardGenesiBenchTest,
+                                false,
+                            ))
+                            .finish(),
+                    )
+                    .with_margin_top(10.)
+                    .finish(),
+                )
+                .finish(),
+        }
+    }
+
+    fn render_bench_result(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let colors = &theme.terminal_colors().normal;
+
+        let mut header = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        let body: Box<dyn Element> = match &self.bench_run {
+            BenchRunState::Idle => {
+                header.add_child(self.label_text(
+                    appearance,
+                    "Result".to_string(),
+                    12.,
+                    muted,
+                    false,
+                ));
+                self.label_text(
+                    appearance,
+                    "Press Run test, or pick one from the list on the left. Only the test you choose is run."
+                        .to_string(),
+                    12.,
+                    muted,
+                    true,
+                )
+            }
+            BenchRunState::Running(command) => {
+                header.add_child(self.label_text(
+                    appearance,
+                    "Running…".to_string(),
+                    12.,
+                    colors.yellow.into(),
+                    false,
+                ));
+                self.mono_text(appearance, command.clone(), MONO_FONT_SIZE, muted, true)
+            }
+            BenchRunState::Done(outcome) => {
+                let accent: ColorU = if outcome.passed {
+                    colors.green.into()
+                } else {
+                    colors.red.into()
+                };
+                header.add_child(
+                    Container::new(self.mono_text(
+                        appearance,
+                        outcome.summary.clone(),
+                        12.,
+                        accent,
+                        false,
+                    ))
+                    .with_horizontal_padding(8.)
+                    .with_vertical_padding(4.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .with_background(
+                        theme
+                            .surface_1()
+                            .blend(&ThemeFill::Solid(accent).with_opacity(46)),
+                    )
+                    .finish(),
+                );
+                header.add_child(
+                    Container::new(self.label_text(
+                        appearance,
+                        format!("{} ms", outcome.elapsed_ms),
+                        11.,
+                        muted,
+                        false,
+                    ))
+                    .with_margin_left(10.)
+                    .finish(),
+                );
+                header.add_child(Expanded::new(1., Empty::new().finish()).finish());
+                header.add_child(self.workspace_chip(
+                    appearance,
+                    "Copy output".to_string(),
+                    None,
+                    WorkspaceAction::CopyGenesiBenchOutput,
+                    false,
+                ));
+                self.mono_text(
+                    appearance,
+                    outcome.output.clone(),
+                    MONO_FONT_SIZE,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                )
+            }
+        };
+
+        Container::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(header.finish())
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(
+                            ClippedScrollable::vertical(
+                                self.bench_output_scroll.clone(),
+                                body,
+                                ScrollbarWidth::Auto,
+                                theme.disabled_ui_text_color().into(),
+                                theme.active_ui_text_color().into(),
+                                Fill::None,
+                            )
+                            .finish(),
+                        )
+                        .with_margin_top(10.)
+                        .finish(),
+                    )
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(14.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
     fn canvas_node_accent(&self, appearance: &Appearance, kind: CanvasNodeKind) -> ColorU {
         let colors = &appearance.theme().terminal_colors().normal;
         match kind {
@@ -5764,6 +6525,290 @@ impl LocalAiChatView {
             }
         }
         ctx.notify();
+    }
+
+    // ──────────────────────────── Genesi Bench ────────────────────────────
+    //
+    // Run one test. The hard part is naming the test the cursor is in; the rest
+    // is handing that name to the runner the project already uses.
+
+    /// Work out what the cursor is on. `and_run` is the keybinding path: the
+    /// user pressed "run the test I'm in", so an inspection that finds a
+    /// runnable test should go straight on to running it rather than showing
+    /// them a button to press.
+    pub fn inspect_bench(
+        &mut self,
+        context: Option<BenchContext>,
+        and_run: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.bench_generation = self.bench_generation.wrapping_add(1);
+        let generation = self.bench_generation;
+        let Some(context) = context else {
+            self.bench_state = BenchState::NoEditor;
+            self.bench_context = None;
+            self.bench_file_tests.clear();
+            ctx.notify();
+            return;
+        };
+
+        // A fresh inspection invalidates the previous verdict: leaving the last
+        // run's green tick on screen while pointing at a different test is the
+        // one way this surface could actively mislead.
+        self.bench_run = BenchRunState::Idle;
+        self.bench_draft = BenchDraftState::Idle;
+        self.bench_state = BenchState::Inspecting;
+        self.bench_context = Some(context.clone());
+        ctx.notify();
+
+        ctx.spawn(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let subject =
+                        subject_for(&context.root, &context.file, &context.source, context.line);
+                    let tests = tests_in(&context.source, &context.file);
+                    (subject, tests)
+                })
+                .await
+            },
+            move |me, result, ctx| {
+                if me.bench_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((subject, tests)) => {
+                        me.bench_file_tests = tests;
+                        let runnable = matches!(subject, BenchSubject::Runnable(_));
+                        me.bench_state = BenchState::Ready(Box::new(subject));
+                        if and_run && runnable {
+                            me.run_bench(ctx);
+                        }
+                    }
+                    Err(error) => {
+                        me.bench_state = BenchState::Ready(Box::new(BenchSubject::Nothing(
+                            format!("The background scanner stopped unexpectedly: {error}"),
+                        )));
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    pub fn run_bench(&mut self, ctx: &mut ViewContext<Self>) {
+        let BenchState::Ready(subject) = &self.bench_state else {
+            return;
+        };
+        let BenchSubject::Runnable(plan) = subject.as_ref() else {
+            return;
+        };
+        let (command, runner) = (plan.command.clone(), plan.runner);
+        self.start_bench_command(command, runner, ctx);
+    }
+
+    /// Run a test the user picked from the file's list rather than the one the
+    /// cursor happens to be in.
+    pub fn run_bench_target(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(target) = self.bench_file_tests.get(index).cloned() else {
+            return;
+        };
+        let Some(context) = self.bench_context.clone() else {
+            return;
+        };
+        let Some(runner) = super::bench::detect_runner(&context.root, &context.file) else {
+            return;
+        };
+        let command = build_command(runner, &target);
+        // Picking from the list makes it the subject, so the header and any
+        // later Run press agree with what was actually run.
+        self.bench_state = BenchState::Ready(Box::new(BenchSubject::Runnable(Box::new(
+            super::bench::BenchPlan {
+                command: command.clone(),
+                runner,
+                target,
+                origin: TargetOrigin::AtCursor,
+            },
+        ))));
+        self.start_bench_command(command, runner, ctx);
+    }
+
+    fn start_bench_command(
+        &mut self,
+        command: String,
+        runner: super::bench::TestRunner,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if matches!(self.bench_run, BenchRunState::Running(_)) {
+            return;
+        }
+        let Some(root) = self.bench_context.as_ref().map(|context| context.root.clone()) else {
+            return;
+        };
+        self.bench_run_generation = self.bench_run_generation.wrapping_add(1);
+        let generation = self.bench_run_generation;
+        self.bench_run = BenchRunState::Running(command.clone());
+        ctx.notify();
+
+        let started = Instant::now();
+        let to_run = command.clone();
+        ctx.spawn(
+            async move { local_agent::run_command(&root, &to_run).await },
+            move |me, output, ctx| {
+                if me.bench_run_generation != generation {
+                    return;
+                }
+                let elapsed_ms = started.elapsed().as_millis();
+                let exit_code = parse_bench_exit_code(&output);
+                me.bench_run = BenchRunState::Done(Box::new(read_outcome(
+                    runner, exit_code, &output, elapsed_ms,
+                )));
+                ctx.notify();
+            },
+        );
+    }
+
+    /// Ask the local model for one test for the symbol under the cursor.
+    ///
+    /// The reply is held as a draft rather than written straight out — see
+    /// [`BenchDraftState`].
+    pub fn generate_bench_test(&mut self, ctx: &mut ViewContext<Self>) {
+        if matches!(self.bench_draft, BenchDraftState::Generating) {
+            return;
+        }
+        let BenchState::Ready(subject) = &self.bench_state else {
+            return;
+        };
+        let BenchSubject::Untested {
+            runner,
+            symbol,
+            file,
+            line,
+        } = subject.as_ref()
+        else {
+            return;
+        };
+        let Some(context) = self.bench_context.clone() else {
+            return;
+        };
+        let Some(model) = self.current_model() else {
+            self.bench_draft = BenchDraftState::Failed(
+                "No model selected. Pick one in the AI panel first.".to_string(),
+            );
+            ctx.notify();
+            return;
+        };
+
+        let path = suggested_test_path(&context.root, file, *runner);
+        let excerpt = bench_excerpt(&context.source, *line);
+        let prompt = generation_prompt(symbol, &excerpt, file, *runner, &path);
+
+        self.bench_draft_generation = self.bench_draft_generation.wrapping_add(1);
+        let generation = self.bench_draft_generation;
+        self.bench_draft = BenchDraftState::Generating;
+        ctx.notify();
+
+        let messages = vec![
+            ChatMessage::system(
+                "You write unit tests. You reply with code and nothing else.".to_string(),
+            ),
+            ChatMessage::user(prompt),
+        ];
+        // No tools: we want the text of a test back, not an attempt to write
+        // the file itself.
+        let mut stream = self.build_stream(&model, messages, false, ctx);
+        ctx.spawn(
+            async move {
+                let mut reply = String::new();
+                while let Some(item) = stream.next().await {
+                    match item {
+                        // Reasoning is deliberately dropped: a thinking model's
+                        // analysis is not the test, and mixing it in is what
+                        // makes the fence extractor pick up prose.
+                        Ok(ChatStreamItem::Token(token)) => reply.push_str(&token),
+                        Ok(_) => {}
+                        Err(error) => return Err(format!("{error}")),
+                    }
+                }
+                Ok(reply)
+            },
+            move |me, result, ctx| {
+                if me.bench_draft_generation != generation {
+                    return;
+                }
+                me.bench_draft = match result {
+                    Ok(reply) => match extract_code_block(&reply) {
+                        Some(code) => BenchDraftState::Ready { path, code },
+                        None => BenchDraftState::Failed(
+                            "The model replied without any code. Try again, or write the test by hand."
+                                .to_string(),
+                        ),
+                    },
+                    Err(error) => BenchDraftState::Failed(error),
+                };
+                ctx.notify();
+            },
+        );
+    }
+
+    /// Write the draft and immediately run it, which is the only way to find out
+    /// whether the model's test is any good.
+    pub fn accept_bench_test(&mut self, ctx: &mut ViewContext<Self>) {
+        let BenchDraftState::Ready { path, code } = &self.bench_draft else {
+            return;
+        };
+        let Some(context) = self.bench_context.clone() else {
+            return;
+        };
+        let absolute = context.root.join(path);
+        if let Some(parent) = absolute.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Refuse to clobber. A generated test landing on top of a real one the
+        // convention search simply missed would destroy work.
+        if absolute.exists() {
+            self.bench_draft = BenchDraftState::Failed(format!(
+                "{} already exists. Open it and paste the test in by hand.",
+                path.display()
+            ));
+            ctx.notify();
+            return;
+        }
+        if let Err(error) = std::fs::write(&absolute, format!("{}\n", code.trim_end())) {
+            self.bench_draft =
+                BenchDraftState::Failed(format!("Could not write {}: {error}", path.display()));
+            ctx.notify();
+            return;
+        }
+
+        // Re-inspect against the file we just created, so the subject becomes
+        // the new test and Run addresses it.
+        let source = code.clone();
+        let file = path.clone();
+        self.bench_draft = BenchDraftState::Idle;
+        self.inspect_bench(
+            Some(BenchContext {
+                root: context.root,
+                file,
+                source,
+                line: 1,
+            }),
+            true,
+            ctx,
+        );
+    }
+
+    pub fn discard_bench_test(&mut self, ctx: &mut ViewContext<Self>) {
+        self.bench_draft = BenchDraftState::Idle;
+        ctx.notify();
+    }
+
+    pub fn copy_bench_output(&mut self, ctx: &mut ViewContext<Self>) {
+        let text = match &self.bench_run {
+            BenchRunState::Done(outcome) => outcome.output.clone(),
+            BenchRunState::Running(command) => command.clone(),
+            BenchRunState::Idle => return,
+        };
+        ctx.clipboard().write(ClipboardContent::plain_text(text));
     }
 
     pub fn open_project_canvas(

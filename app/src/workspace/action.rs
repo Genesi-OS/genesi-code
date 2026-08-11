@@ -353,6 +353,23 @@ pub enum WorkspaceAction {
     /// Open Probe prefilled from an endpoint node on the Project Canvas.
     ProbeGenesiCanvasNode(String),
 
+    // ── Genesi Bench: run one unit test from the editor ──
+    OpenGenesiBenchTool,
+    CloseGenesiBench,
+    /// Re-read the editor and work out what the cursor is on.
+    InspectGenesiBench,
+    /// Open Bench AND immediately run whatever the cursor is in. This is the
+    /// keybinding path — the whole feature in one keystroke.
+    RunGenesiBenchAtCursor,
+    RunGenesiBench,
+    /// Run a specific test picked from the file's test list.
+    RunGenesiBenchTarget(usize),
+    GenerateGenesiBenchTest,
+    /// Write the generated test to disk, then run it.
+    AcceptGenesiBenchTest,
+    DiscardGenesiBenchTest,
+    CopyGenesiBenchOutput,
+
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -1063,6 +1080,16 @@ impl WorkspaceAction {
             | ClearGenesiProbeHistory
             | CopyGenesiProbeResponse
             | ProbeGenesiCanvasNode(_)
+            | OpenGenesiBenchTool
+            | CloseGenesiBench
+            | InspectGenesiBench
+            | RunGenesiBenchAtCursor
+            | RunGenesiBench
+            | RunGenesiBenchTarget(_)
+            | GenerateGenesiBenchTest
+            | AcceptGenesiBenchTest
+            | DiscardGenesiBenchTest
+            | CopyGenesiBenchOutput
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

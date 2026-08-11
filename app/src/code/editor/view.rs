@@ -1987,6 +1987,21 @@ impl CodeEditorView {
         Some((start_line, end_line))
     }
 
+    /// Genesi: the 0-indexed row the caret sits on, with or without a selection.
+    ///
+    /// [`Self::selected_lines`] deliberately answers `None` when nothing is
+    /// selected, which is right for "attach my selection as context" but wrong
+    /// for Bench: "run the test I'm inside" has to work from a bare click, and
+    /// making the user select their test first would be the slow part of a
+    /// feature whose whole point is being fast.
+    pub fn cursor_line(&self, app: &AppContext) -> u32 {
+        let selection_model = self.model.as_ref(app).buffer_selection_model().as_ref(app);
+        let offsets = selection_model.selection_offsets();
+        let head = offsets.first().head;
+        let buffer = self.model.as_ref(app).buffer().as_ref(app);
+        head.to_buffer_point(buffer).row
+    }
+
     /// If vim keybindings are enabled, return the [`VimMode`]. Otherwise, return None.
     pub fn vim_mode(&self, ctx: &AppContext) -> Option<VimMode> {
         self.vim_state(ctx).map(|state| state.mode)
