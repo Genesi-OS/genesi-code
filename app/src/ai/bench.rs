@@ -195,6 +195,16 @@ fn family_of(file: &Path) -> Option<Family> {
     })
 }
 
+/// Whether Bench knows this file's language at all.
+///
+/// Pure extension check with no filesystem access, because it gates the pill
+/// that appears over a selection — which is rendered on every frame the
+/// selection is up. The expensive questions (is there a runner, is there a
+/// test) wait until the user actually clicks.
+pub fn understands(file: &Path) -> bool {
+    family_of(file).is_some()
+}
+
 /// Which runner this project drives, for a file of this language.
 ///
 /// Deliberately requires a project marker: guessing `pytest` for a stray `.py`
@@ -240,17 +250,26 @@ pub fn detect_runner(root: &Path, file: &Path) -> Option<TestRunner> {
 /// Jest when both are present, because a project that added Vitest is running
 /// Vitest — Jest is usually the leftover.
 fn javascript_runner(root: &Path) -> Option<TestRunner> {
-    let manifest = fs::read_to_string(root.join("package.json")).ok()?;
+    let manifest = fs::read_to_string(root.join("package.json")).unwrap_or_default();
     let lower = manifest.to_ascii_lowercase();
-    if lower.contains("\"vitest\"") {
-        Some(TestRunner::Vitest)
-    } else if lower.contains("\"jest\"") {
-        Some(TestRunner::Jest)
-    } else if lower.contains("\"mocha\"") {
-        Some(TestRunner::Mocha)
-    } else {
-        None
+    for (needle, runner) in [
+        ("vitest", TestRunner::Vitest),
+        ("jest", TestRunner::Jest),
+        ("mocha", TestRunner::Mocha),
+    ] {
+        // Named anywhere in the manifest — a dependency, or just the body of
+        // the `test` script. Requiring it to be a quoted dependency key missed
+        // `"test": "vitest run"`, which is how plenty of projects declare it.
+        if lower.contains(needle) {
+            return Some(runner);
+        }
+        // Installed but not named: monorepos hoist the dependency to a parent
+        // manifest, leaving the binary here and the name nowhere.
+        if root.join("node_modules/.bin").join(needle).exists() {
+            return Some(runner);
+        }
     }
+    None
 }
 
 fn has_csproj(root: &Path) -> bool {
@@ -315,7 +334,7 @@ fn encloses_cursor(family: Family, line: &str) -> bool {
         // into the test. Only a declaration that opens a block can be what the
         // cursor is inside of.
         Family::JavaScript => {
-            return js_declaration().is_match(line) && line.trim_end().ends_with('{');
+            return js_symbol_on_line(line).is_some() && line.trim_end().ends_with('{');
         }
     };
     pattern.is_match(line)
@@ -418,19 +437,50 @@ pub fn symbol_at(source: &str, line: usize, file: &Path) -> Option<String> {
     let cursor = line.saturating_sub(1).min(lines.len().saturating_sub(1));
     let floor = cursor.saturating_sub(MAX_LOOKBACK_LINES);
 
+    // JavaScript has too many ways to declare a callable for one pattern, so it
+    // gets its own resolver.
+    if family == Family::JavaScript {
+        return (floor..=cursor)
+            .rev()
+            .find_map(|index| js_symbol_on_line(lines[index]));
+    }
+
     let pattern = match family {
         Family::Rust => rust_fn(),
         Family::Python => python_def(),
-        Family::JavaScript => js_declaration(),
         Family::Go => go_fn(),
         Family::Jvm => jvm_method(),
         Family::Ruby => ruby_def(),
         Family::Php => php_method(),
         Family::CSharp => csharp_method(),
+        Family::JavaScript => unreachable!("handled above"),
     };
     (floor..=cursor)
         .rev()
         .find_map(|index| capture(&pattern, lines[index]))
+}
+
+/// Reserved words that occupy the same shape as a call. Without this filter
+/// `if (ready) {` reads as a function named `if`, and every conditional in the
+/// file becomes a thing Bench offers to test.
+const JS_KEYWORDS: &[&str] = &[
+    "if", "for", "while", "switch", "catch", "return", "function", "class", "const", "let", "var",
+    "do", "else", "try", "finally", "typeof", "new", "delete", "await", "yield", "throw", "case",
+    "default", "import", "export", "with",
+];
+
+/// The callable declared on this line, in any of the forms JavaScript uses.
+///
+/// `function f()` and `const f = …` were all the original pattern covered, which
+/// missed the two most ordinary things in a real file: a class method
+/// (`applyDiscount(price) {`) and an object method (`formatPrice(value) {`).
+/// The scan then walked past them and reported the enclosing CLASS or OBJECT —
+/// so asking to test a method offered to test `PriceEngine` instead.
+fn js_symbol_on_line(line: &str) -> Option<String> {
+    let name = capture(&js_declaration(), line)
+        .or_else(|| capture(&js_method(), line))
+        .or_else(|| capture(&js_property_fn(), line))?;
+    (!JS_KEYWORDS.contains(&name.as_str())).then_some(name)
 }
 
 /// Find a test whose name refers to `symbol`.
@@ -898,6 +948,24 @@ fn js_declaration() -> Regex {
         r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=|class\s+([A-Za-z_$][\w$]*))",
     )
     .expect("valid JS declaration regex")
+}
+
+/// A class or object method: `applyDiscount(price) {`, `async load() {`,
+/// `formatPrice(value) {`. Shares its shape with `if (…) {`, so callers must
+/// reject [`JS_KEYWORDS`].
+fn js_method() -> Regex {
+    Regex::new(r"^\s*(?:(?:static|async|get|set|\*)\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{")
+        .expect("valid JS method regex")
+}
+
+/// An object property holding a function: `parsePrice: (text) => …`,
+/// `load: async function () {`. Requires the arrow or the `function` keyword,
+/// so an ordinary `url: base + path` is not mistaken for something testable.
+fn js_property_fn() -> Regex {
+    Regex::new(
+        r"^\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)",
+    )
+    .expect("valid JS property function regex")
 }
 
 fn go_test_fn() -> Regex {

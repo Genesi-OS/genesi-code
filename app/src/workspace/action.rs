@@ -358,9 +358,13 @@ pub enum WorkspaceAction {
     CloseGenesiBench,
     /// Re-read the editor and work out what the cursor is on.
     InspectGenesiBench,
-    /// Open Bench AND immediately run whatever the cursor is in. This is the
-    /// keybinding path — the whole feature in one keystroke.
+    /// Run whatever the cursor is in WITHOUT leaving the editor. This is the
+    /// pill-over-the-selection path and the keybinding path — the whole point
+    /// is that it does not navigate anywhere.
     RunGenesiBenchAtCursor,
+    /// Show the full surface for a run that already happened, without
+    /// re-inspecting — the "why did it fail" click on the pill.
+    OpenGenesiBenchDetails,
     RunGenesiBench,
     /// Run a specific test picked from the file's test list.
     RunGenesiBenchTarget(usize),
@@ -1084,6 +1088,7 @@ impl WorkspaceAction {
             | CloseGenesiBench
             | InspectGenesiBench
             | RunGenesiBenchAtCursor
+            | OpenGenesiBenchDetails
             | RunGenesiBench
             | RunGenesiBenchTarget(_)
             | GenerateGenesiBenchTest

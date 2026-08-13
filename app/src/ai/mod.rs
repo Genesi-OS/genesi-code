@@ -11,6 +11,7 @@ pub(crate) mod agent_tips;
 pub(crate) mod ai_document_view;
 pub(crate) mod api_probe;
 pub(crate) mod bench;
+pub(crate) mod bench_status;
 pub mod ambient_agents;
 pub(crate) mod artifact_download;
 pub mod artifacts;
@@ -77,5 +78,6 @@ pub fn init(app: &mut AppContext) {
     ai_document_view::init(app);
     conversation_details_panel::init(app);
     local_chat_panel::init(app);
+    bench_status::init(app);
     agent_management::init(app);
 }

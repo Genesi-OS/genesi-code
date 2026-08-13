@@ -62,6 +62,7 @@ use super::bench::{
     suggested_test_path, tests_in, BenchContext, BenchOutcome, BenchSubject, TargetOrigin,
     TestTarget,
 };
+use super::bench_status::{BenchAnchor, BenchPopupState, BenchStatus};
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
 };
@@ -6213,6 +6214,17 @@ impl LocalAiChatView {
         editor
     }
 
+    /// Publish where the run is, for the pill over the selection to read.
+    fn set_bench_status(&self, state: BenchPopupState, ctx: &mut ViewContext<Self>) {
+        let anchor = self.bench_context.as_ref().map(|context| BenchAnchor {
+            // Absolute, because the editor side only knows the file by its real
+            // path and has no idea what root Bench resolved it against.
+            file: context.root.join(&context.file),
+            line: context.line,
+        });
+        BenchStatus::handle(ctx).update(ctx, |status, ctx| status.set(state, anchor, ctx));
+    }
+
     fn probe_field_text(
         &self,
         field: &ViewHandle<EditorView>,
@@ -6559,6 +6571,11 @@ impl LocalAiChatView {
         self.bench_draft = BenchDraftState::Idle;
         self.bench_state = BenchState::Inspecting;
         self.bench_context = Some(context.clone());
+        if and_run {
+            // Only claim to be working when we are going to follow through.
+            // A plain re-read leaves the pill offering to run.
+            self.set_bench_status(BenchPopupState::Working, ctx);
+        }
         ctx.notify();
 
         ctx.spawn(
@@ -6578,16 +6595,41 @@ impl LocalAiChatView {
                 match result {
                     Ok((subject, tests)) => {
                         me.bench_file_tests = tests;
-                        let runnable = matches!(subject, BenchSubject::Runnable(_));
+                        // Tell the pill what was found BEFORE running, so a
+                        // selection with nothing to run stops saying "Testing…"
+                        // and says why instead.
+                        let runnable = match &subject {
+                            BenchSubject::Runnable(_) => true,
+                            BenchSubject::Untested { symbol, .. } => {
+                                let symbol = symbol.clone();
+                                me.set_bench_status(
+                                    BenchPopupState::Nothing {
+                                        reason: format!("No test covers {symbol}"),
+                                    },
+                                    ctx,
+                                );
+                                false
+                            }
+                            BenchSubject::Nothing(reason) => {
+                                let reason = reason.clone();
+                                me.set_bench_status(BenchPopupState::Nothing { reason }, ctx);
+                                false
+                            }
+                        };
                         me.bench_state = BenchState::Ready(Box::new(subject));
                         if and_run && runnable {
                             me.run_bench(ctx);
                         }
                     }
                     Err(error) => {
-                        me.bench_state = BenchState::Ready(Box::new(BenchSubject::Nothing(
-                            format!("The background scanner stopped unexpectedly: {error}"),
-                        )));
+                        let reason = format!("The background scanner stopped unexpectedly: {error}");
+                        me.set_bench_status(
+                            BenchPopupState::Nothing {
+                                reason: reason.clone(),
+                            },
+                            ctx,
+                        );
+                        me.bench_state = BenchState::Ready(Box::new(BenchSubject::Nothing(reason)));
                     }
                 }
                 ctx.notify();
@@ -6647,10 +6689,20 @@ impl LocalAiChatView {
         self.bench_run_generation = self.bench_run_generation.wrapping_add(1);
         let generation = self.bench_run_generation;
         self.bench_run = BenchRunState::Running(command.clone());
+        self.set_bench_status(BenchPopupState::Working, ctx);
         ctx.notify();
 
         let started = Instant::now();
         let to_run = command.clone();
+        // Named here so the pill can say WHICH test it ran, not just that
+        // something passed.
+        let test_name = match &self.bench_state {
+            BenchState::Ready(subject) => match subject.as_ref() {
+                BenchSubject::Runnable(plan) => plan.target.name.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
         ctx.spawn(
             async move { local_agent::run_command(&root, &to_run).await },
             move |me, output, ctx| {
@@ -6659,9 +6711,21 @@ impl LocalAiChatView {
                 }
                 let elapsed_ms = started.elapsed().as_millis();
                 let exit_code = parse_bench_exit_code(&output);
-                me.bench_run = BenchRunState::Done(Box::new(read_outcome(
-                    runner, exit_code, &output, elapsed_ms,
-                )));
+                let outcome = read_outcome(runner, exit_code, &output, elapsed_ms);
+                let label = if test_name.is_empty() {
+                    format!("{} · {elapsed_ms} ms", outcome.summary)
+                } else {
+                    format!("{test_name} · {elapsed_ms} ms")
+                };
+                me.set_bench_status(
+                    if outcome.passed {
+                        BenchPopupState::Passed { label }
+                    } else {
+                        BenchPopupState::Failed { label }
+                    },
+                    ctx,
+                );
+                me.bench_run = BenchRunState::Done(Box::new(outcome));
                 ctx.notify();
             },
         );

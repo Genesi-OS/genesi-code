@@ -111,10 +111,42 @@ fn javascript_symbols_are_found_across_declaration_forms() {
         Some("loadUser")
     );
 
-    let class_declaration = "class ShoppingCart {\n  add() {}\n}\n";
+    let class_declaration = "class ShoppingCart {\n  addItem(item) {\n    this.items.push(item);\n  }\n}\n";
+    // Inside the method, the METHOD is the answer. Reporting the enclosing
+    // class here is the bug that made Bench offer to test `PriceEngine` when
+    // the cursor was in `applyDiscount`.
     assert_eq!(
-        symbol_at(class_declaration, 2, Path::new("src/cart.js")).as_deref(),
+        symbol_at(class_declaration, 3, Path::new("src/cart.js")).as_deref(),
+        Some("addItem")
+    );
+    // On the class line itself, the class is what encloses the cursor.
+    assert_eq!(
+        symbol_at(class_declaration, 1, Path::new("src/cart.js")).as_deref(),
         Some("ShoppingCart")
+    );
+}
+
+#[test]
+fn javascript_object_methods_and_arrow_properties_are_symbols() {
+    let source = "const helpers = {\n  formatPrice(value) {\n    return value;\n  },\n  parsePrice: (text) => Number(text),\n};\n";
+    assert_eq!(
+        symbol_at(source, 3, Path::new("src/helpers.js")).as_deref(),
+        Some("formatPrice")
+    );
+    assert_eq!(
+        symbol_at(source, 5, Path::new("src/helpers.js")).as_deref(),
+        Some("parsePrice")
+    );
+}
+
+#[test]
+fn javascript_control_flow_is_never_mistaken_for_a_function() {
+    // `if (ready) {` has exactly the shape of a method declaration. Without a
+    // keyword filter every conditional becomes something Bench offers to test.
+    let source = "function checkout(cart) {\n  if (cart.ready) {\n    return true;\n  }\n}\n";
+    assert_eq!(
+        symbol_at(source, 3, Path::new("src/checkout.js")).as_deref(),
+        Some("checkout")
     );
 }
 

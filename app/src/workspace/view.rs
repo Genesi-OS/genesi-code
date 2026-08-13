@@ -24807,16 +24807,30 @@ impl TypedActionView for Workspace {
                 self.genesi_bench_open = false;
                 ctx.notify();
             }
-            InspectGenesiBench | RunGenesiBenchAtCursor => {
-                let and_run = matches!(action, RunGenesiBenchAtCursor);
+            InspectGenesiBench => {
                 let context = self.focused_bench_context(ctx);
                 self.genesi_bench_open = true;
                 self.genesi_canvas_open = false;
                 self.genesi_probe_open = false;
                 self.genesi_tools_panel_open = false;
-                self.local_ai_panel.update(ctx, move |panel, ctx| {
-                    panel.inspect_bench(context, and_run, ctx)
-                });
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.inspect_bench(context, false, ctx));
+                ctx.notify();
+            }
+            // Deliberately does NOT open the surface. The pill and the
+            // keybinding are for staying where you are; the result comes back
+            // to the pill, and only a second click asks for the detail view.
+            RunGenesiBenchAtCursor => {
+                let context = self.focused_bench_context(ctx);
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.inspect_bench(context, true, ctx));
+                ctx.notify();
+            }
+            OpenGenesiBenchDetails => {
+                self.genesi_bench_open = true;
+                self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
+                self.genesi_tools_panel_open = false;
                 ctx.notify();
             }
             RunGenesiBench => {
