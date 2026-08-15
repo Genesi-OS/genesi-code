@@ -1188,18 +1188,6 @@ pub fn init(app: &mut AppContext) {
     .with_context_predicate(id!("Workspace"))
     .with_key_binding("ctrl-'")]);
 
-    // Genesi Bench: run the test the cursor is in, without navigating anywhere
-    // first. The binding IS the feature — a test runner you have to go and open
-    // is one you stop reaching for — so it ships bound, editable like the rest.
-    app.register_editable_bindings([EditableBinding::new(
-        "workspace:run_test_at_cursor",
-        "Run the test at the cursor",
-        WorkspaceAction::RunGenesiBenchAtCursor,
-    )
-    .with_group(bindings::BindingGroup::Navigation.as_str())
-    .with_context_predicate(id!("Workspace"))
-    .with_key_binding(cmd_or_ctrl_shift("r"))]);
-
     app.register_editable_bindings([
         EditableBinding::new(
             "workspace:create_team_env_vars",

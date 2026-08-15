@@ -61,7 +61,6 @@ use warpui::{
 };
 
 #[cfg(feature = "local_fs")]
-use crate::ai::bench_status::{BenchAnchor, BenchPopupState, BenchStatus};
 use crate::ai::component_hover::{self, HoverPreview};
 use crate::ai::live_preview_view::{render_document, sheet_background, PreviewScale};
 use crate::ai::persisted_workspace::{LSPInstallationStatus, LspRepoStatus};
@@ -346,20 +345,6 @@ pub(super) const COMPLETION_POPUP_MAX_HEIGHT: f32 = 220.;
 /// Max candidates kept after filtering (keeps rendering/scroll bounded).
 pub(super) const COMPLETION_MAX_VISIBLE_ITEMS: usize = 50;
 
-/// Keep the Bench pill to one short line. The reasons it reports can be a full
-/// sentence, and a pill that grows to a paragraph over your code is the thing
-/// this feature was meant not to be.
-fn truncate_pill_text(text: &str) -> String {
-    const MAX: usize = 48;
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX {
-        return trimmed.to_string();
-    }
-    let mut out: String = trimmed.chars().take(MAX - 1).collect();
-    out.push('…');
-    out
-}
-
 pub struct LocalCodeEditorView {
     pub(super) editor: ViewHandle<CodeEditorView>,
     metadata: Option<LoadedFileMetadata>,
@@ -367,8 +352,6 @@ pub struct LocalCodeEditorView {
     is_new_file: bool,
     diff_type: Option<DiffType>,
     selection_as_context_tooltip: Option<SelectionAsContextTooltip>,
-    /// Genesi Bench: hover state for the pill that offers to test a selection.
-    bench_pill_mouse_state: MouseStateHandle,
     /// A marker for when the backing file has first been loaded. This is used to prevent applying
     /// a diff before it can be properly calculated.
     file_loaded: Condition,
@@ -652,7 +635,6 @@ impl LocalCodeEditorView {
             enable_diff_nav_by_default,
             file_loaded: Condition::new(),
             selection_as_context_tooltip: None,
-            bench_pill_mouse_state: Default::default(),
             was_edited: false,
             base_content_version: None,
             pending_agent_diff: false,
@@ -2427,123 +2409,6 @@ impl LocalCodeEditorView {
             })
     }
 
-    /// Genesi Bench: the pill that appears over a selection offering to test it.
-    ///
-    /// This is Bench's real entry point. The full surface exists for reading
-    /// output and reviewing a generated test, but reaching for it every time you
-    /// want to run one test is exactly the friction that stops people running
-    /// tests at all.
-    ///
-    /// Shown only for a settled selection in a file whose language Bench knows.
-    /// That gate is an extension check and nothing more — deciding whether there
-    /// is a runner or a test means walking the project, which is far too much to
-    /// do on every frame a selection is up. The click pays that cost instead.
-    fn render_bench_pill(&self, app: &AppContext) -> Option<Box<dyn Element>> {
-        let editor = self.editor.as_ref(app);
-        // Mid-drag the selection is still moving; a pill flickering along with
-        // it is the "irritating" version of this feature.
-        if editor.is_selecting() {
-            return None;
-        }
-        let (start, _) = editor.selected_lines(app)?;
-        let file = self.file_path()?;
-        if !crate::ai::bench::understands(&file) {
-            return None;
-        }
-
-        let state = BenchStatus::state_for(
-            app,
-            &BenchAnchor {
-                file: file.to_path_buf(),
-                line: start as usize + 1,
-            },
-        );
-
-        let appearance = Appearance::as_ref(app);
-        let theme = appearance.theme();
-        let colors = &theme.terminal_colors().normal;
-        let (label, accent): (String, ColorU) = match &state {
-            BenchPopupState::Ready => ("Test this".to_string(), theme.active_ui_text_color().into()),
-            BenchPopupState::Working => ("Testing…".to_string(), colors.yellow.into()),
-            BenchPopupState::Passed { label } => (format!("✓ {label}"), colors.green.into()),
-            BenchPopupState::Failed { label } => (format!("✕ {label}"), colors.red.into()),
-            BenchPopupState::Nothing { reason } => (
-                truncate_pill_text(reason),
-                theme.disabled_ui_text_color().into(),
-            ),
-        };
-
-        // A verdict is a thing to inspect; an offer is a thing to act on.
-        let action = if state.wants_details() {
-            WorkspaceAction::OpenGenesiBenchDetails
-        } else {
-            WorkspaceAction::RunGenesiBenchAtCursor
-        };
-        let is_working = matches!(state, BenchPopupState::Working);
-
-        let mut row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Min)
-            .with_child(
-                Text::new_inline(label, appearance.ui_font_family(), appearance.ui_font_size())
-                    .with_color(accent)
-                    .finish(),
-            );
-        if matches!(state, BenchPopupState::Ready) {
-            let shortcut = if cfg!(target_os = "macos") {
-                "⌘⇧R"
-            } else {
-                "Ctrl-Shift-R"
-            };
-            row.add_child(
-                Container::new(
-                    Text::new_inline(
-                        shortcut,
-                        appearance.ui_font_family(),
-                        appearance.ui_font_size() * 0.75,
-                    )
-                    .with_color(theme.disabled_ui_text_color().into())
-                    .finish(),
-                )
-                .with_margin_left(8.)
-                .finish(),
-            );
-        }
-
-        Some(
-            Hoverable::new(self.bench_pill_mouse_state.clone(), move |state| {
-                let background = if state.is_hovered() {
-                    theme.surface_2()
-                } else {
-                    theme.surface_1()
-                };
-                Container::new(
-                    Container::new(row.finish())
-                        .with_padding_left(12.)
-                        .with_padding_right(12.)
-                        .with_padding_top(4.)
-                        .with_padding_bottom(4.)
-                        .finish(),
-                )
-                .with_background(background)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-                .with_border(Border::all(1.5).with_border_fill(theme.surface_2()))
-                .with_drop_shadow(DropShadow::new_with_standard_offset_and_spread(
-                    DROP_SHADOW_COLOR,
-                ))
-                .finish()
-            })
-            .on_click(move |ctx, _app, _pos| {
-                // Clicking mid-run would only queue a second run the guard in
-                // the panel drops, so it reads as a dead button.
-                if !is_working {
-                    ctx.dispatch_typed_action(action.clone());
-                }
-            })
-            .finish(),
-        )
-    }
-
     fn insert_selected_text_to_input(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(relative_file_path) = self.file_path_relative_to_terminal_view(ctx) else {
             return;
@@ -2860,7 +2725,6 @@ impl View for LocalCodeEditorView {
             .with_child(base_with_handler);
 
         let editor = self.editor().as_ref(app);
-        let mut selection_tooltip = None;
         if self.selection_as_context_tooltip.is_some() {
             // When a single terminal exists in the window and the user has made a selection (but isn't currently selecting),
             // we render a tooltip that allows them to add the selected text to the terminal context.
@@ -2869,26 +2733,11 @@ impl View for LocalCodeEditorView {
                 && FeatureFlag::SelectionAsContext.is_enabled()
                 && !editor.is_selecting()
             {
-                selection_tooltip = self.render_selection_tooltip(app);
+                let tooltip = self.render_selection_tooltip(app);
+                if let Some(tooltip) = tooltip {
+                    stack.add_positioned_child(tooltip, editor.selection_position_anchor(app))
+                }
             }
-        }
-
-        // Both of these anchor to the selection, so they have to share one
-        // positioned child — added separately they would sit on top of each
-        // other at the same point.
-        let bench_pill = self.render_bench_pill(app);
-        if selection_tooltip.is_some() || bench_pill.is_some() {
-            let mut affordances = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-            if let Some(tooltip) = selection_tooltip {
-                affordances.add_child(tooltip);
-            }
-            if let Some(pill) = bench_pill {
-                affordances.add_child(Container::new(pill).with_margin_left(6.).finish());
-            }
-            stack.add_positioned_child(
-                affordances.finish(),
-                editor.selection_position_anchor(app),
-            );
         }
 
         // Render context menu if open

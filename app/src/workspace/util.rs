@@ -43,8 +43,6 @@ pub(super) struct WorkspaceMouseStates {
     /// Genesi: entrypoint button for Probe, the built-in API client. Its own
     /// handle so it does not light up whenever the Canvas button is hovered.
     pub(super) genesi_probe_icon: MouseStateHandle,
-    /// Genesi: entrypoint button for Bench, the single-test runner.
-    pub(super) genesi_bench_icon: MouseStateHandle,
     pub(super) notifications_mailbox: MouseStateHandle,
     pub(super) session_config_tab_config_chip_close: MouseStateHandle,
     pub(super) tools_panel_icon: MouseStateHandle,
