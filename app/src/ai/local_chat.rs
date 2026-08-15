@@ -658,18 +658,127 @@ pub fn stream_chat_cloud(
     tools: Option<serde_json::Value>,
     reply_tokens: u32,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
+    let model = model.to_string();
     match provider {
-        CloudProviderKind::Anthropic => stream_chat_anthropic_sse(model, messages, api_key).boxed(),
-        _ => stream_chat_openai_sse(
-            provider.base_url(),
-            Some(model),
-            messages,
-            Some(api_key),
-            tools,
-            reply_tokens,
-        )
-        .boxed(),
+        CloudProviderKind::Anthropic => retrying_on_rate_limit(Box::new(move || {
+            stream_chat_anthropic_sse(&model, messages.clone(), api_key.clone()).boxed()
+        })),
+        _ => {
+            let base_url = provider.base_url();
+            retrying_on_rate_limit(Box::new(move || {
+                stream_chat_openai_sse(
+                    base_url,
+                    Some(&model),
+                    messages.clone(),
+                    Some(api_key.clone()),
+                    tools.clone(),
+                    reply_tokens,
+                )
+                .boxed()
+            }))
+        }
     }
+}
+
+/// How many times a rate-limited turn is retried before the error reaches the
+/// user. Two rides out a per-minute window without leaving anyone staring at a
+/// panel that looks frozen.
+const RATE_LIMIT_MAX_RETRIES: u32 = 2;
+
+/// Longest pause we'll honour before deciding the user would rather see the
+/// error than keep waiting.
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(45);
+
+/// What to wait when a provider says "slow down" without saying for how long.
+const RATE_LIMIT_FALLBACK_WAIT: Duration = Duration::from_secs(10);
+
+/// Retry a chat stream through a provider's rate limit.
+///
+/// Every BYOK provider meters requests, and the free tiers meter them tightly:
+/// Groq's is 8k tokens per MINUTE, which one agent step can spend on its own.
+/// Without this the turn just died — the panel showed a red "429 Too Many
+/// Requests … try again in 22.6s" and the build stopped there, even though the
+/// provider had told us exactly how long to wait.
+///
+/// `build` is called once per attempt, so it must own everything it needs. It
+/// hands back an already-boxed stream on purpose: making this generic over the
+/// stream type monomorphised one `async_stream` generator per provider path,
+/// each wrapping the last, and rustc blew its stack compiling the result.
+///
+/// Only a rate limit that lands BEFORE any output is retried: once tokens have
+/// been streamed into the UI, replaying the request would duplicate them.
+fn retrying_on_rate_limit(
+    build: Box<dyn Fn() -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> + Send>,
+) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
+    async_stream::stream! {
+        for attempt in 0..=RATE_LIMIT_MAX_RETRIES {
+            let mut inner = build();
+            let mut streamed_anything = false;
+            let mut retry_after = None;
+            while let Some(item) = inner.next().await {
+                if !streamed_anything && attempt < RATE_LIMIT_MAX_RETRIES {
+                    if let Some(wait) = item.as_ref().err().and_then(|err| {
+                        rate_limit_wait(&err.to_string())
+                    }) {
+                        retry_after = Some(wait);
+                        break;
+                    }
+                }
+                streamed_anything = true;
+                yield item;
+            }
+            let Some(wait) = retry_after else { return };
+            log::info!(
+                "local chat: provider rate-limited the request, retrying in {:.1}s",
+                wait.as_secs_f64()
+            );
+            warpui::r#async::Timer::after(wait).await;
+        }
+    }
+    .boxed()
+}
+
+/// How long to wait after a rate limit, read out of the provider's own message.
+///
+/// The OpenAI-compatible providers answer a 429 with the exact wait that makes
+/// the retry work ("Please try again in 22.627499999s"), so honour it rather
+/// than guessing. Returns `None` for anything that isn't a rate limit — that is
+/// what stops a bad key or a missing model from being retried three times.
+fn rate_limit_wait(error: &str) -> Option<Duration> {
+    let error = error.to_ascii_lowercase();
+    if !(error.contains("429")
+        || error.contains("too many requests")
+        || error.contains("rate limit"))
+    {
+        return None;
+    }
+    let wait = error
+        .split("try again in")
+        .nth(1)
+        .and_then(parse_leading_duration)
+        .unwrap_or(RATE_LIMIT_FALLBACK_WAIT);
+    Some(wait.min(RATE_LIMIT_MAX_WAIT))
+}
+
+/// Read a leading "22.6s" / "500ms" / "1m" off the front of `text`.
+fn parse_leading_duration(text: &str) -> Option<Duration> {
+    let text = text.trim_start();
+    // Digits and '.' are single-byte, so the char count is also the byte offset.
+    let number: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let value: f64 = number.parse().ok()?;
+    let unit = text[number.len()..].trim_start();
+    // "ms" before "m": otherwise a 500ms wait is read as 500 minutes.
+    let seconds = if unit.starts_with("ms") {
+        value / 1000.0
+    } else if unit.starts_with('m') {
+        value * 60.0
+    } else {
+        value
+    };
+    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
 }
 
 fn cloud_http_client() -> http_client::Client {

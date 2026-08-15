@@ -250,3 +250,50 @@ fn token_estimates_are_pessimistic_not_precise() {
     assert_eq!(estimate_tokens("abcd"), 1);
     assert_eq!(estimate_tokens("abcde"), 2);
 }
+
+#[test]
+fn a_rate_limit_is_retried_after_the_wait_the_provider_asked_for() {
+    // The exact shape Groq returns on a free-tier TPM overrun. Honouring the
+    // number is what makes the retry land after the window has reset instead of
+    // immediately burning the next attempt.
+    let err = "the model server returned 429 Too Many Requests: Rate limit reached \
+               for model `openai/gpt-oss-120b` ... Please try again in 22.627499999s.";
+    assert_eq!(
+        rate_limit_wait(err),
+        Some(Duration::from_secs_f64(22.627499999))
+    );
+}
+
+#[test]
+fn a_rate_limit_without_a_stated_wait_still_backs_off() {
+    assert_eq!(
+        rate_limit_wait("the model server returned 429 Too Many Requests"),
+        Some(RATE_LIMIT_FALLBACK_WAIT)
+    );
+}
+
+#[test]
+fn an_absurd_wait_is_capped_rather_than_honoured() {
+    // A provider asking for ten minutes is worse for the user than the error.
+    assert_eq!(
+        rate_limit_wait("429 rate limit, please try again in 600s"),
+        Some(RATE_LIMIT_MAX_WAIT)
+    );
+}
+
+#[test]
+fn ordinary_failures_are_never_retried() {
+    // Retrying a bad key or a missing model just delays the error three times.
+    assert_eq!(rate_limit_wait("the model server returned 401 Unauthorized"), None);
+    assert_eq!(rate_limit_wait("the model server returned 404: model not found"), None);
+    assert_eq!(rate_limit_wait("connection refused"), None);
+}
+
+#[test]
+fn wait_units_are_read_not_assumed() {
+    // "ms" must be checked before "m", or a 500ms backoff becomes 500 minutes.
+    assert_eq!(parse_leading_duration("500ms"), Some(Duration::from_millis(500)));
+    assert_eq!(parse_leading_duration("2m"), Some(Duration::from_secs(120)));
+    assert_eq!(parse_leading_duration("30s"), Some(Duration::from_secs(30)));
+    assert_eq!(parse_leading_duration("nope"), None);
+}
