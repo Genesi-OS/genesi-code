@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -37,6 +37,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(120);
 /// Ceiling on the request itself. Long enough for a cold dev server that
 /// recompiles on first hit, short enough that a hung port does not look frozen.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on establishing the connection, as opposed to the whole exchange.
+/// A server that is not there should say so immediately rather than burning the
+/// request timeout first.
+const CONNECT_TIMEOUT_HTTP: Duration = Duration::from_secs(5);
 
 /// Response bodies past this are cut before they reach the view. A response
 /// pane is not a file viewer: shaping megabytes of text costs a frame on every
@@ -411,11 +416,7 @@ pub async fn send_request(request: ProbeRequest) -> Result<ProbeResponse> {
     let method = reqwest::Method::from_bytes(request.method.trim().to_ascii_uppercase().as_bytes())
         .with_context(|| format!("`{}` is not a valid HTTP method", request.method))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .context("failed to build the HTTP client")?;
-
+    let client = client_for(&url);
     let mut builder = client.request(method.clone(), &url);
     let headers = parse_headers(&request.headers);
     let has_content_type = headers
@@ -479,6 +480,64 @@ pub async fn send_request(request: ProbeRequest) -> Result<ProbeResponse> {
         content_type,
         truncated,
     })
+}
+
+/// The HTTP client to use for `url`, built once and reused.
+///
+/// Two things here were costing seconds per request. The client was rebuilt on
+/// every send, and building a reqwest client loads the system proxy
+/// configuration — which this codebase already knows is slow enough to be worth
+/// disabling in tests (see `http_client::Client::new_for_test`). Worse, without
+/// `no_proxy` a request to `127.0.0.1` is handed to whatever proxy the desktop
+/// has configured, which on a box running genesi-proxy is a round trip through
+/// something that was never meant to serve loopback.
+///
+/// So: loopback gets a client that has never heard of a proxy, everything else
+/// gets one that respects the system settings, and both are built at most once
+/// for the life of the process.
+fn client_for(url: &str) -> &'static reqwest::Client {
+    static LOOPBACK: OnceLock<reqwest::Client> = OnceLock::new();
+    static EXTERNAL: OnceLock<reqwest::Client> = OnceLock::new();
+
+    let base = || {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            // Without this a dead port waits out the full request timeout
+            // before admitting nothing is there.
+            .connect_timeout(CONNECT_TIMEOUT_HTTP)
+    };
+    if is_loopback_url(url) {
+        LOOPBACK.get_or_init(|| {
+            base()
+                .no_proxy()
+                .build()
+                .expect("a loopback HTTP client should always build")
+        })
+    } else {
+        EXTERNAL.get_or_init(|| {
+            base()
+                .build()
+                .expect("an HTTP client should always build")
+        })
+    }
+}
+
+/// Whether this URL points at the machine Probe is running on.
+fn is_loopback_url(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip any userinfo and the port, leaving the host.
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+        || host.starts_with("127.")
 }
 
 /// reqwest's `Display` stops at "error sending request"; the cause underneath is

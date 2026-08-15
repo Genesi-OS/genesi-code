@@ -799,6 +799,13 @@ pub struct LocalAiChatView {
     probe_headers_input: ViewHandle<EditorView>,
     probe_body_input: ViewHandle<EditorView>,
     probe_selected_route: Option<String>,
+    /// Exactly what Probe last wrote into the URL field. Lets a survey that
+    /// finishes later tell its own seed apart from a URL the user typed, so it
+    /// can correct the port without ever clobbering an edit.
+    probe_seeded_url: Option<String>,
+    /// A Canvas endpoint clicked before the survey knew the port: method,
+    /// route, body hint. Consumed by `apply_probe_survey`.
+    probe_pending_route: Option<(String, String, Option<String>)>,
     probe_response: ProbeResponseState,
     probe_history: Vec<ProbeHistoryEntry>,
     /// Which pane the request editor shows: headers when set, body otherwise.
@@ -925,6 +932,8 @@ impl LocalAiChatView {
             probe_headers_input,
             probe_body_input,
             probe_selected_route: None,
+            probe_seeded_url: None,
+            probe_pending_route: None,
             probe_response: ProbeResponseState::Idle,
             probe_history: Vec::new(),
             probe_show_request_headers: false,
@@ -5529,20 +5538,52 @@ impl LocalAiChatView {
         );
     }
 
-    fn apply_probe_survey(&mut self, survey: Arc<ProbeSurvey>, ctx: &mut ViewContext<Self>) {
-        // Seed the request only when the field is untouched. A rescan that
-        // landed while the user was typing a URL must not rewrite it.
+    /// Write a URL into the field and remember exactly what was written, so a
+    /// later survey can tell its own seed apart from something the user typed.
+    fn seed_probe_url(&mut self, url: &str, ctx: &mut ViewContext<Self>) {
+        self.set_probe_field(&self.probe_url, url, ctx);
+        self.probe_seeded_url = Some(url.to_string());
+    }
+
+    /// Whether the URL field still holds exactly what Probe last put there.
+    fn probe_url_untouched(&self, ctx: &mut ViewContext<Self>) -> bool {
         let current = self.probe_field_text(&self.probe_url, ctx);
         if current.trim().is_empty() {
+            return true;
+        }
+        self.probe_seeded_url.as_deref() == Some(current.as_str())
+    }
+
+    fn apply_probe_survey(&mut self, survey: Arc<ProbeSurvey>, ctx: &mut ViewContext<Self>) {
+        let base = survey.base_url();
+
+        // A route the user clicked on the Canvas before the survey finished.
+        // It could not become a URL then — the port was not known yet — so it
+        // waited here for the real one instead of being built against a guess.
+        if let Some((method, route, body_hint)) = self.probe_pending_route.take() {
+            let takes_body = method_takes_body(&method);
+            self.probe_method = method;
+            self.seed_probe_url(&build_url(&base, &route), ctx);
+            if takes_body {
+                self.seed_probe_body(body_hint.as_deref(), ctx);
+            }
+            self.probe_state = ProbeState::Ready(survey);
+            return;
+        }
+
+        // Otherwise re-point whatever Probe seeded earlier at the port the
+        // survey actually found. Only its own seed is rewritten: a URL the user
+        // typed is theirs, and a rescan landing mid-edit must not clobber it.
+        if self.probe_url_untouched(ctx) {
             let url = match survey.routes.first() {
                 Some(route) => {
                     self.probe_method = route.method.clone();
                     self.probe_selected_route = Some(route.id.clone());
-                    build_url(&survey.base_url(), &route.route)
+                    build_url(&base, &route.route)
                 }
-                None => survey.base_url(),
+                None => base,
             };
-            self.set_probe_field(&self.probe_url, &url, ctx);
+            self.seed_probe_url(&url, ctx);
         }
         self.probe_state = ProbeState::Ready(survey);
     }
@@ -5586,7 +5627,7 @@ impl LocalAiChatView {
 
         self.probe_selected_route = Some(id.to_string());
         self.probe_method = method.clone();
-        self.set_probe_field(&self.probe_url, &url, ctx);
+        self.seed_probe_url(&url, ctx);
         if method_takes_body(&method) {
             self.seed_probe_body(body_hint.as_deref(), ctx);
             self.probe_show_request_headers = false;
@@ -5612,7 +5653,7 @@ impl LocalAiChatView {
     pub fn select_probe_port(&mut self, port: u16, ctx: &mut ViewContext<Self>) {
         let current = self.probe_field_text(&self.probe_url, ctx);
         let url = build_url(&format!("http://127.0.0.1:{port}"), &probe_path_of(&current));
-        self.set_probe_field(&self.probe_url, &url, ctx);
+        self.seed_probe_url(&url, ctx);
         ctx.notify();
     }
 
@@ -5750,17 +5791,24 @@ impl LocalAiChatView {
         self.open_api_probe(project_root, ctx);
 
         if let Some((method, route, body_hint)) = seed {
-            let base = match &self.probe_state {
-                ProbeState::Ready(survey) => survey.base_url(),
-                _ => "http://127.0.0.1:3000".to_string(),
-            };
             // Route ids are shared with the Canvas, so the sidebar highlights
             // this endpoint as soon as the survey lands behind us.
             self.probe_selected_route = Some(node_id.to_string());
-            self.probe_method = method.clone();
-            self.set_probe_field(&self.probe_url, &build_url(&base, &route), ctx);
-            if method_takes_body(&method) {
-                self.seed_probe_body(body_hint.as_deref(), ctx);
+            match &self.probe_state {
+                ProbeState::Ready(survey) => {
+                    let base = survey.base_url();
+                    self.probe_method = method.clone();
+                    self.seed_probe_url(&build_url(&base, &route), ctx);
+                    if method_takes_body(&method) {
+                        self.seed_probe_body(body_hint.as_deref(), ctx);
+                    }
+                }
+                // The survey is still running, so the port is not known. This
+                // used to fall back to a hardcoded :3000 and never correct
+                // itself once the real port arrived — which is exactly what
+                // made a backend on :3210 get called on :3000. Hold the route
+                // until `apply_probe_survey` can build it properly.
+                _ => self.probe_pending_route = Some((method, route, body_hint)),
             }
         }
         ctx.notify();

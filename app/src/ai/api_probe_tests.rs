@@ -149,6 +149,53 @@ fn an_empty_url_is_rejected_before_any_request_is_made() {
 }
 
 #[test]
+fn loopback_urls_are_recognised_in_every_form_people_type() {
+    // These must all bypass the system proxy: a request to this machine that
+    // gets handed to a proxy is the difference between 20 ms and 15 seconds.
+    for url in [
+        "http://localhost:3000/api",
+        "http://127.0.0.1:8080",
+        "127.0.0.1:3210/health",
+        "localhost:5173",
+        "http://[::1]:9000/x",
+        "http://0.0.0.0:4000",
+        "http://127.5.5.5:1234",
+        "http://user:pw@localhost:3000/api",
+    ] {
+        assert!(is_loopback_url(url), "{url} should be loopback");
+    }
+}
+
+#[test]
+fn external_urls_still_go_through_the_system_proxy() {
+    for url in [
+        "https://api.example.com/v1",
+        "http://192.168.1.10:8080",
+        // A host that merely mentions localhost is not localhost.
+        "https://localhost.example.com/api",
+        "https://notlocalhost/api",
+    ] {
+        assert!(!is_loopback_url(url), "{url} should not be loopback");
+    }
+}
+
+#[test]
+fn the_loopback_and_external_clients_are_each_built_once() {
+    // The bug this guards: a client rebuilt per request reloads the system
+    // proxy configuration every time, which this codebase already documents as
+    // slow (see `http_client::Client::new_for_test`).
+    let first = client_for("http://127.0.0.1:3000/a") as *const reqwest::Client;
+    let second = client_for("http://localhost:9999/b") as *const reqwest::Client;
+    assert!(std::ptr::eq(first, second), "loopback client must be reused");
+
+    let external = client_for("https://example.com") as *const reqwest::Client;
+    assert!(
+        !std::ptr::eq(first, external),
+        "external traffic must not borrow the no-proxy client"
+    );
+}
+
+#[test]
 fn response_sizes_render_in_human_units() {
     let response = |size| ProbeResponse {
         status: 200,
