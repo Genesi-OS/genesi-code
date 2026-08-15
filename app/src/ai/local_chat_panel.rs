@@ -687,6 +687,11 @@ pub struct LocalAiChatView {
     ai_mode: Option<AiModeState>,
 
     in_flight: bool,
+    /// Corrections the user typed WHILE a turn was running, waiting to be fed
+    /// into it. Before this existed a mid-turn submit was dropped on the floor
+    /// by the `in_flight` guard in `send_with_context`, so the only way to
+    /// redirect the model was to stop it and start over.
+    steering: Vec<String>,
     error: Option<String>,
     /// Monotonic id of the current generation. Stop bumps it so stale stream
     /// callbacks (from a turn the user interrupted) no-op instead of writing
@@ -882,6 +887,7 @@ impl LocalAiChatView {
             selected_model: None,
             ai_mode: None,
             in_flight: false,
+            steering: Vec::new(),
             error: None,
             current_turn: 0,
             attach_context: true,
@@ -1458,6 +1464,71 @@ impl LocalAiChatView {
         self.set_input_mode(InputMode::Chat, ctx);
     }
 
+    // ─────────────────── Steering: correcting a running turn ───────────────────
+
+    /// Take a correction for the turn already in progress.
+    ///
+    /// It goes into the transcript immediately so the user can see it landed —
+    /// the alternative is typing into a box that appears to swallow input, which
+    /// is exactly what happened before steering existed.
+    fn steer(&mut self, text: String, ctx: &mut ViewContext<Self>) {
+        self.messages.push(ChatEntry::prose(
+            ChatRole::User,
+            text.clone(),
+            Some("steering".to_string()),
+        ));
+        self.steering.push(text);
+        self.scroll_to_bottom();
+        self.persist_mempalace(ctx, false);
+        ctx.notify();
+    }
+
+    /// Fold queued corrections into the running agent conversation.
+    ///
+    /// Called only from the top of [`Self::run_agent_step`], where the previous
+    /// stream has ended and the next has not been built — the one point where a
+    /// running turn can change course without touching the streaming path at
+    /// all. They are labelled as mid-task corrections because a model that reads
+    /// them as ordinary follow-ups tends to finish the original plan first and
+    /// address them afterwards, which is the opposite of steering.
+    fn apply_steering_to_agent(&mut self) {
+        if self.steering.is_empty() {
+            return;
+        }
+        for correction in std::mem::take(&mut self.steering) {
+            self.agent_messages.push(ChatMessage::user(format!(
+                "Course correction from the user, mid-task. Apply this to what you \
+                 are doing now, before continuing:\n\n{correction}"
+            )));
+        }
+        // The correction is fresh instruction, so the model has something to act
+        // on again — don't hold last step's "it only thought" count against it.
+        self.agent_nudges = 0;
+    }
+
+    /// Anything still queued once a turn settles becomes the next prompt.
+    ///
+    /// Plain chat has a single stream and so no step boundary to inject at, and
+    /// an agent turn can finish before it ever takes another step. Either way
+    /// the user typed something and is owed an answer to it.
+    fn flush_pending_steering(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.steering.is_empty() || self.in_flight {
+            return;
+        }
+        let prompt = std::mem::take(&mut self.steering).join("\n\n");
+        // Back out through the workspace so the follow-up picks up editor
+        // context exactly the way a typed prompt would.
+        ctx.emit(LocalAiChatEvent::SubmitPrompt(prompt));
+    }
+
+    pub fn cancel_steering(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.steering.is_empty() {
+            return;
+        }
+        self.steering.clear();
+        ctx.notify();
+    }
+
     /// Send the prompt and start streaming the assistant's reply, optionally
     /// attaching the focused file as context. Called by the workspace after it
     /// gathers `context` for the current turn.
@@ -1469,7 +1540,13 @@ impl LocalAiChatView {
         ctx: &mut ViewContext<Self>,
     ) {
         let prompt = prompt.trim().to_string();
-        if prompt.is_empty() || self.in_flight {
+        if prompt.is_empty() {
+            return;
+        }
+        // Mid-flight steering. This used to `return` and lose the text
+        // entirely; now it joins the turn already in progress.
+        if self.in_flight {
+            self.steer(prompt, ctx);
             return;
         }
         self.load_cloud_keys(ctx);
@@ -1650,6 +1727,7 @@ impl LocalAiChatView {
                         me.messages.pop();
                         me.error = Some(me.empty_reply_error());
                     }
+                    me.flush_pending_steering(ctx);
                     ctx.notify();
                 }
             },
@@ -1794,6 +1872,11 @@ impl LocalAiChatView {
             diff_stat: None,
             diff_preview: None,
         });
+        // The step boundary is the one safe place to change a running turn's
+        // course: the previous stream is finished and the next has not been
+        // built, so the correction is simply part of the conversation the model
+        // is about to read. Nothing about the streaming path changes.
+        self.apply_steering_to_agent();
         let turn = self.current_turn;
         let agent_model = self.agent_model.clone();
         let agent_messages = self.agent_messages.clone();
@@ -2018,6 +2101,7 @@ impl LocalAiChatView {
                 self.refresh_ai_mode();
                 self.scroll_to_bottom();
                 self.persist_mempalace(ctx, false);
+                self.flush_pending_steering(ctx);
                 ctx.notify();
             }
         }
@@ -2399,6 +2483,9 @@ impl LocalAiChatView {
         self.current_turn += 1;
         self.in_flight = false;
         self.pending_tool = None;
+        // Stop means stop: a correction queued for a turn the user just
+        // abandoned must not resurface on the next one.
+        self.steering.clear();
 
         let trailing = self
             .messages
@@ -2479,6 +2566,7 @@ impl LocalAiChatView {
                 self.refresh_ai_mode();
                 self.scroll_to_bottom();
                 self.persist_mempalace(ctx, false);
+                self.flush_pending_steering(ctx);
                 ctx.notify();
             }
             Err(e) => {
@@ -6193,6 +6281,7 @@ impl LocalAiChatView {
         self.agent_step_buffer.clear();
         self.agent_tool_summary.clear();
         self.in_flight = false;
+        self.steering.clear();
         self.current_turn += 1;
     }
 

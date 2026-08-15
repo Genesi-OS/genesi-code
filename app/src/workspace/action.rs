@@ -353,6 +353,11 @@ pub enum WorkspaceAction {
     /// Open Probe prefilled from an endpoint node on the Project Canvas.
     ProbeGenesiCanvasNode(String),
 
+    /// Copy the editor selection together with the definitions it refers to.
+    CopyGenesiSemanticContext,
+    /// Drop a correction into the AI turn that is already running.
+    CancelGenesiSteering,
+
     SelectGenesiReviewFile(String),
     UndoGenesiEdits,
     KeepGenesiEdits,
@@ -1063,6 +1068,8 @@ impl WorkspaceAction {
             | ClearGenesiProbeHistory
             | CopyGenesiProbeResponse
             | ProbeGenesiCanvasNode(_)
+            | CopyGenesiSemanticContext
+            | CancelGenesiSteering
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits
             | KeepGenesiEdits

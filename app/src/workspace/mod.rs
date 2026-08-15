@@ -1188,6 +1188,17 @@ pub fn init(app: &mut AppContext) {
     .with_context_predicate(id!("Workspace"))
     .with_key_binding("ctrl-'")]);
 
+    // Genesi: copy a selection with the interfaces, imports and CSS rules it
+    // refers to, so a paste into a chat or an issue carries its own meaning.
+    app.register_editable_bindings([EditableBinding::new(
+        "workspace:copy_with_context",
+        "Copy with definitions",
+        WorkspaceAction::CopyGenesiSemanticContext,
+    )
+    .with_group(bindings::BindingGroup::Navigation.as_str())
+    .with_context_predicate(id!("Workspace"))
+    .with_key_binding(cmd_or_ctrl_shift("j"))]);
+
     app.register_editable_bindings([
         EditableBinding::new(
             "workspace:create_team_env_vars",

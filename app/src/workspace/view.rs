@@ -5283,6 +5283,36 @@ impl Workspace {
         })
     }
 
+    /// Genesi: the selection the semantic clipboard should resolve, as
+    /// `(project root, project-relative file, selected text, start line)`.
+    ///
+    /// Returns `None` without a selection: enriching the whole file would put a
+    /// project's worth of definitions on the clipboard.
+    fn focused_semantic_selection(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf, String, usize)> {
+        let root = self.focused_project_root(ctx)?;
+        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+        let code_view = pane_group
+            .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
+            .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next())?;
+        let editor_handle = code_view.as_ref(ctx).active_editor()?;
+        let editor = editor_handle.as_ref(ctx);
+        let absolute = editor.file_path()?;
+        let file = absolute
+            .strip_prefix(&root)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(absolute.file_name().unwrap_or_default().to_os_string())
+            });
+
+        let inner = editor.editor().as_ref(ctx);
+        let (start, _) = inner.selected_lines(ctx)?;
+        let selection = inner.selected_text(ctx)?;
+        (!selection.trim().is_empty()).then_some((root, file, selection, start as usize + 1))
+    }
+
     /// Genesi: the project root the local AI agent should explore. Walks up from
     /// the focused code editor's file to a project marker (.git, Cargo.toml, …),
     /// falling back to the file's directory and finally the active terminal cwd.
@@ -24703,6 +24733,35 @@ impl TypedActionView for Workspace {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.copy_probe_response(ctx));
             }
+
+            CopyGenesiSemanticContext => {
+                // Resolution walks the project, so it runs off the UI thread and
+                // the clipboard write happens back here once it lands.
+                let Some((root, file, selection, line)) = self.focused_semantic_selection(ctx)
+                else {
+                    return;
+                };
+                ctx.spawn(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::ai::semantic_clipboard::resolve(&root, &file, &selection, line)
+                        })
+                        .await
+                    },
+                    move |_me, result, ctx| {
+                        if let Ok(resolved) = result {
+                            ctx.clipboard()
+                                .write(ClipboardContent::plain_text(resolved.to_clipboard_text()));
+                        }
+                    },
+                );
+            }
+            CancelGenesiSteering => {
+                self.local_ai_panel
+                    .update(ctx, |panel, ctx| panel.cancel_steering(ctx));
+                ctx.notify();
+            }
+
             ProbeGenesiCanvasNode(node_id) => {
                 let project_root = self.focused_project_root(ctx);
                 self.genesi_probe_open = true;

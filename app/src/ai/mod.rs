@@ -46,6 +46,7 @@ pub(crate) mod project_canvas;
 pub(crate) mod project_canvas_view;
 pub mod request_usage_model;
 pub(crate) mod restored_conversations;
+pub(crate) mod semantic_clipboard;
 pub(crate) mod skills;
 pub(crate) mod voice;
 pub use agent_tips::*;
