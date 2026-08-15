@@ -1066,11 +1066,23 @@ impl LocalAiChatView {
         // the reply against what's left. Sending a fixed max_tokens was its own
         // bug: asking for 4096 reply tokens on a 4096-token window leaves the
         // prompt nowhere to go.
-        let messages = self.fit_to_context(messages);
+        // llama-server renders the tool schemas INTO the prompt, so they cost
+        // real context — but they travel in their own request field and were
+        // invisible to the budget below, which only ever weighed message text.
+        // On an 8K window the six schemas plus their descriptions were enough to
+        // push a Build turn past the wall, and llama-server answers a request
+        // that overflows by accepting it and streaming nothing at all. Chat mode
+        // sends no tools, which is exactly why only Build broke.
+        let tool_tokens = tools
+            .as_ref()
+            .map(|schemas| estimate_tokens(&schemas.to_string()))
+            .unwrap_or(0);
+        let messages = self.fit_to_context(messages, tool_tokens);
         let prompt_tokens = messages
             .iter()
             .map(|message| estimate_tokens(&message.content))
-            .sum();
+            .sum::<usize>()
+            + tool_tokens;
         let reply_tokens = if self.cloud_active {
             LOCAL_MAX_TOKENS
         } else {
@@ -1110,7 +1122,9 @@ impl LocalAiChatView {
     /// Order of sacrifice, least useful first: the OLDEST exchanges go before the
     /// newest (the model needs where it is, not where it started), and only then
     /// do we start cutting into the bodies of what is left.
-    fn fit_to_context(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    /// `reserved` is context the request spends outside the messages — today the
+    /// tool schemas, which the server folds into the prompt for us.
+    fn fit_to_context(&self, messages: Vec<ChatMessage>, reserved: usize) -> Vec<ChatMessage> {
         // A cloud provider's window is orders of magnitude bigger and unknown to
         // us; trimming to a local-sized budget would throw away context for no
         // reason.
@@ -1119,7 +1133,10 @@ impl LocalAiChatView {
         }
         let n_ctx = self.server_context.unwrap_or(ASSUMED_CONTEXT_TOKENS) as usize;
         // Leave the model room to actually answer.
-        let budget = n_ctx.saturating_sub(REPLY_RESERVE_TOKENS).max(512);
+        let budget = n_ctx
+            .saturating_sub(REPLY_RESERVE_TOKENS)
+            .saturating_sub(reserved)
+            .max(512);
 
         let cost = |m: &ChatMessage| estimate_tokens(&m.content);
         let total = |ms: &[ChatMessage]| -> usize { ms.iter().map(cost).sum() };
@@ -1853,9 +1870,10 @@ impl LocalAiChatView {
             LocalEndpoint::Turbo => format!(
                 "{}: the model returned nothing on any channel. The prompt may not fit \
                  the server's context window — start Turbo with a bigger one \
-                 (GENESI_TURBO_CTX=8192), shorten the conversation, or remove the \
-                 reference chips above the input. Run `genesi-ai-turbo serve <model>` \
-                 in a terminal to see the server's own error.",
+                 (GENESI_TURBO_CTX=16384; the default is 8192), shorten the \
+                 conversation, or remove the reference chips above the input. Run \
+                 `genesi-ai-turbo serve <model>` in a terminal to see the server's own \
+                 error.",
                 self.active_backend_error_label()
             ),
             LocalEndpoint::Ollama => format!(
