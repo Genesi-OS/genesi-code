@@ -7190,6 +7190,7 @@ impl SettingsWidget for CloudHandoffWidget {
 struct GenesiCloudKeysWidget {
     hugging_face_api_key_editor: ViewHandle<EditorView>,
     openai_api_key_editor: ViewHandle<EditorView>,
+    groq_api_key_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     gemini_api_key_editor: ViewHandle<EditorView>,
 }
@@ -7225,6 +7226,7 @@ impl GenesiCloudKeysWidget {
         match provider {
             CloudProviderKind::HuggingFace => "Hugging Face API key",
             CloudProviderKind::OpenAI => "OpenAI API key",
+            CloudProviderKind::Groq => "Groq API key",
             CloudProviderKind::Anthropic => "Anthropic API key",
             CloudProviderKind::Gemini => "Gemini API key",
         }
@@ -7234,6 +7236,7 @@ impl GenesiCloudKeysWidget {
         match provider {
             CloudProviderKind::HuggingFace => "hf_...",
             CloudProviderKind::OpenAI => "sk-...",
+            CloudProviderKind::Groq => "gsk_...",
             CloudProviderKind::Anthropic => "sk-ant-...",
             CloudProviderKind::Gemini => "AIza...",
         }
@@ -7297,6 +7300,11 @@ impl GenesiCloudKeysWidget {
             openai_api_key_editor: Self::make_key_editor(
                 CloudProviderKind::OpenAI,
                 keys.get(CloudProviderKind::OpenAI),
+                ctx,
+            ),
+            groq_api_key_editor: Self::make_key_editor(
+                CloudProviderKind::Groq,
+                keys.get(CloudProviderKind::Groq),
                 ctx,
             ),
             anthropic_api_key_editor: Self::make_key_editor(
@@ -7418,6 +7426,10 @@ impl SettingsWidget for GenesiCloudKeysWidget {
             (
                 CloudProviderKind::OpenAI,
                 self.openai_api_key_editor.clone(),
+            ),
+            (
+                CloudProviderKind::Groq,
+                self.groq_api_key_editor.clone(),
             ),
             (
                 CloudProviderKind::Anthropic,

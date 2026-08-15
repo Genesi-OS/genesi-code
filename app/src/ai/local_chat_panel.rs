@@ -7424,6 +7424,11 @@ impl LocalAiChatView {
                         CloudProviderKind::OpenAI => {
                             "OpenAI uses /v1/chat/completions with your own bearer token."
                         }
+                        CloudProviderKind::Groq => {
+                            "Groq uses an OpenAI-compatible endpoint with your own bearer \
+                             token — very fast inference for open models (Llama, GPT-OSS, \
+                             Qwen, Kimi …)."
+                        }
                         CloudProviderKind::HuggingFace => {
                             "Hugging Face uses the official router and an HF token with \
                              Inference Providers permission."

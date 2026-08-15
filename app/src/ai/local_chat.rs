@@ -1444,6 +1444,7 @@ pub fn set_ai_mode_force(value: &str) -> Result<()> {
 pub enum CloudProviderKind {
     HuggingFace,
     OpenAI,
+    Groq,
     Anthropic,
     Gemini,
 }
@@ -1459,6 +1460,7 @@ impl CloudProviderKind {
         match self {
             Self::HuggingFace => "Hugging Face",
             Self::OpenAI => "OpenAI",
+            Self::Groq => "Groq",
             Self::Anthropic => "Anthropic",
             Self::Gemini => "Google Gemini",
         }
@@ -1468,6 +1470,7 @@ impl CloudProviderKind {
         match self {
             Self::HuggingFace => "https://router.huggingface.co/v1",
             Self::OpenAI => "https://api.openai.com/v1",
+            Self::Groq => "https://api.groq.com/openai/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
         }
@@ -1477,6 +1480,7 @@ impl CloudProviderKind {
         match self {
             Self::HuggingFace => "openai/gpt-oss-120b:cerebras",
             Self::OpenAI => "gpt-4o-mini",
+            Self::Groq => "llama-3.3-70b-versatile",
             Self::Anthropic => "claude-sonnet-4-6",
             Self::Gemini => "gemini-3.5-flash",
         }
@@ -1491,6 +1495,13 @@ impl CloudProviderKind {
                 "meta-llama/Llama-3.1-8B-Instruct",
             ],
             Self::OpenAI => &["gpt-5.4", "gpt-4o-mini"],
+            Self::Groq => &[
+                "llama-3.3-70b-versatile",
+                "openai/gpt-oss-120b",
+                "moonshotai/kimi-k2-instruct",
+                "qwen/qwen3-32b",
+                "deepseek-r1-distill-llama-70b",
+            ],
             Self::Anthropic => &[
                 "claude-fable-5",
                 "claude-opus-4-8",
@@ -1509,6 +1520,8 @@ impl CloudProviderKind {
             || normalized.contains("generativelanguage.googleapis.com")
         {
             Self::Gemini
+        } else if normalized.contains("groq") || normalized.contains("api.groq.com") {
+            Self::Groq
         } else if normalized.contains("openai") || normalized.contains("api.openai.com") {
             Self::OpenAI
         } else {
@@ -1521,6 +1534,7 @@ pub fn cloud_presets() -> &'static [CloudProviderKind] {
     &[
         CloudProviderKind::HuggingFace,
         CloudProviderKind::OpenAI,
+        CloudProviderKind::Groq,
         CloudProviderKind::Anthropic,
         CloudProviderKind::Gemini,
     ]
@@ -1535,6 +1549,8 @@ pub struct CloudKeyStore {
     #[serde(default)]
     openai: String,
     #[serde(default)]
+    groq: String,
+    #[serde(default)]
     anthropic: String,
     #[serde(default)]
     gemini: String,
@@ -1545,6 +1561,7 @@ impl CloudKeyStore {
         match provider {
             CloudProviderKind::HuggingFace => &self.hugging_face,
             CloudProviderKind::OpenAI => &self.openai,
+            CloudProviderKind::Groq => &self.groq,
             CloudProviderKind::Anthropic => &self.anthropic,
             CloudProviderKind::Gemini => &self.gemini,
         }
@@ -1554,6 +1571,7 @@ impl CloudKeyStore {
         match provider {
             CloudProviderKind::HuggingFace => self.hugging_face = value,
             CloudProviderKind::OpenAI => self.openai = value,
+            CloudProviderKind::Groq => self.groq = value,
             CloudProviderKind::Anthropic => self.anthropic = value,
             CloudProviderKind::Gemini => self.gemini = value,
         }
@@ -1562,6 +1580,7 @@ impl CloudKeyStore {
     pub fn is_empty(&self) -> bool {
         self.hugging_face.trim().is_empty()
             && self.openai.trim().is_empty()
+            && self.groq.trim().is_empty()
             && self.anthropic.trim().is_empty()
             && self.gemini.trim().is_empty()
     }
