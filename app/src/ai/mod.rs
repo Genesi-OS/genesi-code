@@ -33,6 +33,7 @@ pub(crate) mod harness_display;
 pub(crate) mod component_hover;
 pub(crate) mod live_preview;
 pub(crate) mod live_preview_view;
+pub(crate) mod lenses;
 pub(crate) mod llms;
 pub(crate) mod local_agent;
 pub(crate) mod local_chat;

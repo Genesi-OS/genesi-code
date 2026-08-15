@@ -355,6 +355,10 @@ pub enum WorkspaceAction {
 
     /// Copy the editor selection together with the definitions it refers to.
     CopyGenesiSemanticContext,
+    /// Open the reading lenses on the focused file.
+    OpenGenesiLensesTool,
+    /// `true` shows the performance lens, `false` the architecture one.
+    ShowGenesiPerformanceLens(bool),
     /// Drop a correction into the AI turn that is already running.
     CancelGenesiSteering,
 
@@ -1069,6 +1073,8 @@ impl WorkspaceAction {
             | CopyGenesiProbeResponse
             | ProbeGenesiCanvasNode(_)
             | CopyGenesiSemanticContext
+            | OpenGenesiLensesTool
+            | ShowGenesiPerformanceLens(_)
             | CancelGenesiSteering
             | SelectGenesiReviewFile(_)
             | UndoGenesiEdits

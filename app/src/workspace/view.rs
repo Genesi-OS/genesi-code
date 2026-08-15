@@ -24756,6 +24756,37 @@ impl TypedActionView for Workspace {
                     },
                 );
             }
+            OpenGenesiLensesTool => {
+                let target = self
+                    .focused_semantic_selection(ctx)
+                    .map(|(root, file, _, _)| (root, file))
+                    .or_else(|| {
+                        // No selection is fine — a lens reads the whole file.
+                        let root = self.focused_project_root(ctx)?;
+                        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+                        let code_view = pane_group
+                            .code_view_from_pane_id(pane_group.focused_pane_id(ctx), ctx)
+                            .or_else(|| pane_group.code_panes(ctx).map(|(_, view)| view).next())?;
+                        let absolute = code_view.as_ref(ctx).active_editor()?.as_ref(ctx).file_path()?;
+                        let file = absolute
+                            .strip_prefix(&root)
+                            .map(std::path::Path::to_path_buf)
+                            .ok()?;
+                        Some((root, file))
+                    });
+                self.genesi_canvas_open = false;
+                self.genesi_probe_open = false;
+                self.genesi_tools_panel_open = true;
+                self.local_ai_panel
+                    .update(ctx, move |panel, ctx| panel.open_lenses(target, ctx));
+                ctx.notify();
+            }
+            ShowGenesiPerformanceLens(performance) => {
+                self.local_ai_panel.update(ctx, |panel, ctx| {
+                    panel.show_performance_lens(*performance, ctx)
+                });
+                ctx.notify();
+            }
             CancelGenesiSteering => {
                 self.local_ai_panel
                     .update(ctx, |panel, ctx| panel.cancel_steering(ctx));

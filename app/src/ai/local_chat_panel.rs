@@ -56,6 +56,9 @@ use super::api_probe::{
     build_url, method_takes_body, scan_ports, send_request, survey_project, ProbePort, ProbeRequest,
     ProbeResponse, ProbeRoute, ProbeSurvey, PROBE_METHODS,
 };
+use super::lenses::{
+    architecture, performance, ArchitectureLens, PerformanceLens, Severity,
+};
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
 };
@@ -366,6 +369,7 @@ struct PendingEdit {
 enum GenesiSideTool {
     Review,
     Canvas,
+    Lenses,
 }
 
 #[derive(Debug)]
@@ -816,6 +820,12 @@ pub struct LocalAiChatView {
     /// Which pane the request editor shows: headers when set, body otherwise.
     probe_show_request_headers: bool,
     probe_show_response_headers: bool,
+    /// The reading lenses for the focused file, recomputed when it changes.
+    lenses: Option<(ArchitectureLens, PerformanceLens)>,
+    lenses_generation: u64,
+    /// `true` shows the performance lens, `false` architecture.
+    lens_performance: bool,
+    lenses_scroll: ClippedScrollStateHandle,
     probe_sidebar_scroll: ClippedScrollStateHandle,
     probe_response_scroll: ClippedScrollStateHandle,
 
@@ -944,6 +954,10 @@ impl LocalAiChatView {
             probe_history: Vec::new(),
             probe_show_request_headers: false,
             probe_show_response_headers: false,
+            lenses: None,
+            lenses_generation: 0,
+            lens_performance: false,
+            lenses_scroll: ClippedScrollStateHandle::default(),
             probe_sidebar_scroll: ClippedScrollStateHandle::default(),
             probe_response_scroll: ClippedScrollStateHandle::default(),
             soundscape_enabled: false,
@@ -5902,6 +5916,215 @@ impl LocalAiChatView {
         ctx.notify();
     }
 
+    // ──────────────────────── Code reading lenses ────────────────────────
+
+    /// Recompute both lenses for the focused file.
+    ///
+    /// Architecture needs a project walk to answer "who imports this", which is
+    /// the half you cannot see from inside the file — so the whole thing runs
+    /// off the UI thread.
+    pub fn open_lenses(&mut self, target: Option<(PathBuf, PathBuf)>, ctx: &mut ViewContext<Self>) {
+        self.active_side_tool = GenesiSideTool::Lenses;
+        self.lenses_generation = self.lenses_generation.wrapping_add(1);
+        let generation = self.lenses_generation;
+        let Some((root, file)) = target else {
+            self.lenses = None;
+            ctx.notify();
+            return;
+        };
+        ctx.notify();
+
+        ctx.spawn(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    (architecture(&root, &file), performance(&root, &file))
+                })
+                .await
+            },
+            move |me, result, ctx| {
+                if me.lenses_generation != generation {
+                    return;
+                }
+                me.lenses = result.ok();
+                ctx.notify();
+            },
+        );
+    }
+
+    pub fn show_performance_lens(&mut self, performance: bool, ctx: &mut ViewContext<Self>) {
+        self.lens_performance = performance;
+        ctx.notify();
+    }
+
+    fn render_lens_section(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        body: String,
+    ) -> Box<dyn Element> {
+        Container::new(self.render_canvas_inspector_field(appearance, &label, body, false))
+            .with_horizontal_padding(10.)
+            .with_margin_bottom(10.)
+            .finish()
+    }
+
+    fn render_lenses(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+        let mut content = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        content.add_child(
+            Container::new(
+                Flex::row()
+                    .with_child(self.workspace_chip(
+                        appearance,
+                        "Architecture".to_string(),
+                        None,
+                        WorkspaceAction::ShowGenesiPerformanceLens(false),
+                        !self.lens_performance,
+                    ))
+                    .with_child(self.workspace_chip(
+                        appearance,
+                        "Performance".to_string(),
+                        None,
+                        WorkspaceAction::ShowGenesiPerformanceLens(true),
+                        self.lens_performance,
+                    ))
+                    .finish(),
+            )
+            .with_uniform_padding(10.)
+            .finish(),
+        );
+
+        let Some((architecture, performance)) = &self.lenses else {
+            content.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    "Open a source file to read it through a lens.".to_string(),
+                    12.,
+                    muted,
+                    true,
+                ))
+                .with_uniform_padding(10.)
+                .finish(),
+            );
+            return content.finish();
+        };
+
+        if self.lens_performance {
+            content.add_child(
+                Container::new(self.label_text(
+                    appearance,
+                    performance.summary(),
+                    12.,
+                    theme.main_text_color(theme.background()).into(),
+                    true,
+                ))
+                .with_horizontal_padding(10.)
+                .with_margin_bottom(8.)
+                .finish(),
+            );
+            for finding in &performance.findings {
+                let accent: ColorU = match finding.severity {
+                    Severity::Scaling => theme.terminal_colors().normal.red.into(),
+                    Severity::Waste => theme.terminal_colors().normal.yellow.into(),
+                    Severity::Note => muted,
+                };
+                content.add_child(
+                    Container::new(
+                        Flex::column()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                            .with_child(self.label_text(
+                                appearance,
+                                format!("line {} · {}", finding.line, finding.title),
+                                12.,
+                                accent,
+                                true,
+                            ))
+                            .with_child(self.mono_text(
+                                appearance,
+                                finding.snippet.clone(),
+                                11.,
+                                theme.main_text_color(theme.background()).into(),
+                                true,
+                            ))
+                            .with_child(self.label_text(
+                                appearance,
+                                finding.detail.clone(),
+                                11.,
+                                muted,
+                                true,
+                            ))
+                            .finish(),
+                    )
+                    .with_uniform_padding(10.)
+                    .with_margin_left(10.)
+                    .with_margin_right(10.)
+                    .with_margin_bottom(6.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_background(theme.surface_1())
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .finish(),
+                );
+            }
+            return content.finish();
+        }
+
+        content.add_child(self.render_lens_section(
+            appearance,
+            "Position".to_string(),
+            format!("{}\n{}", architecture.layer.label(), architecture.summary()),
+        ));
+        content.add_child(self.render_lens_section(
+            appearance,
+            format!("Depended on by ({})", architecture.fan_in()),
+            if architecture.dependents.is_empty() {
+                "Nothing in the project imports this file".to_string()
+            } else {
+                architecture
+                    .dependents
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        ));
+        content.add_child(self.render_lens_section(
+            appearance,
+            format!(
+                "Project imports ({})",
+                architecture.internal_dependencies.len()
+            ),
+            if architecture.internal_dependencies.is_empty() {
+                "None".to_string()
+            } else {
+                architecture.internal_dependencies.join("\n")
+            },
+        ));
+        content.add_child(self.render_lens_section(
+            appearance,
+            format!(
+                "External packages ({})",
+                architecture.external_dependencies.len()
+            ),
+            if architecture.external_dependencies.is_empty() {
+                "None".to_string()
+            } else {
+                architecture.external_dependencies.join(", ")
+            },
+        ));
+        content.add_child(self.render_lens_section(
+            appearance,
+            format!("Exports ({})", architecture.exports.len()),
+            if architecture.exports.is_empty() {
+                "Nothing exported".to_string()
+            } else {
+                architecture.exports.join(", ")
+            },
+        ));
+        content.finish()
+    }
+
     pub fn open_project_canvas(
         &mut self,
         project_root: Option<PathBuf>,
@@ -6043,6 +6266,7 @@ impl LocalAiChatView {
                         match self.active_side_tool {
                             GenesiSideTool::Review => "Review",
                             GenesiSideTool::Canvas => "Canvas",
+                            GenesiSideTool::Lenses => "Lenses",
                         }
                         .to_string(),
                         TITLE_FONT_SIZE,
@@ -6065,6 +6289,13 @@ impl LocalAiChatView {
                 None,
                 WorkspaceAction::OpenGenesiCanvasTool,
                 self.active_side_tool == GenesiSideTool::Canvas,
+            ))
+            .with_child(self.workspace_chip(
+                appearance,
+                "Lenses".to_string(),
+                None,
+                WorkspaceAction::OpenGenesiLensesTool,
+                self.active_side_tool == GenesiSideTool::Lenses,
             ))
             // The panel had no way out from inside itself: once open, the only
             // way to dismiss it was the toolbar button that opened it.
@@ -6096,6 +6327,25 @@ impl LocalAiChatView {
                 .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
                 .finish(),
         );
+
+        if self.active_side_tool == GenesiSideTool::Lenses {
+            root.add_child(
+                Expanded::new(
+                    1.,
+                    ClippedScrollable::vertical(
+                        self.lenses_scroll.clone(),
+                        self.render_lenses(appearance),
+                        ScrollbarWidth::Auto,
+                        theme.disabled_ui_text_color().into(),
+                        theme.active_ui_text_color().into(),
+                        Fill::None,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            );
+            return root.finish();
+        }
 
         if self.active_side_tool == GenesiSideTool::Canvas {
             root.add_child(
