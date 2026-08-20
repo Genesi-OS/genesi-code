@@ -69,9 +69,13 @@ define_settings_group!(CodeSettings, settings: [
         description: "Whether global file search is shown in the tools panel.",
     },
     // Controls whether hidden files (dotfiles) are shown in the project explorer.
+    // On by default: in a code project the dotfiles are project files the user
+    // edits -- .env, .gitignore, .github/, .eslintrc. Hiding them all made .env
+    // look like it did not exist. Real noise is excluded elsewhere: .git is
+    // marked ignored by is_git_internal_path, independently of this setting.
     show_hidden_files: ShowHiddenFiles {
         type: bool,
-        default: false,
+        default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         private: false,

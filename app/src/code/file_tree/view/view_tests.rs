@@ -127,7 +127,7 @@ fn flattened_paths(
 }
 
 #[test]
-fn hidden_files_are_filtered_until_setting_is_enabled() {
+fn dotfiles_are_shown_until_the_setting_is_disabled() {
     VirtualFS::test("file_tree_hidden_files_setting", |dirs, mut vfs| {
         vfs.mkdir("tree/.config").with_files(vec![
             Stub::FileWithContent("tree/.env", "SECRET=value\n"),
@@ -148,26 +148,30 @@ fn hidden_files_are_filtered_until_setting_is_enabled() {
                 view.set_root_directories(vec![tree.clone()], ctx);
             });
 
+            // A dotfile in a code project is a project file the user edits, so
+            // it is in the tree by default. Filtering every one of them made
+            // .env look like it did not exist at all.
             file_tree_view.read(&app, |view, _ctx| {
                 let paths = flattened_paths(view, &tree);
                 assert!(paths.contains(&std_path(&tree)));
                 assert!(paths.contains(&std_path(&visible_file)));
-                assert!(!paths.contains(&std_path(&hidden_file)));
-                assert!(!paths.contains(&std_path(&hidden_dir)));
+                assert!(paths.contains(&std_path(&hidden_file)));
+                assert!(paths.contains(&std_path(&hidden_dir)));
             });
 
             <crate::settings::CodeSettings as warpui::SingletonEntity>::handle(&app).update(
                 &mut app,
                 |settings, ctx| {
-                    settings::Setting::set_value(&mut settings.show_hidden_files, true, ctx)
+                    settings::Setting::set_value(&mut settings.show_hidden_files, false, ctx)
                         .expect("show hidden files setting updates");
                 },
             );
 
             file_tree_view.read(&app, |view, _ctx| {
                 let paths = flattened_paths(view, &tree);
-                assert!(paths.contains(&std_path(&hidden_file)));
-                assert!(paths.contains(&std_path(&hidden_dir)));
+                assert!(!paths.contains(&std_path(&hidden_file)));
+                assert!(!paths.contains(&std_path(&hidden_dir)));
+                assert!(paths.contains(&std_path(&visible_file)));
             });
         });
     });
@@ -186,6 +190,15 @@ fn hidden_root_directory_is_not_filtered() {
 
         App::test((), |mut app| async move {
             let _ = initialize_app(&mut app);
+            // Pin the filter on: this test is about the ROOT surviving it, not
+            // about whichever way the setting happens to default.
+            <crate::settings::CodeSettings as warpui::SingletonEntity>::handle(&app).update(
+                &mut app,
+                |settings, ctx| {
+                    settings::Setting::set_value(&mut settings.show_hidden_files, false, ctx)
+                        .expect("show hidden files setting updates");
+                },
+            );
             let (_, file_tree_view) = app.add_window(WindowStyle::NotStealFocus, FileTreeView::new);
 
             file_tree_view.update(&mut app, |view, ctx| {
