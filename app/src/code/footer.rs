@@ -47,6 +47,8 @@ use crate::view_components::action_button::{
 const FOOTER_HEIGHT: f32 = 24.;
 /// Margin around the LSP icon container
 const ICON_MARGIN: f32 = 4.;
+/// Space either side of the separator between breadcrumb segments.
+const BREADCRUMB_GAP: f32 = 4.;
 const INDICATOR_SIZE: f32 = 8.;
 
 #[derive(Default)]
@@ -1707,6 +1709,139 @@ impl Entity for CodeFooterView {
     type Event = CodeFooterViewEvent;
 }
 
+/// How many breadcrumb segments to draw before collapsing the middle.
+const BREADCRUMB_MAX_SEGMENTS: usize = 4;
+
+impl CodeFooterView {
+    /// The path segments to draw, nearest the project root first.
+    ///
+    /// Resolved against the repository root so the leading segment is the
+    /// project and not `C:\Users\...`. A file outside any repo falls back to its
+    /// trailing components, which is all a lone file can honestly claim to know
+    /// about itself.
+    ///
+    /// Long paths collapse in the middle rather than at the end: the folder a
+    /// file lives in says far more than the one three levels above it, and the
+    /// bar is 24px tall with no room to grow.
+    fn breadcrumb_segments(path: &Path, app: &AppContext) -> Vec<String> {
+        let repo_root = DetectedRepositories::as_ref(app)
+            .get_root_for_path(&LocalOrRemotePath::Local(path.to_path_buf()))
+            .and_then(|root| root.to_local_path().map(Path::to_path_buf));
+
+        let relative = repo_root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok().map(|rest| (root, rest)));
+
+        let mut segments: Vec<String> = match relative {
+            Some((root, rest)) => root
+                .file_name()
+                .into_iter()
+                .chain(rest.components().map(|c| c.as_os_str()))
+                .map(|name| name.to_string_lossy().to_string())
+                .collect(),
+            None => {
+                let mut tail: Vec<String> = path
+                    .components()
+                    .rev()
+                    .take(BREADCRUMB_MAX_SEGMENTS - 1)
+                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                    .collect();
+                tail.reverse();
+                tail
+            }
+        };
+
+        if segments.len() > BREADCRUMB_MAX_SEGMENTS {
+            let tail = segments.split_off(segments.len() - (BREADCRUMB_MAX_SEGMENTS - 2));
+            segments.truncate(1);
+            segments.push("…".to_string());
+            segments.extend(tail);
+        }
+
+        segments
+    }
+
+    fn breadcrumb_text(
+        theme: &WarpTheme,
+        appearance: &Appearance,
+        text: String,
+        emphasized: bool,
+    ) -> Box<dyn Element> {
+        let color = if emphasized {
+            internal_colors::text_main(theme, theme.background())
+        } else {
+            internal_colors::text_sub(theme, theme.background())
+        };
+
+        appearance
+            .ui_builder()
+            .span(text)
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.ui_font_family()),
+                font_color: Some(color),
+                font_size: Some(12.0),
+                ..Default::default()
+            })
+            .build()
+            .finish()
+    }
+
+    /// The active file's location, drawn as `project > folder > file.rs`.
+    fn render_breadcrumb(
+        &self,
+        theme: &WarpTheme,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let segments = Self::breadcrumb_segments(self.mode.path(), app);
+        let last = segments.len().checked_sub(1)?;
+
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Min);
+
+        // The file-type icon reads faster than the extension does, and it is
+        // what makes the row scan as a file location rather than as more status
+        // text sitting next to the LSP message.
+        if let Some(icon) = crate::code::icon::icon_from_file_path(
+            &self.mode.path().to_string_lossy(),
+            appearance,
+        ) {
+            row.add_child(
+                Container::new(ConstrainedBox::new(icon).with_width(14.).finish())
+                    .with_margin_right(BREADCRUMB_GAP)
+                    .finish(),
+            );
+        }
+
+        for (index, segment) in segments.iter().enumerate() {
+            if index > 0 {
+                row.add_child(
+                    Container::new(Self::breadcrumb_text(
+                        theme,
+                        appearance,
+                        "›".to_string(),
+                        false,
+                    ))
+                    .with_margin_left(BREADCRUMB_GAP)
+                    .with_margin_right(BREADCRUMB_GAP)
+                    .finish(),
+                );
+            }
+            // Only the file name is drawn at full strength -- it is what the
+            // user is actually looking at; the folders above it are context.
+            row.add_child(Self::breadcrumb_text(
+                theme,
+                appearance,
+                segment.clone(),
+                index == last,
+            ));
+        }
+
+        Some(row.finish())
+    }
+}
+
 impl View for CodeFooterView {
     fn ui_name() -> &'static str {
         "CodeFooterView"
@@ -1720,6 +1855,19 @@ impl View for CodeFooterView {
             .with_main_axis_alignment(MainAxisAlignment::Start)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max);
+
+        // Where the file lives, on the left, the way an editor's status bar
+        // normally reads. The LSP state that used to be the whole bar keeps its
+        // place after it.
+        if let Some(breadcrumb) = self.render_breadcrumb(theme, appearance, app) {
+            footer_content.add_child(breadcrumb);
+            // Flexible gap: the breadcrumb keeps the left edge and the LSP
+            // section is pushed to the right, so the two stop reading as one
+            // run-on line of status text.
+            footer_content.add_child(
+                Shrinkable::new(1., Container::new(Empty::new().finish()).finish()).finish(),
+            );
+        }
 
         if self.is_tab_config_footer() {
             footer_content.add_child(Self::render_tab_config_info_icon(theme));
