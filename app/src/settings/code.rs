@@ -82,4 +82,61 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.editor.show_hidden_files",
         description: "Whether hidden files (dotfiles) are shown in the project explorer.",
     },
+    // AI inline completion: suggests the rest of the line as you type, from a
+    // local model. Off by default -- it drives a model on every pause, and on a
+    // machine already running Turbo that is a cost the user should opt into.
+    ai_completion_enabled: AiCompletionEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.ai_completion.enabled",
+        description: "Whether the editor suggests code inline using a local AI model.",
+    },
+    // Empty means "whatever the AI panel is already using", which is the point:
+    // one model stays loaded instead of a second one being pulled in behind it.
+    ai_completion_model: AiCompletionModel {
+        type: String,
+        default: String::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.ai_completion.model",
+        description: "Model used for inline completion. Empty follows the AI panel's model.",
+    },
+    // Turbo (llama-server) answers a short completion far faster than Ollama
+    // does, which is the difference between a suggestion arriving before or
+    // after the user has typed past it.
+    ai_completion_use_turbo: AiCompletionUseTurbo {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.ai_completion.use_turbo",
+        description: "Serve inline completions through Turbo rather than Ollama.",
+    },
+    // Speculative decoding is Turbo's own speed/accuracy trade. It is worth it
+    // for completions, which are short and heavily constrained by the prefix.
+    ai_completion_speculative_decoding: AiCompletionSpeculativeDecoding {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.ai_completion.speculative_decoding",
+        description: "Let Turbo use speculative decoding when generating inline completions.",
+    },
+    // Honours the AI Mode daemon: when it says the machine is not in an AI-ready
+    // state, completions stay quiet rather than fighting it for the GPU.
+    ai_completion_require_ai_mode: AiCompletionRequireAiMode {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.ai_completion.require_ai_mode",
+        description: "Only suggest completions while Genesi AI Mode is active.",
+    },
 ]);
