@@ -36,7 +36,10 @@ use crate::ai::persisted_workspace::{
     LSPEnablementResultForFile, LspRepoStatus, PersistedWorkspace,
 };
 use crate::code::lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent};
-use crate::settings::AISettings;
+use ::settings::{Setting, ToggleableSetting};
+
+use crate::report_if_error;
+use crate::settings::{AISettings, CodeSettings};
 use crate::ui_components::blended_colors;
 #[cfg(feature = "local_fs")]
 use crate::user_config::is_tab_config_toml;
@@ -49,6 +52,8 @@ const FOOTER_HEIGHT: f32 = 24.;
 const ICON_MARGIN: f32 = 4.;
 /// Space either side of the separator between breadcrumb segments.
 const BREADCRUMB_GAP: f32 = 4.;
+/// Toggle rows in the completion menu, before the model list is appended.
+const AI_MENU_FIXED_ROWS: usize = 4;
 const INDICATOR_SIZE: f32 = 8.;
 
 #[derive(Default)]
@@ -135,6 +140,24 @@ impl FooterMode {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodeFooterViewAction {
     CloseMenu,
+    /// Open/close the inline-completion menu.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ToggleAiMenu,
+    /// Turn inline completion on or off.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ToggleAiCompletion,
+    /// Route completions through Turbo rather than Ollama.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ToggleAiTurbo,
+    /// Let Turbo use speculative decoding.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ToggleAiSpeculativeDecoding,
+    /// Only complete while Genesi AI Mode is active.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ToggleAiRequireAiMode,
+    /// Pick the model completions run on. Empty follows the AI panel.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    SelectAiModel(String),
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     ToggleMenu,
     EnableLSP,
@@ -212,6 +235,28 @@ pub struct CodeFooterView {
     is_lsp_menu_open: bool,
     /// Whether to render the top border. Disabled for code review footer.
     show_border: bool,
+    is_ai_menu_open: bool,
+    ai_button: ViewHandle<ActionButton>,
+    /// What the machine looked like when the AI menu was last opened.
+    ///
+    /// Sampled on open rather than read while rendering: the model list shells
+    /// out to `genesi-ai-turbo` and the AI Mode state is a file on disk, and
+    /// neither belongs on the paint path.
+    ai_menu_state: AiMenuState,
+    ai_row_mouse_states: Vec<MouseStateHandle>,
+}
+
+/// A snapshot of the local AI stack, taken when the completion menu opens.
+#[derive(Debug, Default, Clone)]
+struct AiMenuState {
+    /// Ollama tags and imported GGUFs, together, the same list the AI panel offers.
+    models: Vec<String>,
+    /// Whether llama-server answered /health.
+    turbo_up: bool,
+    /// Whether Ollama answered at all.
+    ollama_up: bool,
+    /// Whether the AI Mode daemon reports itself active.
+    ai_mode_active: bool,
 }
 
 /// Wraps the per-server-type status map and enforces a single invariant on
@@ -341,9 +386,24 @@ impl CodeFooterView {
         })
     }
 
+    /// The inline-completion button. Sparkle rather than lightning: lightning
+    /// already means "language server" one slot over in this same bar.
+    fn create_ai_button(ctx: &mut ViewContext<Self>) -> ViewHandle<ActionButton> {
+        ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new("", NakedTheme)
+                .with_icon(Icon::Stars)
+                .with_size(ButtonSize::Small)
+                .with_disabled_theme(NakedTheme)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(CodeFooterViewAction::ToggleAiMenu);
+                })
+        })
+    }
+
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn new(path: PathBuf, ctx: &mut ViewContext<Self>) -> Self {
         let lsp_status_button = Self::create_lsp_status_button(true, ctx);
+        let ai_button = Self::create_ai_button(ctx);
         if Self::is_tab_config_path(&path) {
             let tab_config_skill_button = Self::create_tab_config_skill_button(ctx);
             let mut footer = Self {
@@ -355,6 +415,10 @@ impl CodeFooterView {
                 tab_config_skill_button: Some(tab_config_skill_button),
                 is_lsp_menu_open: false,
                 show_border: true,
+                is_ai_menu_open: false,
+                ai_button,
+                ai_menu_state: AiMenuState::default(),
+                ai_row_mouse_states: Vec::new(),
             };
             footer.sync_tab_config_skill_button(ctx);
             ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, _, ctx| {
@@ -451,6 +515,10 @@ impl CodeFooterView {
             enable_lsp_button,
             tab_config_skill_button: None,
             show_border: true,
+            is_ai_menu_open: false,
+            ai_button,
+            ai_menu_state: AiMenuState::default(),
+            ai_row_mouse_states: Vec::new(),
         }
     }
 
@@ -459,6 +527,7 @@ impl CodeFooterView {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn new_for_workspace(root_path: PathBuf, ctx: &mut ViewContext<Self>) -> Self {
         let lsp_status_button = Self::create_lsp_status_button(true, ctx);
+        let ai_button = Self::create_ai_button(ctx);
 
         // Subscribe to LspManagerModel to auto-track server lifecycle
         let workspace_root = root_path.clone();
@@ -572,6 +641,7 @@ impl CodeFooterView {
             });
         }
 
+        let ai_button = Self::create_ai_button(ctx);
         let mut view = Self {
             mode: FooterMode::Workspace {
                 root_path,
@@ -585,6 +655,10 @@ impl CodeFooterView {
             enable_lsp_button: None,
             tab_config_skill_button: None,
             show_border: false,
+            is_ai_menu_open: false,
+            ai_button,
+            ai_menu_state: AiMenuState::default(),
+            ai_row_mouse_states: Vec::new(),
         };
 
         // Populate initial servers from the manager
@@ -1842,6 +1916,239 @@ impl CodeFooterView {
     }
 }
 
+impl CodeFooterView {
+    /// Samples the local AI stack for the menu.
+    ///
+    /// Done on open, not on paint: listing models shells out to
+    /// `genesi-ai-turbo` and the AI Mode state is a file read, and neither
+    /// belongs on the paint path. The menu shows what was true when it opened,
+    /// which for a menu is honest enough.
+    #[cfg(feature = "local_fs")]
+    fn refresh_ai_menu_state(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::ai::local_chat::{
+            list_gguf_models, list_models, read_ai_mode_state, turbo_health_ok,
+            DEFAULT_LOCAL_BASE_URL,
+        };
+
+        ctx.spawn(
+            async move {
+                let served = list_models(DEFAULT_LOCAL_BASE_URL).await;
+                let ollama_up = served.is_ok();
+                let mut models = served.unwrap_or_default();
+                models.extend(list_gguf_models().await.into_iter().map(|(name, _)| name));
+                models.sort();
+                models.dedup();
+
+                AiMenuState {
+                    models,
+                    turbo_up: turbo_health_ok().await,
+                    ollama_up,
+                    ai_mode_active: read_ai_mode_state()
+                        .map(|state| state.ai_mode_active)
+                        .unwrap_or(false),
+                }
+            },
+            |me, state, ctx| {
+                me.ai_menu_state = state;
+                ctx.notify();
+            },
+        );
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    fn refresh_ai_menu_state(&mut self, _ctx: &mut ViewContext<Self>) {}
+
+    /// The completion menu: the button plus, when open, the panel above it.
+    fn render_ai_control(&self, appearance: &Appearance, app: &AppContext) -> Box<dyn Element> {
+        let button = ChildView::new(&self.ai_button).finish();
+        if !self.is_ai_menu_open {
+            return button;
+        }
+
+        let theme = appearance.theme();
+        let settings = CodeSettings::as_ref(app);
+        let enabled = *settings.ai_completion_enabled.value();
+        let use_turbo = *settings.ai_completion_use_turbo.value();
+        let spec = *settings.ai_completion_speculative_decoding.value();
+        let require_ai_mode = *settings.ai_completion_require_ai_mode.value();
+        let chosen_model = settings.ai_completion_model.value().clone();
+
+        let state = &self.ai_menu_state;
+        // What the machine can actually do right now, so the toggles above are
+        // read against reality rather than against intent.
+        let backend = match (state.turbo_up, state.ollama_up) {
+            (true, _) if use_turbo => "Turbo is up".to_string(),
+            (false, true) if use_turbo => "Turbo is down, Ollama will answer".to_string(),
+            (_, true) => "Ollama is up".to_string(),
+            (false, false) => "No local model is running".to_string(),
+            (true, false) => "Turbo is up".to_string(),
+        };
+        let ai_mode = if state.ai_mode_active {
+            "AI Mode active"
+        } else {
+            "AI Mode idle"
+        };
+
+        let mut column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start);
+
+        column.add_child(Self::render_menu_title(
+            "Inline AI completion".to_string(),
+            theme.background(),
+            appearance,
+        ));
+        column.add_child(Self::render_status_text(
+            theme,
+            appearance,
+            format!("{backend} - {ai_mode}"),
+        ));
+        column.add_child(Self::render_menu_separator(appearance));
+
+        let mut rows: Vec<(String, String, bool, CodeFooterViewAction)> = vec![
+            (
+                "Suggest as I type".to_string(),
+                "Grey text after the cursor; Tab accepts".to_string(),
+                enabled,
+                CodeFooterViewAction::ToggleAiCompletion,
+            ),
+            (
+                "Use Turbo".to_string(),
+                "llama-server answers short completions faster than Ollama".to_string(),
+                use_turbo,
+                CodeFooterViewAction::ToggleAiTurbo,
+            ),
+            (
+                "Speculative decoding".to_string(),
+                "Faster, and completions are short enough to take the trade".to_string(),
+                spec,
+                CodeFooterViewAction::ToggleAiSpeculativeDecoding,
+            ),
+            (
+                "Only while AI Mode is on".to_string(),
+                "Stay quiet unless the AI Mode daemon says the machine is ready".to_string(),
+                require_ai_mode,
+                CodeFooterViewAction::ToggleAiRequireAiMode,
+            ),
+        ];
+
+        // The model list, with "follow the AI panel" first. That entry is the
+        // default for a reason: it reuses the model already resident instead of
+        // loading a second one behind it.
+        rows.push((
+            "Model: follow the AI panel".to_string(),
+            "Reuses whatever is already loaded".to_string(),
+            chosen_model.is_empty(),
+            CodeFooterViewAction::SelectAiModel(String::new()),
+        ));
+        for model in &state.models {
+            rows.push((
+                format!("Model: {model}"),
+                String::new(),
+                &chosen_model == model,
+                CodeFooterViewAction::SelectAiModel(model.clone()),
+            ));
+        }
+
+        for (index, (label, detail, on, action)) in rows.into_iter().enumerate() {
+            let mouse_state = self
+                .ai_row_mouse_states
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            column.add_child(Self::render_ai_toggle_row(
+                label,
+                detail,
+                on,
+                mouse_state,
+                action,
+                appearance,
+            ));
+        }
+
+        let menu = Container::new(
+            ConstrainedBox::new(column.finish())
+                .with_max_width(320.)
+                .finish(),
+        )
+        .with_background_color(blended_colors::neutral_2(theme))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_padding(Padding::uniform(4.))
+        .finish();
+
+        let mut element = Stack::new().with_child(button);
+        element.add_positioned_child(
+            menu,
+            OffsetPositioning::offset_from_parent(
+                vec2f(0., -2.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::TopLeft,
+                ChildAnchor::BottomLeft,
+            ),
+        );
+        element.finish()
+    }
+
+    /// One row of the completion menu, drawn as a toggle.
+    fn render_ai_toggle_row(
+        label: String,
+        detail: String,
+        on: bool,
+        mouse_state: MouseStateHandle,
+        action: CodeFooterViewAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mark = if on { "ON " } else { "   " };
+
+        let text = appearance
+            .ui_builder()
+            .span(format!("{mark} {label}"))
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.ui_font_family()),
+                font_color: Some(if on {
+                    internal_colors::text_main(theme, theme.background())
+                } else {
+                    internal_colors::text_sub(theme, theme.background())
+                }),
+                font_size: Some(12.0),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        let detail_text = appearance
+            .ui_builder()
+            .span(detail)
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.ui_font_family()),
+                font_color: Some(internal_colors::text_sub(theme, theme.background())),
+                font_size: Some(11.0),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        let column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_child(text)
+            .with_child(detail_text)
+            .finish();
+
+        Hoverable::new(mouse_state, move |_| {
+            Container::new(column)
+                .with_padding(Padding::uniform(6.))
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
+    }
+}
+
 impl View for CodeFooterView {
     fn ui_name() -> &'static str {
         "CodeFooterView"
@@ -1917,6 +2224,13 @@ impl View for CodeFooterView {
             }
         }
 
+        // The completion control ends the bar, opposite the breadcrumb.
+        footer_content.add_child(
+            Container::new(self.render_ai_control(appearance, app))
+                .with_margin_left(ICON_MARGIN)
+                .finish(),
+        );
+
         let mut container = Container::new(
             ConstrainedBox::new(
                 Container::new(footer_content.finish())
@@ -1949,6 +2263,58 @@ impl TypedActionView for CodeFooterView {
             }
             CodeFooterViewAction::CloseMenu => {
                 self.is_lsp_menu_open = false;
+                self.is_ai_menu_open = false;
+                ctx.notify();
+            }
+            CodeFooterViewAction::ToggleAiMenu => {
+                self.is_ai_menu_open = !self.is_ai_menu_open;
+                // Only one menu at a time: they anchor to the same edge and
+                // would otherwise overlap each other.
+                self.is_lsp_menu_open = false;
+                if self.is_ai_menu_open {
+                    self.refresh_ai_menu_state(ctx);
+                }
+                // One hover state per row, kept across renders so a row does not
+                // lose its hover the moment the list is rebuilt.
+                let rows_needed = AI_MENU_FIXED_ROWS + self.ai_menu_state.models.len() + 1;
+                self.ai_row_mouse_states
+                    .resize_with(rows_needed, MouseStateHandle::default);
+                ctx.notify();
+            }
+            CodeFooterViewAction::ToggleAiCompletion => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.ai_completion_enabled.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            CodeFooterViewAction::ToggleAiTurbo => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.ai_completion_use_turbo.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            CodeFooterViewAction::ToggleAiSpeculativeDecoding => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .ai_completion_speculative_decoding
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            CodeFooterViewAction::ToggleAiRequireAiMode => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .ai_completion_require_ai_mode
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            CodeFooterViewAction::SelectAiModel(model) => {
+                let model = model.clone();
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.ai_completion_model.set_value(model, ctx));
+                });
+                self.is_ai_menu_open = false;
                 ctx.notify();
             }
             CodeFooterViewAction::RunTabConfigSkill => {
