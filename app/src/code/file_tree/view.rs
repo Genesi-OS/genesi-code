@@ -257,6 +257,17 @@ impl FileTreeGitStatus {
     }
 }
 
+/// A git status as the tree draws it.
+///
+/// Folders take the status of what is inside them, but only files get the
+/// letter: a column of `M`s next to every folder on the way to one edited file
+/// is noise, while the tinted folder name still leads the eye there.
+#[derive(Clone, Copy)]
+struct GitDecoration {
+    status: FileTreeGitStatus,
+    show_label: bool,
+}
+
 impl FileTreeItem {
     fn path(&self) -> &StandardizedPath {
         match self {
@@ -1480,7 +1491,7 @@ impl FileTreeView {
 
             let repo_root = (**root_dir.entry.root_directory()).clone();
             let repo_path = repo_root.to_local_path_lossy();
-            let statuses = Self::load_git_statuses(&repo_path);
+            let statuses = Self::with_ancestor_statuses(Self::load_git_statuses(&repo_path));
             if statuses.is_empty() {
                 self.git_statuses.remove(&root_path);
             } else {
@@ -1491,6 +1502,29 @@ impl FileTreeView {
 
     #[cfg(not(feature = "local_fs"))]
     fn refresh_git_statuses(&mut self) {}
+
+    /// Marks every folder on the way to a changed file, so a change is visible
+    /// without expanding the tree to find it.
+    ///
+    /// A folder that git reported on directly -- a submodule, say -- keeps the
+    /// status git gave it; the derived ones never overwrite that.
+    #[cfg(feature = "local_fs")]
+    fn with_ancestor_statuses(
+        statuses: HashMap<PathBuf, FileTreeGitStatus>,
+    ) -> HashMap<PathBuf, FileTreeGitStatus> {
+        let mut combined = statuses.clone();
+        for path in statuses.keys() {
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                combined
+                    .entry(ancestor.to_path_buf())
+                    .or_insert(FileTreeGitStatus::Modified);
+            }
+        }
+        combined
+    }
 
     #[cfg(feature = "local_fs")]
     fn load_git_statuses(repo_path: &Path) -> HashMap<PathBuf, FileTreeGitStatus> {
@@ -1972,7 +2006,7 @@ impl FileTreeView {
         appearance: &Appearance,
         item_highlight_state: ItemHighlightState,
         editor_view: Option<&ViewHandle<EditorView>>,
-        git_status: Option<FileTreeGitStatus>,
+        git_status: Option<GitDecoration>,
     ) -> Box<dyn Element> {
         // Create the folder header row
         let mut header_row = Flex::row()
@@ -2037,7 +2071,7 @@ impl FileTreeView {
         );
 
         let text_color = git_status
-            .map(|status| status.color(appearance))
+            .map(|decoration| decoration.status.color(appearance))
             .unwrap_or_else(|| item_highlight_state.text_and_icon_color(appearance));
         let text_style = if render_state.is_ignored {
             Properties::default()
@@ -2078,15 +2112,15 @@ impl FileTreeView {
             }
         }
 
-        if let Some(status) = git_status {
+        if let Some(decoration) = git_status.filter(|decoration| decoration.show_label) {
             header_row.add_child(
                 Container::new(
                     Text::new_inline(
-                        status.label().to_string(),
+                        decoration.status.label().to_string(),
                         appearance.ui_font_family(),
                         ITEM_FONT_SIZE - 2.,
                     )
-                    .with_color(status.color(appearance))
+                    .with_color(decoration.status.color(appearance))
                     .with_style(Properties::default().weight(Weight::Bold))
                     .finish(),
                 )
@@ -2309,20 +2343,22 @@ impl FileTreeView {
         &self,
         id: &FileTreeIdentifier,
         item: &FileTreeItem,
-    ) -> Option<FileTreeGitStatus> {
-        if !matches!(item, FileTreeItem::File { .. }) {
-            return None;
-        }
-
+    ) -> Option<GitDecoration> {
         let repository_root = self.root_for_path(&id.root)?;
         let relative_path = item
             .path()
             .strip_prefix(&repository_root)
             .map(PathBuf::from)?;
-        self.git_statuses
+        let status = self
+            .git_statuses
             .get(&id.root)
             .and_then(|statuses| statuses.get(&relative_path))
-            .copied()
+            .copied()?;
+
+        Some(GitDecoration {
+            status,
+            show_label: matches!(item, FileTreeItem::File { .. }),
+        })
     }
 
     /// Selects the first item if no item is selected.
