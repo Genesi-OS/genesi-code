@@ -3194,21 +3194,38 @@ impl CodeEditorModel {
                 IndentMode::Enter => {}
             };
 
+            let line_start = Point::new(position.row, 0).to_buffer_char_offset(buffer);
+
             // The current indent level of the end selection position (used only by
             // IndentMode::Enter).
-            let current_indent_num = buffer
-                .indented_line_tab_stops(Point::new(position.row, 0).to_buffer_char_offset(buffer))
-                .unwrap_or(0);
+            let current_indent_num = buffer.indented_line_tab_stops(line_start).unwrap_or(0);
+
+            // The literal leading whitespace of the reference line, kept verbatim
+            // (tabs stay tabs). This is what we fall back on whenever the syntax
+            // tree cannot answer, which is common: the tree is reparsed
+            // asynchronously, so the version that exists right after a keystroke
+            // is routinely missing, and pressing enter then landed the caret at
+            // column 0. Languages with no indents query (html, vue, xml,
+            // powershell, ...) and plain text never had an answer at all.
+            let existing_indent: String = {
+                let len = buffer
+                    .indented_line_delta(line_start)
+                    .map(|delta| delta.as_usize())
+                    .unwrap_or(0);
+                (0..len)
+                    .map_while(|i| buffer.char_at(line_start + CharOffset::from(i)))
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect()
+            };
 
             // TODO(CLD-558): point and buffer indices off by one
             position.row = position.row.saturating_sub(1);
 
-            let mut levels_to_indent = self
+            let syntax_levels = self
                 .syntax_tree
                 .as_ref(ctx)
                 .indentation_at_point(position, ctx)
-                .map(|res| res.delta)
-                .unwrap_or(0);
+                .map(|res| res.delta);
 
             // Check if the range is wrapped in a bracket for enter behavior.
             //
@@ -3216,29 +3233,40 @@ impl CodeEditorModel {
             // we want to create a higher level of indentation and extra newline
             // when we press enter.
             let range_wrapped_in_bracket = self.range_wrapped_in_bracket(start..end, ctx);
-            if range_wrapped_in_bracket {
-                // Make sure we don't increase more than one from the current indent level of the line.
-                levels_to_indent = (levels_to_indent + 1).min(current_indent_num as u8 + 1);
-            }
 
-            let mut insert_before_cursor = String::new();
-            let mut insert_after_cursor = None;
-            if let Some(text) =
-                indent_unit.map(|indent_unit| indent_unit.text_with_num_tab_stops(1))
-            {
-                insert_before_cursor.push_str(&text.as_str().repeat(levels_to_indent.into()));
+            let one_unit = indent_unit.map(|indent_unit| indent_unit.text_with_num_tab_stops(1));
 
-                if range_wrapped_in_bracket {
-                    // If we are applying bracket expansion, we need to insert additional newline and indentation
-                    // for the trailing bracket after the selection.
-                    let mut s = String::from("\n");
-                    let trail_unit = levels_to_indent.saturating_sub(1);
-                    if trail_unit > 0 {
-                        s.push_str(&text.as_str().repeat(trail_unit.into()))
+            // `insert_before_cursor` is the indentation the new line starts with;
+            // `closing_indent` is the indentation the trailing bracket gets when
+            // we expand `{|}` across three lines.
+            let (insert_before_cursor, closing_indent) = match (syntax_levels, &one_unit) {
+                (Some(mut levels), Some(unit)) => {
+                    if range_wrapped_in_bracket {
+                        // Make sure we don't increase more than one from the current indent level of the line.
+                        levels = (levels + 1).min(current_indent_num as u8 + 1);
                     }
-                    insert_after_cursor = Some(s);
+                    (
+                        unit.repeat(levels.into()),
+                        unit.repeat(levels.saturating_sub(1).into()),
+                    )
                 }
-            }
+                _ => {
+                    // No syntax answer: keep the line's own indentation, and add
+                    // one level when the caret sits between a bracket pair.
+                    let unit = one_unit.clone().unwrap_or_else(|| " ".repeat(4));
+                    let mut opened = existing_indent.clone();
+                    if range_wrapped_in_bracket {
+                        opened.push_str(&unit);
+                    }
+                    (opened, existing_indent.clone())
+                }
+            };
+
+            let insert_after_cursor = range_wrapped_in_bracket.then(|| {
+                // If we are applying bracket expansion, we need to insert additional newline and indentation
+                // for the trailing bracket after the selection.
+                format!("\n{closing_indent}")
+            });
 
             IndentResult {
                 insert_before_cursor,

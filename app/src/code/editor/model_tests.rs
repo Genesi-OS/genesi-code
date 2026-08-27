@@ -1027,3 +1027,106 @@ fn test_line_at_vertical_offset_returns_none_for_invalid() {
         );
     })
 }
+
+/// Enter used to drop the caret at column 0 whenever the syntax tree could not
+/// answer, which is most of the time in practice: the tree is reparsed
+/// asynchronously, so the version that exists immediately after a keystroke is
+/// routinely missing. The caret has to land under the code it continues.
+#[test]
+fn test_enter_keeps_current_line_indentation() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(
+            &mut app,
+            "fn main() {\n    let x = 1;",
+            ContentVersion::new(),
+        );
+        layout_model(&mut app, &editor).await;
+
+        // End of the indented line.
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let last_line = text.as_str().lines().last().unwrap_or_default();
+            assert_eq!(
+                last_line, "    ",
+                "enter should carry the line's indentation onto the new line, got {text:?}"
+            );
+        });
+    })
+}
+
+/// Plain text has no indents query at all, so this path was previously
+/// guaranteed to produce no indentation.
+#[test]
+fn test_enter_keeps_indentation_in_plain_text() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = app.add_model(|ctx| {
+            let styles = code_text_styles(Appearance::as_ref(ctx), FontSettings::as_ref(ctx), None);
+            let mut model = CodeEditorModel::new(styles, None, false, None, ctx);
+            let state = InitialBufferState::plain_text("        indented");
+            model.reset_content(state, ctx);
+            model
+        });
+        layout_model(&mut app, &editor).await;
+
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let last_line = text.as_str().lines().last().unwrap_or_default();
+            assert_eq!(last_line, "        ", "got {text:?}");
+        });
+    })
+}
+
+/// A caret between a bracket pair splits into three lines: the body is indented
+/// one level past the opening line, and the closing bracket returns to it.
+#[test]
+fn test_enter_between_brackets_expands_block() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(&mut app, "    fn f() {}", ContentVersion::new());
+        layout_model(&mut app, &editor).await;
+
+        // Between `{` and `}`.
+        let between = editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            CharOffset::from(text.as_str().chars().count() - 1)
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(between, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(lines.len(), 3, "expected three lines, got {text:?}");
+            assert!(
+                lines[1].starts_with("    ") && lines[1].len() > 4,
+                "body line should be indented past the opening line, got {:?}",
+                lines[1]
+            );
+            assert_eq!(
+                lines[2].trim_end(),
+                "    }",
+                "closing bracket should return to the opening line's indentation, got {text:?}"
+            );
+        });
+    })
+}
