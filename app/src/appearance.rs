@@ -301,38 +301,29 @@ fn load_default_monospace_font_family(ctx: &mut AppContext) -> anyhow::Result<Fa
 
 fn load_default_ui_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId> {
     warpui::fonts::Cache::handle(ctx).update(ctx, |font_cache, _| {
-        let roboto = font_cache.load_family_from_bytes(
-            "Roboto",
+        // Dosis is Genesi Code's UI face, bundled rather than taken from the
+        // system so the app looks the same on every machine.
+        //
+        // Note there is no italic file: Dosis ships upright weights only. The
+        // renderer synthesises a slant when something asks for italic, which is
+        // fine for the little italic the UI uses.
+        //
+        // This deliberately does NOT fall back to a system font on Windows.
+        // Upstream returned Segoe UI here before it ever reached the bundled
+        // family, which would have quietly thrown this whole change away on the
+        // one platform it is being developed on.
+        font_cache.load_family_from_bytes(
+            "Dosis",
             vec![
+                ASSETS.get("bundled/fonts/dosis/Dosis-Light.ttf")?.to_vec(),
+                ASSETS.get("bundled/fonts/dosis/Dosis-Regular.ttf")?.to_vec(),
+                ASSETS.get("bundled/fonts/dosis/Dosis-Medium.ttf")?.to_vec(),
                 ASSETS
-                    .get("bundled/fonts/roboto/Roboto-Italic.ttf")?
+                    .get("bundled/fonts/dosis/Dosis-SemiBold.ttf")?
                     .to_vec(),
-                ASSETS.get("bundled/fonts/roboto/Roboto-Bold.ttf")?.to_vec(),
-                ASSETS
-                    .get("bundled/fonts/roboto/Roboto-Regular.ttf")?
-                    .to_vec(),
-                ASSETS
-                    .get("bundled/fonts/roboto/Roboto-Medium.ttf")?
-                    .to_vec(),
-                ASSETS
-                    .get("bundled/fonts/roboto/RobotoFlex-Semibold.ttf")?
-                    .to_vec(),
-                ASSETS
-                    .get("bundled/fonts/roboto/Roboto-BoldItalic.ttf")?
-                    .to_vec(),
+                ASSETS.get("bundled/fonts/dosis/Dosis-Bold.ttf")?.to_vec(),
             ],
-        );
-
-        // On Windows, default to use Segoe UI as the UI font. This font is recommended by
-        // Windows when rendering any UI text: https://learn.microsoft.com/en-us/windows/win32/uxguide/vis-fonts.
-        // This font should be bundled with any modern version of Windows, if we can't load it for
-        // any reason we fallback to using our normal bundled font.
-        #[cfg(windows)]
-        if let Ok(font_family_id) = font_cache.load_system_font("Segoe UI") {
-            return Ok(font_family_id);
-        }
-
-        roboto
+        )
     })
 }
 
