@@ -873,6 +873,15 @@ impl TypedActionView for CodeEditorView {
         // the cursor or inserting a newline. Escape is already routed to the
         // parent via `EscapePressed` (see `escape`). Typing/Backspace fall
         // through so the buffer still edits and the parent re-filters.
+        // A live inline suggestion owns Tab: it is the only key that accepts
+        // one, and indenting instead would be the wrong answer to a keypress the
+        // user aimed at the grey text in front of them. Checked before the
+        // popup gate because only one of the two can be on screen.
+        if self.inline_suggestion_active && matches!(action, Tab) {
+            ctx.emit(CodeEditorEvent::InlineSuggestionAccept);
+            return;
+        }
+
         if self.completion_active {
             match action {
                 MoveDown => {

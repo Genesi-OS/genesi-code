@@ -11,7 +11,10 @@ use std::{
 };
 
 use ai::diff_validation::DiffType;
+use ::settings::Setting;
+use warp_core::ui::theme::color::internal_colors;
 use futures::stream::AbortHandle;
+use futures::StreamExt as _;
 use lsp::types::FileLocation;
 use lsp::{
     LanguageId, LanguageServerId, LspEvent, LspManagerModel, LspManagerModelEvent, LspServerModel,
@@ -73,6 +76,11 @@ use crate::code::global_buffer_model::{BufferState, GlobalBufferModel, GlobalBuf
 use crate::code::{SaveOutcome, ShowFindReferencesCardProvider};
 use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
+use crate::ai::local_chat::{list_models, read_ai_mode_state, ChatStreamItem, LocalEndpoint};
+use crate::code::ai_completion::{
+    build_completion_messages, completion_stream, sanitize_completion, InlineCompletionState,
+    InlineSuggestion, COMPLETION_DEBOUNCE,
+};
 use crate::settings::{AISettings, CodeSettings};
 use crate::terminal::TerminalView;
 use crate::workspace::WorkspaceAction;
@@ -402,6 +410,11 @@ pub struct LocalCodeEditorView {
     /// View for the find references feature.
     find_references_view: Option<ViewHandle<FindReferencesView>>,
     autosave_handle: Option<SpawnedFutureHandle>,
+    /// The live inline suggestion, and the staleness bookkeeping that decides
+    /// whether it may still be shown. See [`crate::code::ai_completion`].
+    inline_completion: InlineCompletionState,
+    /// Debounce timer for the next completion request.
+    inline_completion_handle: Option<SpawnedFutureHandle>,
     flow_last_edit_at: Option<Instant>,
     flow_streak: u8,
     flow_active_until: Option<Instant>,
@@ -450,6 +463,7 @@ impl LocalCodeEditorView {
                     // identifier, keeps the popup filtered as the user types, and
                     // dismisses it when the context no longer applies.
                     me.handle_completion_trigger(ctx);
+                    me.handle_inline_completion_trigger(ctx);
 
                     me.schedule_autosave(ctx);
                 } else {
@@ -457,6 +471,9 @@ impl LocalCodeEditorView {
                     // invalidate a timer created for the previous disk state.
                     me.cancel_autosave();
                 }
+            }
+            CodeEditorEvent::InlineSuggestionAccept => {
+                me.accept_inline_suggestion(ctx);
             }
             CodeEditorEvent::VimEscapeInNormalMode => {
                 if me.dismiss_lsp_overlays(ctx) {
@@ -657,6 +674,8 @@ impl LocalCodeEditorView {
             diagnostic_decorations: Vec::new(),
             find_references_view: None,
             autosave_handle: None,
+            inline_completion: InlineCompletionState::default(),
+            inline_completion_handle: None,
             flow_last_edit_at: None,
             flow_streak: 0,
             flow_active_until: None,
@@ -673,6 +692,245 @@ impl LocalCodeEditorView {
         *CodeSettings::as_ref(app).autosave_enabled
             && self.diff_type.is_none()
             && self.file_path().is_some()
+    }
+
+    /// Throws away the current suggestion and schedules a new request.
+    ///
+    /// Called on every user edit. The invalidate is what makes a reply that is
+    /// already in flight harmless: it comes back carrying an older generation
+    /// and is dropped rather than pasted at a cursor that has since moved.
+    /// Keeps the editor's Tab gate in step with whether a suggestion exists.
+    ///
+    /// Tab must only be stolen while something is actually on screen to accept;
+    /// otherwise it would stop indenting for no visible reason.
+    fn sync_inline_suggestion_gate(&mut self, ctx: &mut ViewContext<Self>) {
+        let cursor = self.editor.as_ref(ctx).cursor_head_offset(ctx);
+        let text = self.editor.as_ref(ctx).text(ctx).into_string();
+        let byte_offset = text
+            .char_indices()
+            .nth(cursor.as_usize())
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+        let active = self
+            .inline_completion
+            .visible_suggestion(byte_offset)
+            .is_some();
+        self.editor.update(ctx, |editor, _ctx| {
+            editor.set_inline_suggestion_active(active);
+        });
+    }
+
+    fn handle_inline_completion_trigger(&mut self, ctx: &mut ViewContext<Self>) {
+        self.inline_completion.invalidate();
+        self.editor.update(ctx, |editor, _ctx| {
+            editor.set_inline_suggestion_active(false);
+        });
+        if let Some(handle) = self.inline_completion_handle.take() {
+            handle.abort();
+        }
+
+        if !*CodeSettings::as_ref(ctx).ai_completion_enabled.value() {
+            return;
+        }
+
+        let generation = self.inline_completion.current_generation();
+        let handle = ctx.spawn(
+            async move {
+                Timer::after(COMPLETION_DEBOUNCE).await;
+            },
+            move |me, _, ctx| {
+                me.inline_completion_handle = None;
+                me.request_inline_completion(generation, ctx);
+            },
+        );
+        self.inline_completion_handle = Some(handle);
+    }
+
+    /// Asks the local model to continue the buffer at the cursor.
+    fn request_inline_completion(&mut self, generation: u64, ctx: &mut ViewContext<Self>) {
+        // A late debounce firing after further typing is not worth a request.
+        if generation != self.inline_completion.current_generation() {
+            return;
+        }
+
+        let settings = CodeSettings::as_ref(ctx);
+        if *settings.ai_completion_require_ai_mode.value()
+            && !read_ai_mode_state()
+                .map(|state| state.ai_mode_active)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        let configured_model = settings.ai_completion_model.value().clone();
+        let endpoint = if *settings.ai_completion_use_turbo.value() {
+            LocalEndpoint::Turbo
+        } else {
+            LocalEndpoint::Ollama
+        };
+
+
+        let (text, offset) = {
+            let editor = self.editor.as_ref(ctx);
+            let text = editor.text(ctx).into_string();
+            let offset = editor.cursor_head_offset(ctx).as_usize();
+            (text, offset)
+        };
+
+        // `cursor_head_offset` counts characters; the prompt builder slices
+        // bytes. They differ the moment the file contains anything non-ASCII.
+        let byte_offset = text
+            .char_indices()
+            .nth(offset)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+
+        let language = self
+            .file_path()
+            .and_then(lsp::LanguageId::from_path)
+            .map(|id| format!("{id:?}"));
+
+        let messages =
+            build_completion_messages(&text, byte_offset, language.as_deref());
+
+        ctx.spawn(
+            async move {
+                // An empty setting means "use whatever is already loaded": ask
+                // the endpoint what it is serving rather than naming a model
+                // ourselves, so enabling completions never pulls a second model
+                // into memory behind the one the AI panel is using.
+                let model = if configured_model.trim().is_empty() {
+                    match list_models(endpoint.base_url()).await {
+                        Ok(models) => match models.into_iter().next() {
+                            Some(model) => model,
+                            None => return String::new(),
+                        },
+                        Err(err) => {
+                            log::debug!("inline completion: no local model to use: {err}");
+                            return String::new();
+                        }
+                    }
+                } else {
+                    configured_model
+                };
+
+                let mut stream = completion_stream(&model, endpoint, messages);
+                let mut answer = String::new();
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(ChatStreamItem::Token(token)) => answer.push_str(&token),
+                        Ok(ChatStreamItem::Done) => break,
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::debug!("inline completion failed: {err}");
+                            return String::new();
+                        }
+                    }
+                }
+                sanitize_completion(&answer)
+            },
+            move |me, text, ctx| {
+                me.inline_completion.accept_response(InlineSuggestion {
+                    text,
+                    offset: byte_offset,
+                    generation,
+                });
+                me.sync_inline_suggestion_gate(ctx);
+                ctx.notify();
+            },
+        );
+    }
+
+    /// The grey continuation drawn after the cursor, if one is live.
+    ///
+    /// Returned with its placement, because both depend on the same cursor
+    /// offset and computing them apart invites them to disagree.
+    fn render_inline_suggestion(
+        &self,
+        app: &AppContext,
+    ) -> Option<(Box<dyn Element>, OffsetPositioning)> {
+        let editor = self.editor.as_ref(app);
+        let cursor = editor.cursor_head_offset(app);
+        let text = editor.text(app).into_string();
+        let byte_offset = text
+            .char_indices()
+            .nth(cursor.as_usize())
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+
+        let suggestion = self.inline_completion.visible_suggestion(byte_offset)?;
+
+        // Only the first line is drawn. A multi-line completion still inserts in
+        // full on Tab, but painting the rest here would run over the code below
+        // it -- this is an overlay, so nothing reflows to make room.
+        let preview = suggestion.text.lines().next().unwrap_or_default();
+        if preview.is_empty() {
+            return None;
+        }
+
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let element = Text::new_inline(
+            preview.to_string(),
+            appearance.monospace_font_family(),
+            appearance.monospace_font_size(),
+        )
+        .with_color(internal_colors::text_disabled(theme, theme.background()))
+        .finish();
+
+        // At end-of-line the cursor offset has no glyph box, which is exactly
+        // where completions usually land -- fall back to the character before it
+        // and start from that glyph's right edge.
+        let bounds = editor
+            .character_bounds_in_viewport(cursor, app)
+            .or_else(|| {
+                let previous = cursor.saturating_sub(&CharOffset::from(1));
+                editor.character_bounds_in_viewport(previous, app)
+            })?;
+
+        let positioning = OffsetPositioning::offset_from_parent(
+            Vector2F::new(bounds.max_x(), bounds.origin_y()),
+            ParentOffsetBounds::ParentByPosition,
+            ParentAnchor::TopLeft,
+            ChildAnchor::TopLeft,
+        );
+
+        Some((element, positioning))
+    }
+
+    /// Inserts the live suggestion at the cursor. Returns whether there was one.
+    fn accept_inline_suggestion(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let (byte_offset, cursor) = {
+            let editor = self.editor.as_ref(ctx);
+            let cursor = editor.cursor_head_offset(ctx);
+            let text = editor.text(ctx).into_string();
+            let byte_offset = text
+                .char_indices()
+                .nth(cursor.as_usize())
+                .map(|(index, _)| index)
+                .unwrap_or(text.len());
+            (byte_offset, cursor)
+        };
+
+        let Some(suggestion) = self.inline_completion.take_suggestion(byte_offset) else {
+            return false;
+        };
+
+        // An empty range at the cursor is an insert; this is the same path the
+        // LSP completion accept takes, so undo and diffing treat it identically.
+        let Ok(edits) = Vec1::try_from_vec(vec![(suggestion.text, cursor..cursor)]) else {
+            return false;
+        };
+        self.editor.update(ctx, |editor, ctx| {
+            editor.apply_edits(edits, ctx);
+        });
+        // The insert is an edit like any other, and the request it would
+        // otherwise schedule is not wanted: the user just took the answer.
+        self.inline_completion.invalidate();
+        if let Some(handle) = self.inline_completion_handle.take() {
+            handle.abort();
+        }
+        ctx.notify();
+        true
     }
 
     fn cancel_autosave(&mut self) {
@@ -2779,6 +3037,12 @@ impl View for LocalCodeEditorView {
                     );
                 }
             }
+        }
+
+        // The inline suggestion sits under the tooltips and popups below it: it
+        // is ambient, and should never cover something the user opened.
+        if let Some((ghost, positioning)) = self.render_inline_suggestion(app) {
+            stack.add_positioned_overlay_child(ghost, positioning);
         }
 
         // Render LSP hover tooltip if available (render last so it appears on top)

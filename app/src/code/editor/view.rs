@@ -116,6 +116,9 @@ pub enum CodeEditorEvent {
     CompletionSelectNext,
     /// Emitted when the completion popup is open and the user presses Up.
     CompletionSelectPrev,
+    /// Emitted when a grey inline suggestion is showing and the user presses
+    /// Tab. The parent owns the suggestion text, so it does the inserting.
+    InlineSuggestionAccept,
     /// Emitted when the completion popup is open and the user presses Enter —
     /// the parent applies the selected candidate instead of inserting a newline.
     CompletionAccept,
@@ -300,6 +303,9 @@ pub struct CodeEditorView {
     /// are intercepted in `handle_action` and forwarded as `CodeEditorEvent`s
     /// instead of editing the buffer.
     completion_active: bool,
+    /// Set by the parent while a grey inline suggestion is on screen. Tab then
+    /// accepts it instead of indenting.
+    inline_suggestion_active: bool,
 }
 
 impl CodeEditorView {
@@ -449,6 +455,7 @@ impl CodeEditorView {
             find_references_anchor_offset: None,
             window_id: ctx.window_id(),
             completion_active: false,
+            inline_suggestion_active: false,
         }
     }
 
@@ -460,6 +467,12 @@ impl CodeEditorView {
     /// keyboard interception. When active, Up/Down/Enter are forwarded as
     /// `CodeEditorEvent::Completion*` events rather than moving the cursor or
     /// inserting a newline.
+    /// Tells the editor a suggestion is showing, so Tab accepts it rather than
+    /// inserting an indent.
+    pub fn set_inline_suggestion_active(&mut self, active: bool) {
+        self.inline_suggestion_active = active;
+    }
+
     pub fn set_completion_active(&mut self, active: bool, _ctx: &mut ViewContext<Self>) {
         self.completion_active = active;
     }
