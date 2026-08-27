@@ -7281,6 +7281,13 @@ impl LocalAiChatView {
     /// The AI picker popup: a card listing the on-device models (click to pick),
     /// the Turbo accelerated endpoint, and a disabled "Cloud — coming soon" slot
     /// (BYOK provider selection is on the roadmap). Returns `None` when closed.
+    /// The model picker.
+    ///
+    /// Two questions, kept apart because conflating them is what made the old
+    /// list confusing: *which model* answers (the list), and *how it runs* (the
+    /// controls under the divider). Turbo used to sit in the list as though it
+    /// were a model you could choose instead of Llama, when it is the backend
+    /// the chosen model runs on.
     fn render_model_picker(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
         if !self.model_picker_open {
             return None;
@@ -7292,31 +7299,26 @@ impl LocalAiChatView {
             Container::new(me.label_text(appearance, text, CHIP_FONT_SIZE, muted, true))
                 .with_horizontal_padding(8.)
                 .with_padding_top(4.)
-                .with_padding_bottom(4.)
+                .with_padding_bottom(6.)
                 .finish()
         };
 
         let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-        // Local and cloud used to be stacked in one long flat list, so the panel
-        // showed ollama models, Turbo, providers, key status and cloud models all
-        // at once. They are alternatives, not a sequence - one tab at a time.
+        // Where the model runs is the first choice, so it leads: everything
+        // below it changes meaning depending on the answer.
         list.add_child(
             Container::new(
                 Flex::row()
-                    .with_child(self.picker_tab_button(
-                        appearance,
-                        "On this machine",
-                        ModelPickerTab::Local,
-                    ))
-                    .with_child(self.picker_tab_button(
-                        appearance,
-                        "Cloud (your API key)",
-                        ModelPickerTab::Cloud,
-                    ))
+                    .with_child(self.picker_tab_button(appearance, "Local", ModelPickerTab::Local))
+                    .with_child(self.picker_tab_button(appearance, "API", ModelPickerTab::Cloud))
                     .finish(),
             )
-            .with_padding_bottom(6.)
+            .with_background_color(theme.surface_1().into())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_horizontal_padding(2.)
+            .with_vertical_padding(2.)
+            .with_margin_bottom(8.)
             .finish(),
         );
 
@@ -7334,124 +7336,85 @@ impl LocalAiChatView {
                         // picking one sets the matching endpoint - so the endpoint
                         // no longer decides selection, the index does.
                         let selected = !self.cloud_active && self.selected_model == Some(index);
-                        let mark = if selected { "\u{25cf}  " } else { "\u{25cb}  " };
                         let loading = self.preparing_model.as_deref() == Some(model.as_str());
-                        let suffix = if loading { "   loading\u{2026}" } else { "" };
-                        list.add_child(self.picker_row(
+                        list.add_child(self.picker_model_row(
                             appearance,
-                            format!("{mark}{}{suffix}", self.model_label(model)),
+                            self.model_label(model),
+                            if loading { "loading" } else { "" },
                             LocalAiChatAction::PickModel(index),
                             selected,
                         ));
                     }
                 }
 
-                // Turbo is a property of HOW a local model runs, so it belongs
-                // with the local models rather than as a chip on the compose bar.
                 let gguf_active = self
                     .current_model()
                     .is_some_and(|model| is_gguf_ref(&model));
-                let turbo_selected = self.endpoint == LocalEndpoint::Turbo && !gguf_active;
-                let turbo_label = if self.turbo_available || turbo_selected {
-                    format!(
-                        "{}\u{26a1} Turbo \u{2014} full GPU offload",
-                        if turbo_selected { "\u{25cf}  " } else { "\u{25cb}  " }
-                    )
-                } else {
-                    "\u{25cb}  \u{26a1} Turbo \u{2014} not running".to_string()
-                };
-                list.add_child(self.picker_row(
-                    appearance,
-                    turbo_label,
-                    LocalAiChatAction::ToggleTurbo,
-                    turbo_selected,
-                ));
-                if gguf_active {
-                    list.add_child(note(
-                        self,
-                        "A local GGUF always runs through Turbo - it is the only backend that \
-                         can load one.",
-                    ));
-                }
+                let turbo_on = self.endpoint == LocalEndpoint::Turbo || gguf_active;
 
-                // System-wide AI Mode tuning: also a property of running locally.
-                list.add_child(self.picker_row(
+                list.add_child(Self::picker_divider(appearance));
+
+                // Turbo below the divider, described by what it does to the model
+                // above rather than offered as an alternative to it.
+                list.add_child(self.picker_switch_row(
                     appearance,
-                    format!("AI Mode: {}", ai_mode_short_label(self.ai_mode.as_ref())),
-                    LocalAiChatAction::CycleAiMode,
+                    "Turbo",
+                    if gguf_active {
+                        "Always on for a .gguf - the only backend that loads one"
+                    } else if self.turbo_available {
+                        "Run the selected model with full GPU offload"
+                    } else {
+                        "Not running - start genesi-ai-turbo to enable"
+                    },
+                    turbo_on,
+                    LocalAiChatAction::ToggleTurbo,
+                ));
+
+                list.add_child(self.picker_switch_row(
+                    appearance,
+                    "AI Mode",
+                    &ai_mode_short_label(self.ai_mode.as_ref()),
                     self.ai_mode.is_some(),
+                    LocalAiChatAction::CycleAiMode,
                 ));
             }
             ModelPickerTab::Cloud => {
                 for provider in cloud_presets() {
                     let selected = self.cloud.provider == *provider;
-                    let mark = if self.cloud_active && selected {
-                        "\u{25cf}  "
-                    } else {
-                        "\u{25cb}  "
-                    };
-                    list.add_child(self.picker_row(
+                    list.add_child(self.picker_model_row(
                         appearance,
-                        format!("{mark}{}", provider.label()),
+                        provider.label().to_string(),
+                        "",
                         LocalAiChatAction::SelectCloudProvider(*provider),
+                        self.cloud_active && selected,
+                    ));
+                }
+
+                list.add_child(Self::picker_divider(appearance));
+
+                for model in self.cloud.provider.suggested_models() {
+                    let selected = self.cloud.model == *model;
+                    list.add_child(self.picker_model_row(
+                        appearance,
+                        (*model).to_string(),
+                        "",
+                        LocalAiChatAction::PickCloudModel((*model).to_string()),
                         selected,
                     ));
                 }
 
                 let key_saved = !self.active_cloud_key().trim().is_empty();
-                list.add_child(self.picker_row(
+                list.add_child(Self::picker_divider(appearance));
+                list.add_child(self.picker_switch_row(
                     appearance,
+                    "API key",
                     if key_saved {
-                        format!("\u{2713} Key stored for {}", self.cloud.provider.label())
+                        "Stored on this machine"
                     } else {
-                        format!("Add an API key for {}", self.cloud.provider.label())
+                        "Needed before this provider can answer"
                     },
-                    LocalAiChatAction::SetKey,
                     key_saved,
-                ));
-
-                for model in self.cloud.provider.suggested_models() {
-                    let selected = self.cloud.model == *model;
-                    let mark = if selected { "\u{25cf}  " } else { "\u{25cb}  " };
-                    list.add_child(self.picker_row(
-                        appearance,
-                        format!("{mark}{model}"),
-                        LocalAiChatAction::PickCloudModel((*model).to_string()),
-                        selected,
-                    ));
-                }
-                list.add_child(self.picker_row(
-                    appearance,
-                    format!(
-                        "Custom model: {}",
-                        truncate_middle(self.cloud.model.trim(), MODEL_LABEL_MAX_CHARS)
-                    ),
-                    LocalAiChatAction::SetModel,
-                    false,
-                ));
-                list.add_child(note(
-                    self,
-                    match self.cloud.provider {
-                        CloudProviderKind::Anthropic => {
-                            "Anthropic uses its native Messages API; the key is sent with \
-                             x-api-key."
-                        }
-                        CloudProviderKind::Gemini => {
-                            "Gemini uses Google's official OpenAI-compatible endpoint."
-                        }
-                        CloudProviderKind::OpenAI => {
-                            "OpenAI uses /v1/chat/completions with your own bearer token."
-                        }
-                        CloudProviderKind::Groq => {
-                            "Groq uses an OpenAI-compatible endpoint with your own bearer \
-                             token — very fast inference for open models (Llama, GPT-OSS, \
-                             Qwen, Kimi …)."
-                        }
-                        CloudProviderKind::HuggingFace => {
-                            "Hugging Face uses the official router and an HF token with \
-                             Inference Providers permission."
-                        }
-                    },
+                    LocalAiChatAction::SetKey,
                 ));
             }
         }
@@ -7469,6 +7432,140 @@ impl LocalAiChatView {
                 .with_horizontal_padding(PANEL_PADDING)
                 .finish(),
         )
+    }
+
+    /// A hairline between "which model" and "how it runs".
+    fn picker_divider(appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            ConstrainedBox::new(
+                Container::new(Empty::new().finish())
+                    .with_background_color(theme.surface_2().into())
+                    .finish(),
+            )
+            .with_height(1.)
+            .finish(),
+        )
+        .with_margin_top(6.)
+        .with_margin_bottom(6.)
+        .finish()
+    }
+
+    /// A model in the list: name on the left, a live dot on the right.
+    ///
+    /// The dot sits in its own column and is drawn only for the active model,
+    /// so the current choice is found by scanning one edge rather than by
+    /// telling a filled circle from a hollow one at the head of every line.
+    fn picker_model_row(
+        &self,
+        appearance: &Appearance,
+        label: String,
+        detail: &str,
+        action: LocalAiChatAction,
+        active: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color: ColorU = theme.main_text_color(theme.background()).into();
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(self.label_text(appearance, &label, BODY_FONT_SIZE, text_color, false));
+
+        if !detail.is_empty() {
+            row.add_child(
+                Container::new(self.label_text(appearance, detail, CHIP_FONT_SIZE, muted, false))
+                    .with_margin_left(6.)
+                    .finish(),
+            );
+        }
+
+        row.add_child(Shrinkable::new(1., Container::new(Empty::new().finish()).finish()).finish());
+
+        if active {
+            row.add_child(
+                ConstrainedBox::new(
+                    Container::new(Empty::new().finish())
+                        .with_background_color(genesi_green().into())
+                        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        .finish(),
+                )
+                .with_width(7.)
+                .with_height(7.)
+                .finish(),
+            );
+        }
+
+        let mut container = Container::new(row.finish())
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(7.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
+        if active {
+            container = container.with_background_color(green_tint());
+        }
+
+        EventHandler::new(container.finish())
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A control under the divider: what it does, and whether it is on.
+    ///
+    /// Each carries its own explanation, because these are the settings people
+    /// guess wrong about - "Turbo" on its own says nothing about what enabling
+    /// it needs or costs.
+    fn picker_switch_row(
+        &self,
+        appearance: &Appearance,
+        label: &str,
+        detail: &str,
+        on: bool,
+        action: LocalAiChatAction,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color: ColorU = if on {
+            genesi_green()
+        } else {
+            theme.main_text_color(theme.background()).into()
+        };
+        let muted: ColorU = theme.disabled_text_color(theme.background()).into();
+
+        let mut heading = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false));
+        heading
+            .add_child(Shrinkable::new(1., Container::new(Empty::new().finish()).finish()).finish());
+        heading.add_child(self.label_text(
+            appearance,
+            if on { "On" } else { "Off" },
+            CHIP_FONT_SIZE,
+            if on { genesi_green() } else { muted },
+            false,
+        ));
+
+        let column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(heading.finish())
+            .with_child(self.label_text(appearance, detail, CHIP_FONT_SIZE, muted, true))
+            .finish();
+
+        EventHandler::new(
+            Container::new(column)
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
     }
 
     /// One half of the Local / Cloud segmented control at the top of the picker.
