@@ -3,6 +3,7 @@
 /// It also handles applying an optional diff to the file content that will be applied
 /// when the file is loaded.
 use std::{
+    collections::HashSet,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -10,9 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ai::diff_validation::DiffType;
 use ::settings::Setting;
-use warp_core::ui::theme::color::internal_colors;
+use ai::diff_validation::DiffType;
 use futures::stream::AbortHandle;
 use futures::StreamExt as _;
 use lsp::types::FileLocation;
@@ -36,6 +36,7 @@ use warp_core::features::FeatureFlag;
 use warp_core::r#async::debounce;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::icons::Icon;
+use warp_core::ui::theme::color::internal_colors;
 use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::content::text::IndentUnit;
 use warp_editor::render::model::{Decoration, LineCount};
@@ -46,9 +47,9 @@ use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::path::to_relative_path;
 use warp_util::sync::Condition;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable,
-    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Fill, Flex,
-    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Fill, Flex, Hoverable,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
     ParentElement, ParentOffsetBounds, Radius, Rect, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::keymap::macros::*;
@@ -66,8 +67,13 @@ use warpui::{
 #[cfg(feature = "local_fs")]
 use crate::ai::component_hover::{self, HoverPreview};
 use crate::ai::live_preview_view::{render_document, sheet_background, PreviewScale};
+use crate::ai::local_chat::{list_models, read_ai_mode_state, ChatStreamItem, LocalEndpoint};
 use crate::ai::persisted_workspace::{LSPInstallationStatus, LspRepoStatus};
 use crate::ai::persisted_workspace::{PersistedWorkspace, PersistedWorkspaceEvent};
+use crate::code::ai_completion::{
+    build_completion_messages, completion_stream, sanitize_completion, InlineCompletionState,
+    InlineSuggestion, COMPLETION_DEBOUNCE,
+};
 use crate::code::buffer_location::LocalOrRemotePath as BufferFileLocation;
 use crate::code::editor::model::HoverableLink;
 use crate::code::editor::EditorReviewComment;
@@ -76,11 +82,6 @@ use crate::code::global_buffer_model::{BufferState, GlobalBufferModel, GlobalBuf
 use crate::code::{SaveOutcome, ShowFindReferencesCardProvider};
 use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
-use crate::ai::local_chat::{list_models, read_ai_mode_state, ChatStreamItem, LocalEndpoint};
-use crate::code::ai_completion::{
-    build_completion_messages, completion_stream, sanitize_completion, InlineCompletionState,
-    InlineSuggestion, COMPLETION_DEBOUNCE,
-};
 use crate::settings::{AISettings, CodeSettings};
 use crate::terminal::TerminalView;
 use crate::workspace::WorkspaceAction;
@@ -233,6 +234,13 @@ pub enum LocalCodeEditorAction {
         lsp_position: lsp::types::Location,
         anchor_offset: CharOffset,
     },
+    /// The pointer moved onto a completion row: highlight it, the way hovering
+    /// a list item does everywhere else.
+    HighlightCompletionRow(usize),
+    /// A completion row was clicked. Rows are clickable because reaching for the
+    /// mouse and finding the list ignores it is the kind of thing that makes an
+    /// editor feel broken.
+    AcceptCompletionRow(usize),
 }
 
 #[derive(Default)]
@@ -331,6 +339,14 @@ pub(super) enum LspCompletionState {
         is_incomplete: bool,
         /// Scroll state for the (possibly long) candidate list.
         scroll_state: ClippedScrollStateHandle,
+        /// The typed prefix the current `filtered` set was matched against. Kept
+        /// so the rows can highlight the characters that actually matched.
+        prefix: String,
+        /// Scroll state for the documentation pane next to the list.
+        doc_scroll_state: ClippedScrollStateHandle,
+        /// Indices into `items` we already sent `completionItem/resolve` for, so
+        /// arrowing up and down a list does not re-request the same docs.
+        resolved: HashSet<usize>,
     },
 }
 
@@ -344,12 +360,30 @@ impl LspCompletionState {
         *self = LspCompletionState::None;
         true
     }
+
+    /// The item index (into `items`) currently highlighted, if any.
+    pub(super) fn selected_item_index(&self) -> Option<usize> {
+        match self {
+            LspCompletionState::Active {
+                filtered, selected, ..
+            } => filtered.get(*selected).copied(),
+            _ => None,
+        }
+    }
 }
 
 pub(super) const HOVER_TOOLTIP_MAX_WIDTH: f32 = 400.;
 pub(super) const HOVER_TOOLTIP_MAX_HEIGHT: f32 = 100.;
-pub(super) const COMPLETION_POPUP_MAX_WIDTH: f32 = 420.;
-pub(super) const COMPLETION_POPUP_MAX_HEIGHT: f32 = 220.;
+pub(super) const COMPLETION_POPUP_MAX_WIDTH: f32 = 460.;
+/// Height of one candidate row. Fixed, because the keyboard scrolling below
+/// works out where the selected row sits by multiplying by it.
+pub(super) const COMPLETION_ROW_HEIGHT: f32 = 22.;
+/// Rows visible before the list starts scrolling.
+pub(super) const COMPLETION_VISIBLE_ROWS: f32 = 11.;
+pub(super) const COMPLETION_POPUP_MAX_HEIGHT: f32 = COMPLETION_ROW_HEIGHT * COMPLETION_VISIBLE_ROWS;
+/// The documentation pane under the list. Capped so a long doc comment scrolls
+/// instead of pushing the popup off the screen.
+pub(super) const COMPLETION_DOC_MAX_HEIGHT: f32 = 140.;
 /// Max candidates kept after filtering (keeps rendering/scroll bounded).
 pub(super) const COMPLETION_MAX_VISIBLE_ITEMS: usize = 50;
 
@@ -484,6 +518,15 @@ impl LocalCodeEditorView {
             }
             CodeEditorEvent::EscapePressed => {
                 if me.dismiss_lsp_overlays(ctx) {
+                    ctx.notify();
+                }
+            }
+            CodeEditorEvent::SelectionStart => {
+                // A click puts the caret somewhere else, which means whatever
+                // prefix the popup was completing is no longer under the cursor.
+                // Leaving it open was the bug where clicking away from the list
+                // left it floating over unrelated code.
+                if me.dismiss_completion(ctx) {
                     ctx.notify();
                 }
             }
@@ -768,7 +811,6 @@ impl LocalCodeEditorView {
             LocalEndpoint::Ollama
         };
 
-
         let (text, offset) = {
             let editor = self.editor.as_ref(ctx);
             let text = editor.text(ctx).into_string();
@@ -789,8 +831,7 @@ impl LocalCodeEditorView {
             .and_then(lsp::LanguageId::from_path)
             .map(|id| format!("{id:?}"));
 
-        let messages =
-            build_completion_messages(&text, byte_offset, language.as_deref());
+        let messages = build_completion_messages(&text, byte_offset, language.as_deref());
 
         ctx.spawn(
             async move {
@@ -1510,11 +1551,9 @@ impl LocalCodeEditorView {
         // Wrapping in a `Hoverable` is what lets the pointer travel onto the
         // card (to scroll or read it) without the card dismissing itself.
         Some(
-            ConstrainedBox::new(
-                Hoverable::new(hover.mouse_state.clone(), |_state| card).finish(),
-            )
-            .with_width(460.)
-            .finish(),
+            ConstrainedBox::new(Hoverable::new(hover.mouse_state.clone(), |_state| card).finish())
+                .with_width(460.)
+                .finish(),
         )
     }
 
@@ -2921,6 +2960,16 @@ impl View for LocalCodeEditorView {
         }
     }
 
+    /// Focus leaving the editor -- clicking the file tree, another tab, the AI
+    /// panel -- has to take the popups with it. A completion list left hanging
+    /// over a pane the user has moved on from is the single loudest way an
+    /// editor announces that its overlays are not wired to anything.
+    fn on_blur(&mut self, _blur_ctx: &warpui::BlurContext, ctx: &mut ViewContext<Self>) {
+        if self.dismiss_lsp_overlays(ctx) {
+            ctx.notify();
+        }
+    }
+
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
         // Rendering the remote disconnection banner or version conflict banner.
         // Only show the disconnection banner if the file was successfully loaded;
@@ -3158,6 +3207,13 @@ impl TypedActionView for LocalCodeEditorView {
                 // Lazily fetch find-references as fallback when at the definition.
                 // This is triggered on cmd-click when go-to-definition has no different location.
                 self.fetch_find_references_and_show(lsp_position.clone(), *anchor_offset, ctx);
+            }
+            LocalCodeEditorAction::HighlightCompletionRow(row) => {
+                self.select_completion_row(*row, ctx);
+            }
+            LocalCodeEditorAction::AcceptCompletionRow(row) => {
+                self.select_completion_row(*row, ctx);
+                self.accept_completion(ctx);
             }
         }
     }

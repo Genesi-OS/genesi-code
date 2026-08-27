@@ -1,6 +1,7 @@
 use lsp::{HoverContents, LspServerLogLevel, MarkupKind};
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use num_traits::SaturatingSub;
+use pathfinder_color::ColorU;
 use std::collections::HashSet;
 use std::ops::Range;
 use string_offset::CharOffset;
@@ -13,17 +14,22 @@ use warp_editor::render::element::VerticalExpansionBehavior;
 use warp_editor::render::model::Decoration;
 use warpui::elements::{
     Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Flex, FormattedTextElement, HighlightedHyperlink, Hoverable,
-    MouseStateHandle, ParentElement, Radius, Rect, ScrollbarWidth,
+    CornerRadius, CrossAxisAlignment, DispatchEventResult, EventHandler, Flex,
+    FormattedTextElement, Highlight, HighlightedHyperlink, Hoverable, MouseInBehavior,
+    MouseStateHandle, ParentElement, Radius, Rect, ScrollbarWidth, Shrinkable, Text,
 };
+use warpui::fonts::{Properties, Weight};
 use warpui::text::point::Point;
+use warpui::text_layout::ClipConfig;
+use warpui::units::Pixels;
 use warpui::{AppContext, Element, SingletonEntity, ViewContext};
 
 use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use super::lsp_telemetry::LspTelemetryEvent;
 use crate::code::local_code_editor::{
-    HoverContentSegment, LocalCodeEditorView, LspCompletionState, LspHoverState,
-    COMPLETION_MAX_VISIBLE_ITEMS, COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH,
+    HoverContentSegment, LocalCodeEditorAction, LocalCodeEditorView, LspCompletionState,
+    LspHoverState, COMPLETION_DOC_MAX_HEIGHT, COMPLETION_MAX_VISIBLE_ITEMS,
+    COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH, COMPLETION_ROW_HEIGHT,
     HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
 use crate::editor::InteractionState;
@@ -706,8 +712,13 @@ impl LocalCodeEditorView {
             anchor,
             is_incomplete,
             scroll_state: Default::default(),
+            prefix,
+            doc_scroll_state: Default::default(),
+            resolved: HashSet::new(),
         };
         self.set_editor_completion_active(true, ctx);
+        self.scroll_completion_to_selection();
+        self.resolve_selected_completion(ctx);
         ctx.notify();
     }
 
@@ -839,7 +850,11 @@ impl LocalCodeEditorView {
                     anchor,
                     is_incomplete: false,
                     scroll_state: Default::default(),
+                    prefix,
+                    doc_scroll_state: Default::default(),
+                    resolved: HashSet::new(),
                 };
+                self.scroll_completion_to_selection();
                 ctx.notify();
                 return;
             }
@@ -847,41 +862,180 @@ impl LocalCodeEditorView {
             return;
         }
         if let LspCompletionState::Active {
-            filtered, selected, ..
+            filtered,
+            selected,
+            prefix: active_prefix,
+            ..
         } = &mut self.lsp_completion_state
         {
             *filtered = new_filtered;
             *selected = 0;
+            *active_prefix = prefix;
         }
+        self.scroll_completion_to_selection();
+        self.resolve_selected_completion(ctx);
         ctx.notify();
     }
 
     pub(super) fn completion_select_next(&mut self, ctx: &mut ViewContext<Self>) {
-        if let LspCompletionState::Active {
+        let moved = if let LspCompletionState::Active {
             filtered, selected, ..
         } = &mut self.lsp_completion_state
         {
-            if !filtered.is_empty() {
+            if filtered.is_empty() {
+                false
+            } else {
                 *selected = (*selected + 1) % filtered.len();
-                ctx.notify();
+                true
             }
+        } else {
+            false
+        };
+        if moved {
+            self.after_completion_selection_changed(ctx);
         }
     }
 
     pub(super) fn completion_select_prev(&mut self, ctx: &mut ViewContext<Self>) {
-        if let LspCompletionState::Active {
+        let moved = if let LspCompletionState::Active {
             filtered, selected, ..
         } = &mut self.lsp_completion_state
         {
-            if !filtered.is_empty() {
+            if filtered.is_empty() {
+                false
+            } else {
                 *selected = if *selected == 0 {
                     filtered.len() - 1
                 } else {
                     *selected - 1
                 };
-                ctx.notify();
+                true
             }
+        } else {
+            false
+        };
+        if moved {
+            self.after_completion_selection_changed(ctx);
         }
+    }
+
+    /// Move the highlight to `row` (a position within `filtered`). Used by the
+    /// pointer moving over the list.
+    pub(super) fn select_completion_row(&mut self, row: usize, ctx: &mut ViewContext<Self>) {
+        let moved = if let LspCompletionState::Active {
+            filtered, selected, ..
+        } = &mut self.lsp_completion_state
+        {
+            if row < filtered.len() && *selected != row {
+                *selected = row;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if moved {
+            self.after_completion_selection_changed(ctx);
+        }
+    }
+
+    fn after_completion_selection_changed(&mut self, ctx: &mut ViewContext<Self>) {
+        self.scroll_completion_to_selection();
+        self.reset_completion_doc_scroll();
+        self.resolve_selected_completion(ctx);
+        ctx.notify();
+    }
+
+    /// Keep the highlighted row inside the visible window. Without this the
+    /// selection walks off the bottom of the list and the popup looks frozen.
+    fn scroll_completion_to_selection(&self) {
+        let LspCompletionState::Active {
+            selected,
+            filtered,
+            scroll_state,
+            ..
+        } = &self.lsp_completion_state
+        else {
+            return;
+        };
+        if filtered.is_empty() {
+            return;
+        }
+
+        let row_top = *selected as f32 * COMPLETION_ROW_HEIGHT;
+        let row_bottom = row_top + COMPLETION_ROW_HEIGHT;
+        let window_top = scroll_state.scroll_start().as_f32();
+        let window_bottom = window_top + COMPLETION_POPUP_MAX_HEIGHT;
+
+        if row_top < window_top {
+            scroll_state.scroll_to(Pixels::new(row_top));
+        } else if row_bottom > window_bottom {
+            scroll_state.scroll_to(Pixels::new(row_bottom - COMPLETION_POPUP_MAX_HEIGHT));
+        }
+    }
+
+    fn reset_completion_doc_scroll(&self) {
+        if let LspCompletionState::Active {
+            doc_scroll_state, ..
+        } = &self.lsp_completion_state
+        {
+            doc_scroll_state.scroll_to(Pixels::zero());
+        }
+    }
+
+    /// Ask the server for the selected candidate's documentation, once per item.
+    ///
+    /// Servers are allowed to answer the list request with just labels, and the
+    /// ones people actually use do exactly that: without this round trip the
+    /// popup has nothing to show beyond the name it is already showing.
+    fn resolve_selected_completion(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(item_index) = self.lsp_completion_state.selected_item_index() else {
+            return;
+        };
+        let generation = self.completion_request_generation;
+
+        let raw_item = match &mut self.lsp_completion_state {
+            LspCompletionState::Active {
+                items, resolved, ..
+            } => {
+                let Some(item) = items.get(item_index) else {
+                    return;
+                };
+                // Nothing to fetch: the list response already carried the docs.
+                if item.documentation.is_some() {
+                    return;
+                }
+                if !resolved.insert(item_index) {
+                    return;
+                }
+                item.raw.as_ref().clone()
+            }
+            _ => return,
+        };
+
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        let Ok(request) = server.as_ref(ctx).resolve_completion_item(raw_item) else {
+            return;
+        };
+
+        ctx.spawn(request, move |me, resolved, ctx| {
+            let Ok(resolved) = resolved else {
+                return;
+            };
+            // The popup may have been rebuilt (or closed) while we waited.
+            if me.completion_request_generation != generation {
+                return;
+            }
+            if let LspCompletionState::Active { items, .. } = &mut me.lsp_completion_state {
+                if let Some(item) = items.get_mut(item_index) {
+                    item.merge_resolved(resolved);
+                    ctx.notify();
+                }
+            }
+        });
     }
 
     /// Apply the selected candidate: replace the typed prefix `anchor..cursor`
@@ -1346,6 +1500,7 @@ impl LocalCodeEditorView {
                     kind: Some(lsp_types::CompletionItemKind::SNIPPET),
                     sort_text: Some(format!("~builtin-{label}")),
                     filter_text: Some(label.to_string()),
+                    ..Default::default()
                 });
             }
         }
@@ -1381,6 +1536,7 @@ impl LocalCodeEditorView {
                     kind: Some(lsp_types::CompletionItemKind::TEXT),
                     sort_text: Some(format!("~~local-{identifier}")),
                     filter_text: Some(identifier.to_string()),
+                    ..Default::default()
                 });
             }
         }
@@ -1423,6 +1579,7 @@ impl LocalCodeEditorView {
                 kind: Some(lsp_types::CompletionItemKind::SNIPPET),
                 sort_text: Some("0-html-document".to_string()),
                 filter_text: Some("!".to_string()),
+                ..Default::default()
             }]);
         }
 
@@ -1505,6 +1662,7 @@ impl LocalCodeEditorView {
                     kind: Some(lsp_types::CompletionItemKind::SNIPPET),
                     sort_text: None,
                     filter_text: Some((*tag).to_string()),
+                    ..Default::default()
                 }
             })
             .collect::<Vec<_>>();
@@ -1536,16 +1694,209 @@ impl LocalCodeEditorView {
         }
     }
 
+    /// A one-letter badge and a colour per candidate kind, so a method, a field
+    /// and a snippet are distinguishable at a glance instead of being three
+    /// identical rows of text.
+    fn completion_kind_glyph(
+        kind: Option<lsp_types::CompletionItemKind>,
+        theme: &WarpTheme,
+    ) -> (&'static str, ColorU) {
+        use lsp_types::CompletionItemKind as Kind;
+
+        let ansi = theme.terminal_colors();
+        let blue: ColorU = ansi.normal.blue.into();
+        let magenta: ColorU = ansi.normal.magenta.into();
+        let cyan: ColorU = ansi.normal.cyan.into();
+        let yellow: ColorU = ansi.normal.yellow.into();
+        let green: ColorU = ansi.normal.green.into();
+        let muted: ColorU = theme.disabled_ui_text_color().into();
+
+        match kind {
+            Some(Kind::METHOD) | Some(Kind::FUNCTION) | Some(Kind::CONSTRUCTOR) => ("f", magenta),
+            Some(Kind::FIELD) | Some(Kind::PROPERTY) => ("p", blue),
+            Some(Kind::VARIABLE) | Some(Kind::VALUE) => ("v", blue),
+            Some(Kind::CLASS) | Some(Kind::STRUCT) | Some(Kind::INTERFACE) => ("C", yellow),
+            Some(Kind::MODULE) | Some(Kind::FOLDER) => ("M", yellow),
+            Some(Kind::ENUM) | Some(Kind::ENUM_MEMBER) => ("E", yellow),
+            Some(Kind::KEYWORD) | Some(Kind::OPERATOR) => ("k", magenta),
+            Some(Kind::SNIPPET) => ("{", green),
+            Some(Kind::CONSTANT) => ("c", cyan),
+            Some(Kind::TYPE_PARAMETER) => ("T", yellow),
+            Some(Kind::FILE) => ("F", cyan),
+            _ => ("a", muted),
+        }
+    }
+
+    /// The kind spelled out, shown at the right of the row. This is the half of
+    /// the answer the badge cannot give on its own.
+    fn completion_kind_name(kind: Option<lsp_types::CompletionItemKind>) -> &'static str {
+        use lsp_types::CompletionItemKind as Kind;
+
+        match kind {
+            Some(Kind::METHOD) => "method",
+            Some(Kind::FUNCTION) => "function",
+            Some(Kind::CONSTRUCTOR) => "constructor",
+            Some(Kind::FIELD) => "field",
+            Some(Kind::PROPERTY) => "property",
+            Some(Kind::VARIABLE) => "variable",
+            Some(Kind::VALUE) => "value",
+            Some(Kind::CLASS) => "class",
+            Some(Kind::STRUCT) => "struct",
+            Some(Kind::INTERFACE) => "interface",
+            Some(Kind::MODULE) => "module",
+            Some(Kind::ENUM) => "enum",
+            Some(Kind::ENUM_MEMBER) => "enum member",
+            Some(Kind::KEYWORD) => "keyword",
+            Some(Kind::OPERATOR) => "operator",
+            Some(Kind::SNIPPET) => "snippet",
+            Some(Kind::CONSTANT) => "constant",
+            Some(Kind::TYPE_PARAMETER) => "type param",
+            Some(Kind::FILE) => "file",
+            Some(Kind::FOLDER) => "folder",
+            Some(Kind::TEXT) => "text",
+            _ => "",
+        }
+    }
+
+    /// Char indices in `label` that the typed prefix matched, for highlighting.
+    /// Mirrors the subsequence rule [`Self::completion_match_score`] filters
+    /// with, so the highlight always explains why a row is in the list.
+    fn completion_match_indices(label: &str, prefix: &str) -> Vec<usize> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let needle: Vec<char> = prefix.to_lowercase().chars().collect();
+        let mut matched = 0usize;
+        let mut indices = Vec::with_capacity(needle.len());
+        for (index, ch) in label.to_lowercase().chars().enumerate() {
+            if needle.get(matched) == Some(&ch) {
+                indices.push(index);
+                matched += 1;
+                if matched == needle.len() {
+                    break;
+                }
+            }
+        }
+        if matched == needle.len() {
+            indices
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Documentation for the highlighted candidate, capped so a module-level doc
+    /// comment cannot turn the popup into a wall of text.
+    fn completion_doc_pane(
+        &self,
+        item: &lsp::CompletionItem,
+        appearance: &Appearance,
+    ) -> Option<Box<dyn Element>> {
+        let theme = appearance.theme();
+        let detail = item
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty() && *detail != item.label);
+        let documentation = item
+            .documentation
+            .as_deref()
+            .map(str::trim)
+            .filter(|doc| !doc.is_empty());
+
+        if detail.is_none() && documentation.is_none() {
+            return None;
+        }
+
+        let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        if let Some(detail) = detail {
+            column.add_child(
+                Text::new(
+                    detail.to_string(),
+                    appearance.monospace_font_family(),
+                    appearance.monospace_font_size() - 1.,
+                )
+                .with_color(theme.nonactive_ui_text_color().into())
+                .finish(),
+            );
+        }
+
+        if let Some(documentation) = documentation {
+            // Doc comments arrive as markdown. Rendering it properly here would
+            // mean a second markdown surface inside a popup that has to stay
+            // cheap to lay out every keystroke, so we render the source text and
+            // let the hover card handle rich content.
+            let text = markdown_parser::parse_markdown(documentation).unwrap_or_else(|_| {
+                FormattedText::new([FormattedTextLine::Line(vec![
+                    FormattedTextFragment::plain_text(documentation.to_string()),
+                ])])
+            });
+            column.add_child(
+                Container::new(
+                    FormattedTextElement::new(
+                        text,
+                        appearance.monospace_font_size() - 1.,
+                        appearance.ui_font_family(),
+                        appearance.monospace_font_family(),
+                        theme.nonactive_ui_text_color().into(),
+                        HighlightedHyperlink::default(),
+                    )
+                    .finish(),
+                )
+                .with_padding_top(4.)
+                .finish(),
+            );
+        }
+
+        let doc_scroll_state = match &self.lsp_completion_state {
+            LspCompletionState::Active {
+                doc_scroll_state, ..
+            } => doc_scroll_state.clone(),
+            _ => return None,
+        };
+
+        let scrollable = ClippedScrollable::vertical(
+            doc_scroll_state,
+            column.finish(),
+            ScrollbarWidth::Auto,
+            theme.disabled_ui_text_color().into(),
+            theme.active_ui_text_color().into(),
+            warpui::elements::Fill::None,
+        )
+        .finish();
+
+        let mut pane = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        pane.add_child(Self::render_separator(theme));
+        pane.add_child(
+            Container::new(
+                ConstrainedBox::new(scrollable)
+                    .with_max_height(COMPLETION_DOC_MAX_HEIGHT)
+                    .finish(),
+            )
+            .with_horizontal_padding(8.)
+            .with_padding_bottom(4.)
+            .finish(),
+        );
+        Some(pane.finish())
+    }
+
     /// Render the completion popup if candidates are available.
     pub(super) fn render_completion_popup(&self, app: &AppContext) -> Option<Box<dyn Element>> {
-        let (items, filtered, selected, scroll_state) = match &self.lsp_completion_state {
+        let (items, filtered, selected, scroll_state, prefix) = match &self.lsp_completion_state {
             LspCompletionState::Active {
                 items,
                 filtered,
                 selected,
                 scroll_state,
+                prefix,
                 ..
-            } => (items, filtered, *selected, scroll_state.clone()),
+            } => (
+                items,
+                filtered,
+                *selected,
+                scroll_state.clone(),
+                prefix.as_str(),
+            ),
             _ => return None,
         };
         if filtered.is_empty() {
@@ -1554,6 +1905,10 @@ impl LocalCodeEditorView {
 
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
+        let font_size = appearance.monospace_font_size();
+        let label_color: ColorU = theme.active_ui_text_color().into();
+        let muted_color: ColorU = theme.disabled_ui_text_color().into();
+        let match_color: ColorU = theme.accent().into_solid();
 
         let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         for (row_index, &item_index) in filtered.iter().enumerate() {
@@ -1561,29 +1916,113 @@ impl LocalCodeEditorView {
                 continue;
             };
             let is_selected = row_index == selected;
+            let (glyph, glyph_color) = Self::completion_kind_glyph(item.kind, theme);
 
-            let text = FormattedText::new([FormattedTextLine::Line(vec![
-                FormattedTextFragment::plain_text(item.label.clone()),
-            ])]);
-            let label_element = FormattedTextElement::new(
-                text,
-                appearance.monospace_font_size(),
-                appearance.ui_font_family(),
+            let mut row_content = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.);
+
+            row_content.add_child(
+                ConstrainedBox::new(
+                    Text::new_inline(glyph, appearance.monospace_font_family(), font_size)
+                        .with_color(glyph_color)
+                        .finish(),
+                )
+                .with_width(10.)
+                .finish(),
+            );
+
+            let mut label = Text::new_inline(
+                item.label.clone(),
                 appearance.monospace_font_family(),
-                theme.active_ui_text_color().into(),
-                HighlightedHyperlink::default(),
+                font_size,
             )
-            .finish();
+            .with_color(label_color)
+            .with_clip(ClipConfig::ellipsis());
+            let matched = Self::completion_match_indices(&item.label, prefix);
+            if !matched.is_empty() {
+                label = label.with_single_highlight(
+                    Highlight::new()
+                        .with_properties(Properties::default().weight(Weight::Bold))
+                        .with_foreground_color(match_color),
+                    matched,
+                );
+            }
+            row_content.add_child(Shrinkable::new(1., label.finish()).finish());
 
-            let mut row = Container::new(label_element)
-                .with_horizontal_padding(8.)
-                .with_vertical_padding(2.);
+            // The signature fragment servers attach to the label itself, e.g.
+            // rust-analyzer's `(&self, index: usize)`.
+            if let Some(label_detail) = item.label_detail.as_deref().filter(|d| !d.is_empty()) {
+                row_content.add_child(
+                    Text::new_inline(
+                        label_detail.to_string(),
+                        appearance.monospace_font_family(),
+                        font_size - 1.,
+                    )
+                    .with_color(muted_color)
+                    .with_clip(ClipConfig::ellipsis())
+                    .finish(),
+                );
+            }
+
+            // Where it comes from, else what it is. Either answers the question
+            // the bare label left open.
+            let trailing = item
+                .label_description
+                .as_deref()
+                .filter(|description| !description.is_empty())
+                .unwrap_or_else(|| Self::completion_kind_name(item.kind));
+            if !trailing.is_empty() {
+                row_content.add_child(
+                    Text::new_inline(
+                        trailing.to_string(),
+                        appearance.ui_font_family(),
+                        font_size - 2.,
+                    )
+                    .with_color(muted_color)
+                    .with_clip(ClipConfig::ellipsis())
+                    .finish(),
+                );
+            }
+
+            let mut row = Container::new(
+                ConstrainedBox::new(row_content.finish())
+                    .with_height(COMPLETION_ROW_HEIGHT)
+                    .finish(),
+            )
+            .with_horizontal_padding(8.);
             if is_selected {
                 row = row.with_background(warpui::elements::Fill::Solid(
                     internal_colors::neutral_3(theme),
                 ));
             }
-            column.add_child(row.finish());
+
+            // Rows answer the mouse: hovering highlights, clicking accepts.
+            column.add_child(
+                EventHandler::new(row.finish())
+                    .on_mouse_in(
+                        move |ctx, _, _| {
+                            ctx.dispatch_typed_action(
+                                LocalCodeEditorAction::HighlightCompletionRow(row_index),
+                            );
+                            DispatchEventResult::PropagateToParent
+                        },
+                        // Synthetic hovers fire on every repaint. Honouring them
+                        // would let a parked pointer yank the selection back
+                        // from wherever the arrow keys just put it.
+                        Some(MouseInBehavior {
+                            fire_on_synthetic_events: false,
+                            fire_when_covered: false,
+                        }),
+                    )
+                    .on_left_mouse_down(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(LocalCodeEditorAction::AcceptCompletionRow(
+                            row_index,
+                        ));
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish(),
+            );
         }
 
         let scrollable_content = ClippedScrollable::vertical(
@@ -1596,19 +2035,40 @@ impl LocalCodeEditorView {
         )
         .finish();
 
-        let constrained_content = ConstrainedBox::new(scrollable_content)
+        let mut body = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        body.add_child(
+            Container::new(
+                ConstrainedBox::new(scrollable_content)
+                    .with_max_height(COMPLETION_POPUP_MAX_HEIGHT)
+                    .finish(),
+            )
+            .with_vertical_padding(4.)
+            .finish(),
+        );
+
+        if let Some(item) = filtered.get(selected).and_then(|index| items.get(*index)) {
+            if let Some(doc_pane) = self.completion_doc_pane(item, appearance) {
+                body.add_child(doc_pane);
+            }
+        }
+
+        let constrained_content = ConstrainedBox::new(body.finish())
             .with_width(COMPLETION_POPUP_MAX_WIDTH)
-            .with_max_height(COMPLETION_POPUP_MAX_HEIGHT)
             .finish();
 
         let popup = Container::new(constrained_content)
-            .with_vertical_padding(4.)
             .with_background(theme.background())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
             .with_border(Border::all(1.).with_border_fill(internal_colors::neutral_4(theme)))
             .finish();
 
-        Some(popup)
+        // Swallow clicks that land on the popup but miss a row, so the padding
+        // between rows does not fall through and move the caret.
+        Some(
+            EventHandler::new(popup)
+                .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                .finish(),
+        )
     }
 
     pub(super) fn create_highlighted_code_fragment(

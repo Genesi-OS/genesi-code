@@ -12,6 +12,7 @@ fn completion(label: &str, sort_text: Option<&str>) -> CompletionItem {
         kind: None,
         sort_text: sort_text.map(str::to_string),
         filter_text: None,
+        ..Default::default()
     }
 }
 
