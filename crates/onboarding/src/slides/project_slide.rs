@@ -23,7 +23,6 @@ use super::OnboardingSlide;
 use crate::model::OnboardingStateModel;
 use crate::slides::{bottom_nav, layout, slide_content};
 use crate::telemetry::OnboardingEvent;
-use crate::visuals::project_visual;
 
 const LEFT_COLUMN_W: f32 = 428.;
 
@@ -135,7 +134,7 @@ impl ProjectSlide {
 
         let subtitle = appearance
             .ui_builder()
-            .paragraph("Set up a project to optimize it for coding in Warp.")
+            .paragraph("Set up a project to optimize it for coding in Genesi Code.")
             .with_style(UiComponentStyles {
                 font_size: Some(20.),
                 font_weight: Some(Weight::Normal),
@@ -299,7 +298,7 @@ impl ProjectSlide {
                 if theme_picker_last {
                     "Next"
                 } else {
-                    "Get Warping"
+                    "Get started"
                 },
                 Keystroke::parse("enter").unwrap_or_default(),
                 ProjectSlideAction::NextClicked,
@@ -419,23 +418,6 @@ impl ProjectSlide {
             .finish()
     }
 
-    fn render_visual(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        let panel_background = internal_colors::neutral_2(theme);
-
-        let pill_color = internal_colors::fg_overlay_1(theme).into_solid();
-        let center_icon_color = internal_colors::neutral_5(theme);
-        let side_icon_color = internal_colors::neutral_4(theme);
-
-        Container::new(project_visual(
-            panel_background,
-            pill_color,
-            center_icon_color,
-            side_icon_color,
-        ))
-        .with_background_color(internal_colors::neutral_1(theme))
-        .finish()
-    }
 }
 
 impl Entity for ProjectSlide {
@@ -454,7 +436,7 @@ impl View for ProjectSlide {
 
         layout::static_left(
             || self.render_content(appearance, settings, agent_modality_enabled),
-            || self.render_visual(appearance),
+            layout::onboarding_right_panel_video,
         )
     }
 }

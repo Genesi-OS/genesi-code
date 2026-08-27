@@ -6,7 +6,6 @@ mod intention_slide;
 mod intro_slide;
 pub mod layout;
 mod onboarding_slide;
-mod progress_dots;
 mod project_slide;
 pub mod slide_content;
 mod theme_picker_slide;

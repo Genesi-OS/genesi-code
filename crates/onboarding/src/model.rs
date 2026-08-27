@@ -552,23 +552,10 @@ impl OnboardingStateModel {
         default_model_id: LLMId,
         ctx: &mut ModelContext<Self>,
     ) {
-        use warp_core::features::FeatureFlag;
-
-        // If the user is past the agent slide, don't change the agent model from underneath them.
-        // When the new settings modes flag is on, ThemePicker comes after the agent slides
-        // so it must also be guarded.
-        let is_past_agent_slide = if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-            matches!(
-                self.step,
-                OnboardingStep::ThirdParty | OnboardingStep::ThemePicker
-            )
-        } else {
-            matches!(self.step, OnboardingStep::Project)
-        };
-        if is_past_agent_slide {
-            return;
-        }
-
+        // Upstream guarded this against clobbering a model the user had just
+        // chosen on the Agent slide. That slide is not part of Genesi's flow
+        // (it pasted a Warp auth token and linked an upgrade page), so nothing
+        // in onboarding picks a model any more and the default can always win.
         self.agent_settings.selected_model_id = default_model_id.clone();
 
         self.models = models;
@@ -663,79 +650,45 @@ impl OnboardingStateModel {
         ctx.notify();
     }
 
+    /// The onboarding flow, in order.
+    ///
+    /// Genesi's onboarding is deliberately short and account-free: pick a look,
+    /// set up the UI, open a project. The upstream flow also had an Intention
+    /// slide, an Agent slide (which pasted a Warp auth token and linked an
+    /// upgrade page) and a paywall slide; none of that applies to a login-free
+    /// editor, so those steps are not part of the sequence.
+    const FLOW: &'static [OnboardingStep] = &[
+        OnboardingStep::Intro,
+        OnboardingStep::ThemePicker,
+        OnboardingStep::Customize,
+        OnboardingStep::Project,
+    ];
+
+    fn flow_position(step: OnboardingStep) -> Option<usize> {
+        Self::FLOW.iter().position(|candidate| *candidate == step)
+    }
+
     pub(crate) fn back(&mut self, ctx: &mut ModelContext<Self>) {
-        use warp_core::features::FeatureFlag;
-        let theme_picker_last = FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-
-        let prev = if theme_picker_last {
-            match self.step {
-                OnboardingStep::Intro => None,
-                OnboardingStep::Intention => Some(OnboardingStep::Intro),
-                OnboardingStep::Customize => Some(OnboardingStep::Intention),
-                OnboardingStep::Agent => Some(OnboardingStep::Customize),
-                OnboardingStep::ThirdParty => match self.intention {
-                    OnboardingIntention::Terminal => Some(OnboardingStep::Customize),
-                    OnboardingIntention::AgentDrivenDevelopment => Some(OnboardingStep::Agent),
-                },
-                OnboardingStep::Project => Some(OnboardingStep::ThirdParty),
-                OnboardingStep::ThemePicker => Some(OnboardingStep::ThirdParty),
-            }
-        } else {
-            match self.step {
-                OnboardingStep::Intro => None,
-                OnboardingStep::ThemePicker => Some(OnboardingStep::Intro),
-                OnboardingStep::Intention => Some(OnboardingStep::ThemePicker),
-                OnboardingStep::Customize => None,
-                OnboardingStep::ThirdParty => None,
-                OnboardingStep::Agent => Some(OnboardingStep::Intention),
-                OnboardingStep::Project => Some(OnboardingStep::Agent),
-            }
+        let Some(position) = Self::flow_position(self.step) else {
+            return;
         };
-
-        if let Some(prev) = prev {
-            send_telemetry_from_ctx!(OnboardingEvent::SlideNavigatedBack, ctx);
-            self.set_step(prev, ctx);
-        }
+        let Some(prev) = position.checked_sub(1).map(|i| Self::FLOW[i]) else {
+            return; // already on the first slide
+        };
+        send_telemetry_from_ctx!(OnboardingEvent::SlideNavigatedBack, ctx);
+        self.set_step(prev, ctx);
     }
 
     pub(crate) fn next(&mut self, ctx: &mut ModelContext<Self>) {
-        use warp_core::features::FeatureFlag;
-        let theme_picker_last = FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-
-        let is_last_step = if theme_picker_last {
-            matches!(self.step, OnboardingStep::ThemePicker)
-        } else {
-            matches!(self.step, OnboardingStep::Project)
+        let Some(position) = Self::flow_position(self.step) else {
+            return;
         };
-        if !is_last_step {
-            send_telemetry_from_ctx!(OnboardingEvent::SlideNavigatedNext, ctx);
-        }
-
-        if theme_picker_last {
-            match self.step {
-                OnboardingStep::Intro => self.set_step(OnboardingStep::Intention, ctx),
-                OnboardingStep::Intention => self.set_step(OnboardingStep::Customize, ctx),
-                OnboardingStep::Customize => match self.intention {
-                    OnboardingIntention::Terminal => self.set_step(OnboardingStep::ThirdParty, ctx),
-                    OnboardingIntention::AgentDrivenDevelopment => {
-                        self.set_step(OnboardingStep::Agent, ctx)
-                    }
-                },
-                OnboardingStep::Agent => self.set_step(OnboardingStep::ThirdParty, ctx),
-                OnboardingStep::ThirdParty => self.set_step(OnboardingStep::ThemePicker, ctx),
-                OnboardingStep::Project => self.set_step(OnboardingStep::ThemePicker, ctx),
-                OnboardingStep::ThemePicker => {}
+        match Self::FLOW.get(position + 1) {
+            Some(next) => {
+                send_telemetry_from_ctx!(OnboardingEvent::SlideNavigatedNext, ctx);
+                self.set_step(*next, ctx);
             }
-        } else {
-            match self.step {
-                OnboardingStep::Intro => self.set_step(OnboardingStep::ThemePicker, ctx),
-                OnboardingStep::ThemePicker => self.set_step(OnboardingStep::Intention, ctx),
-                OnboardingStep::Intention => self.set_step(OnboardingStep::Agent, ctx),
-                OnboardingStep::Customize => {}
-                OnboardingStep::ThirdParty => {}
-                OnboardingStep::Agent => self.set_step(OnboardingStep::Project, ctx),
-                OnboardingStep::Project => {}
-            }
+            None => {} // last slide; completion is driven by the slide itself
         }
     }
 

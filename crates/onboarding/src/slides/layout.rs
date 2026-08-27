@@ -1,14 +1,18 @@
 use pathfinder_geometry::vector::{vec2f, Vector2F};
 use warpui_core::assets::asset_cache::AssetSource;
+use warpui_core::image_cache::ImageCache;
+use std::sync::OnceLock;
+
+use instant::Instant;
 use warpui_core::elements::{
-    Align, CacheOption, Clipped, ConstrainedBox, Container, CrossAxisAlignment, Empty, Expanded,
-    Flex, Image, MainAxisSize, ParentElement, Point, Shrinkable, SizeConstraintCondition,
-    SizeConstraintSwitch, Stack,
+    Align, CacheOption, Clipped, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    Empty, Expanded, Flex, Image, MainAxisSize, ParentElement, Point, Radius, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack,
 };
 use warpui_core::event::DispatchedEvent;
 use warpui_core::{
     AfterLayoutContext, AppContext, Element, EventContext, LayoutContext, PaintContext,
-    SizeConstraint,
+    SingletonEntity as _, SizeConstraint,
 };
 
 // Onboarding images live under `app/assets/async/` so they are excluded from the WASM
@@ -377,4 +381,78 @@ pub fn onboarding_right_panel_with_bg(
     stack.extend(Some(foreground));
 
     Clipped::new(stack.finish()).finish()
+}
+
+/// The looping product clip shown on the onboarding right panel.
+///
+/// This is an animated WebP, not the source MP4, because the renderer has no
+/// video decoder at all: `ImageCache` decodes animated GIF and WebP and nothing
+/// else.
+///
+/// The asset is cropped to 4:3 around the machine at the centre of the frame and
+/// re-encoded at 800x600, 10fps. Every frame is held in memory as RGBA once
+/// decoded, so frame count and resolution are a real memory cost, not just a
+/// file-size one: the source 1920x1080 24fps clip would run to about 1 GB, while
+/// this costs roughly 95 MB and only while onboarding is on screen.
+pub const ONBOARDING_VIDEO_PATH: &str = "async/webp/onboarding/genesicode.webp";
+
+/// Gap between the clip and the panel edges.
+const VIDEO_INSET: f32 = 24.;
+
+/// Corner rounding on the clip.
+const VIDEO_CORNER_RADIUS: f32 = 16.;
+
+/// When the clip started playing, fixed for the lifetime of the process.
+///
+/// The image element derives the current frame from `started_at.elapsed()`, so
+/// this MUST be stable across repaints -- handing it a fresh `Instant::now()`
+/// every frame would pin the clip to its first frame forever. Anchoring it once
+/// also means the clip keeps running across slide changes instead of restarting
+/// each time the user moves through onboarding.
+fn video_started_at() -> Instant {
+    static STARTED_AT: OnceLock<Instant> = OnceLock::new();
+    *STARTED_AT.get_or_init(Instant::now)
+}
+
+/// The onboarding right panel: the clip, inset from the panel edges and rounded.
+///
+/// The animation loops on its own for as long as the slide is shown; there is no
+/// play count to set.
+pub fn onboarding_right_panel_video() -> Box<dyn Element> {
+    let started_at = video_started_at();
+    let video = Image::new(
+        AssetSource::Bundled {
+            path: ONBOARDING_VIDEO_PATH,
+        },
+        CacheOption::Original,
+    )
+    // contain(), NOT cover(). cover() scales the clip until it fills the panel
+    // and lets the overflow paint outside its box, so it spilled across the
+    // left column and drew over the slide's own text -- and ate the inset below
+    // on the way out. contain() fits the whole frame inside the box instead.
+    .contain()
+    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(VIDEO_CORNER_RADIUS)))
+    .enable_animation_with_start_time(started_at)
+    .finish();
+
+    Container::new(video)
+        .with_padding_left(VIDEO_INSET)
+        .with_padding_right(VIDEO_INSET)
+        .with_padding_top(VIDEO_INSET)
+        .with_padding_bottom(VIDEO_INSET)
+        .finish()
+}
+
+/// Drop the decoded clip from the image cache.
+///
+/// Worth doing explicitly, because nothing else will. `ImageCache` only evicts
+/// on its own for `AssetSource::Raw` entries (the terminal's inline images);
+/// a `Bundled` asset like this one is decoded once and then held for the rest of
+/// the session. Every frame lives in memory as RGBA and again as a GPU texture,
+/// so leaving it cached costs hundreds of megabytes for a screen the user sees
+/// once and never returns to.
+pub fn evict_onboarding_video(ctx: &AppContext) {
+    ImageCache::as_ref(ctx).evict_image(&AssetSource::Bundled {
+        path: ONBOARDING_VIDEO_PATH,
+    });
 }

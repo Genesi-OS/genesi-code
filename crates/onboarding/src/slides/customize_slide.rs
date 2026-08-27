@@ -1,5 +1,4 @@
 use ui_components::{button, Component as _, Options as _};
-use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
 use warpui_core::elements::{
@@ -20,7 +19,6 @@ use super::toggle_card::{render_toggle_card, ChipSpec, ToggleCardSpec};
 use super::OnboardingSlide;
 use crate::model::{OnboardingStateEvent, OnboardingStateModel, UICustomizationSettings};
 use crate::slides::{bottom_nav, layout, slide_content};
-use crate::visuals::{intention_terminal_visual, intention_visual};
 use crate::OnboardingIntention;
 
 /// Which setting card is currently selected (expanded).
@@ -146,7 +144,7 @@ impl CustomizeUISlide {
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
         let title = appearance
             .ui_builder()
-            .paragraph("Customize your Warp")
+            .paragraph("Customize your editor")
             .with_style(UiComponentStyles {
                 font_size: Some(36.),
                 font_weight: Some(Weight::Medium),
@@ -488,143 +486,6 @@ impl CustomizeUISlide {
         "async/png/onboarding/terminal_intention/terminal_codereview_disabled.png",
     ];
 
-    /// Returns the image path for the current visual state.
-    /// When `OpenWarpNewSettingsModes` is enabled, assets depend on the tab layout setting.
-    fn visual_image_path(
-        selected_setting: Option<SettingCard>,
-        hovered_chip: Option<ToolsPanelSubSetting>,
-        intention: OnboardingIntention,
-        ui: &UICustomizationSettings,
-    ) -> &'static str {
-        let is_agent = matches!(intention, OnboardingIntention::AgentDrivenDevelopment);
-        let vertical = ui.use_vertical_tabs;
-        match selected_setting {
-            None => match intention {
-                OnboardingIntention::AgentDrivenDevelopment => {
-                    "async/png/onboarding/welcome_agent.png"
-                }
-                OnboardingIntention::Terminal => "async/png/onboarding/welcome_terminal.png",
-            },
-            Some(SettingCard::TabStyling) => {
-                if is_agent {
-                    if !ui.tools_panel_enabled(&intention) {
-                        if vertical {
-                            "async/png/onboarding/agent_intention/customize_tools_disabled_vertical.png"
-                        } else {
-                            "async/png/onboarding/agent_intention/customize_tools_disabled_horizontal.png"
-                        }
-                    } else if vertical {
-                        "async/png/onboarding/agent_intention/customize_vertical_tabs.png"
-                    } else {
-                        "async/png/onboarding/agent_intention/customize_horizontal_tabs.png"
-                    }
-                } else if vertical {
-                    "async/png/onboarding/terminal_intention/terminal_customize_vertical_tabs.png"
-                } else {
-                    "async/png/onboarding/terminal_intention/terminal_customize_horizontal_tabs.png"
-                }
-            }
-            Some(SettingCard::ToolsPanel) => {
-                if !ui.tools_panel_enabled(&intention) {
-                    // Terminal: tools disabled uses the same image as tab layout.
-                    if is_agent {
-                        if vertical {
-                            "async/png/onboarding/agent_intention/customize_tools_disabled_vertical.png"
-                        } else {
-                            "async/png/onboarding/agent_intention/customize_tools_disabled_horizontal.png"
-                        }
-                    } else if vertical {
-                        "async/png/onboarding/terminal_intention/terminal_customize_vertical_tabs.png"
-                    } else {
-                        "async/png/onboarding/terminal_intention/terminal_customize_horizontal_tabs.png"
-                    }
-                } else {
-                    // Default chip: file explorer for both intents (matches the new tools panel order).
-                    let default_chip = ToolsPanelSubSetting::ProjectExplorer;
-                    let chip = hovered_chip.unwrap_or(default_chip);
-                    if is_agent {
-                        match (chip, vertical) {
-                            (ToolsPanelSubSetting::ConversationHistory, true) => "async/png/onboarding/agent_intention/customize_conversation_vertical.png",
-                            (ToolsPanelSubSetting::ConversationHistory, false) => "async/png/onboarding/agent_intention/customize_conversation_horizontal.png",
-                            (ToolsPanelSubSetting::ProjectExplorer, true) => "async/png/onboarding/agent_intention/customize_fileexplorer_vertical.png",
-                            (ToolsPanelSubSetting::ProjectExplorer, false) => "async/png/onboarding/agent_intention/customize_fileexplorer_horizontal.png",
-                            (ToolsPanelSubSetting::GlobalSearch, true) => "async/png/onboarding/agent_intention/customize_filesearch_vertical.png",
-                            (ToolsPanelSubSetting::GlobalSearch, false) => "async/png/onboarding/agent_intention/customize_filesearch_horizontal.png",
-                            (ToolsPanelSubSetting::WarpDrive, true) => "async/png/onboarding/agent_intention/customize_warpdrive_vertical.png",
-                            (ToolsPanelSubSetting::WarpDrive, false) => "async/png/onboarding/agent_intention/customize_warpdrive_horizontal.png",
-                        }
-                    } else {
-                        // Terminal: no conversation chip; ConversationHistory falls through to file explorer.
-                        match (chip, vertical) {
-                            (ToolsPanelSubSetting::ConversationHistory | ToolsPanelSubSetting::ProjectExplorer, true) => "async/png/onboarding/terminal_intention/terminal_customize_fileexplorer_vertical.png",
-                            (ToolsPanelSubSetting::ConversationHistory | ToolsPanelSubSetting::ProjectExplorer, false) => "async/png/onboarding/terminal_intention/terminal_customize_fileexplorer_horizontal.png",
-                            (ToolsPanelSubSetting::GlobalSearch, true) => "async/png/onboarding/terminal_intention/terminal_customize_filesearch_vertical.png",
-                            (ToolsPanelSubSetting::GlobalSearch, false) => "async/png/onboarding/terminal_intention/terminal_customize_filesearch_horizontal.png",
-                            (ToolsPanelSubSetting::WarpDrive, true) => "async/png/onboarding/terminal_intention/terminal_customize_warpdrive_vertical.png",
-                            (ToolsPanelSubSetting::WarpDrive, false) => "async/png/onboarding/terminal_intention/terminal_customize_warpdrive_horizontal.png",
-                        }
-                    }
-                }
-            }
-            Some(SettingCard::CodeReview) => {
-                if is_agent {
-                    match (ui.show_code_review_button, vertical) {
-                        (true, true) => "async/png/onboarding/agent_intention/customize_codereview_enabled_vertical.png",
-                        (true, false) => "async/png/onboarding/agent_intention/customize_codereview_enabled_horizontal.png",
-                        (false, true) => "async/png/onboarding/agent_intention/customize_codereview_disabled_vertical.png",
-                        (false, false) => "async/png/onboarding/agent_intention/customize_codereview_disabled_horizontal.png",
-                    }
-                } else if ui.show_code_review_button {
-                    "async/png/onboarding/terminal_intention/terminal_codereview_enabled.png"
-                } else {
-                    "async/png/onboarding/terminal_intention/terminal_codereview_disabled.png"
-                }
-            }
-        }
-    }
-
-    fn render_visual(
-        &self,
-        appearance: &Appearance,
-        intention: OnboardingIntention,
-        ui: &UICustomizationSettings,
-    ) -> Box<dyn Element> {
-        let theme = appearance.theme();
-
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-            let path =
-                Self::visual_image_path(self.selected_setting, self.hovered_chip, intention, ui);
-            let fg_layout = match self.selected_setting {
-                None => layout::FOREGROUND_LAYOUT_DEFAULT,
-                Some(SettingCard::CodeReview) => layout::FOREGROUND_LAYOUT_CODE_REVIEW,
-                _ => layout::FOREGROUND_LAYOUT_WIDE,
-            };
-            layout::onboarding_right_panel_with_bg(path, fg_layout)
-        } else {
-            let panel_background = internal_colors::neutral_2(theme);
-            let neutral = internal_colors::neutral_4(theme);
-
-            let visual = if matches!(intention, OnboardingIntention::Terminal) {
-                let neutral_highlight = internal_colors::neutral_6(theme);
-                let accent = internal_colors::accent(theme);
-                intention_terminal_visual(
-                    panel_background,
-                    neutral,
-                    neutral_highlight,
-                    accent.into_solid(),
-                )
-            } else {
-                let blue = theme.ansi_fg_blue();
-                let green = theme.ansi_fg_green();
-                let yellow = theme.ansi_fg_yellow();
-                intention_visual(panel_background, neutral, blue, green, yellow)
-            };
-
-            Container::new(visual)
-                .with_background_color(internal_colors::neutral_1(theme))
-                .finish()
-        }
-    }
 }
 
 impl Entity for CustomizeUISlide {
@@ -643,7 +504,7 @@ impl View for CustomizeUISlide {
 
         layout::static_left(
             || self.render_content(appearance, intention, &ui),
-            || self.render_visual(appearance, intention, &ui),
+            layout::onboarding_right_panel_video,
         )
     }
 }

@@ -23,7 +23,6 @@ use super::OnboardingSlide;
 use crate::model::{OnboardingStateEvent, OnboardingStateModel};
 use crate::slides::{bottom_nav, layout, slide_content};
 use crate::telemetry::OnboardingEvent;
-use crate::visuals::theme_picker_visual;
 use crate::OnboardingIntention;
 
 #[derive(Debug, Clone)]
@@ -53,7 +52,6 @@ pub enum ThemePickerSlideAction {
     PrivacySettingsClicked,
 }
 
-const TOS_URL: &str = "https://www.warp.dev/terms-of-service";
 
 #[derive(Debug, Clone)]
 struct ThemeOption {
@@ -67,7 +65,6 @@ pub struct ThemePickerSlide {
     selected_theme_index: usize,
     sync_with_os: bool,
     sync_with_os_mouse: MouseStateHandle,
-    tos_mouse_state: MouseStateHandle,
     privacy_settings_mouse_state: MouseStateHandle,
     back_button: button::Button,
     next_button: button::Button,
@@ -116,7 +113,6 @@ impl ThemePickerSlide {
             selected_theme_index,
             sync_with_os: false,
             sync_with_os_mouse: MouseStateHandle::default(),
-            tos_mouse_state: MouseStateHandle::default(),
             privacy_settings_mouse_state: MouseStateHandle::default(),
             back_button: button::Button::default(),
             next_button: button::Button::default(),
@@ -274,7 +270,7 @@ impl ThemePickerSlide {
 
         let theme_picker_last = FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
         let next_label = if theme_picker_last {
-            "Get Warping"
+            "Get started"
         } else {
             "Next"
         };
@@ -459,41 +455,6 @@ impl ThemePickerSlide {
         "async/png/onboarding/agent_intention/theme/theme_adeberry_horizontal.png",
     ];
 
-    fn theme_visual_path(&self, app: &AppContext) -> &'static str {
-        let state = self.onboarding_state.as_ref(app);
-        let vertical = state.ui_customization().use_vertical_tabs;
-        let intention_dir = match state.intention() {
-            OnboardingIntention::AgentDrivenDevelopment => "agent_intention",
-            OnboardingIntention::Terminal => "terminal_intention",
-        };
-        let theme_name = self.theme_display_name(self.selected_theme_index);
-        let name_key = match theme_name.as_str() {
-            "Phenomenon" => "phenomenon",
-            "Dark" => "dark",
-            "Light" => "light",
-            "Adeberry" => "adeberry",
-            _ => "dark",
-        };
-        let orientation = if vertical { "vertical" } else { "horizontal" };
-        // Safety: all combinations are in VISUAL_IMAGE_PATHS.
-        Self::VISUAL_IMAGE_PATHS
-            .iter()
-            .find(|p| p.contains(intention_dir) && p.contains(name_key) && p.contains(orientation))
-            .unwrap_or(&Self::VISUAL_IMAGE_PATHS[0])
-    }
-
-    fn render_theme_picker_visual(
-        &self,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-            let path = self.theme_visual_path(app);
-            layout::onboarding_right_panel_with_bg(path, layout::FOREGROUND_LAYOUT_DEFAULT)
-        } else {
-            theme_picker_visual(appearance)
-        }
-    }
 }
 
 impl Entity for ThemePickerSlide {
@@ -511,7 +472,7 @@ impl View for ThemePickerSlide {
         // Background is rendered by the parent onboarding view (including background images).
         layout::static_left(
             || self.render_theme_picker_content(appearance, app),
-            || self.render_theme_picker_visual(appearance, app),
+            layout::onboarding_right_panel_video,
         )
     }
 }
@@ -600,35 +561,15 @@ impl ThemePickerSlide {
             )
             .finish();
 
-        let tos_line = Flex::row()
-            .with_child(
-                ui_builder
-                    .span("By continuing, you agree to Warp's ")
-                    .with_style(disclaimer_styles)
-                    .build()
-                    .finish(),
-            )
-            .with_child(
-                ui_builder
-                    .link(
-                        "Terms of Service".into(),
-                        Some(TOS_URL.into()),
-                        None,
-                        self.tos_mouse_state.clone(),
-                    )
-                    .soft_wrap(false)
-                    .with_style(link_styles)
-                    .build()
-                    .finish(),
-            )
-            .finish();
+        // No Terms of Service line: it linked to Warp's ToS, and Genesi Code has
+        // no account, no sign-up and no service of its own to agree to. The
+        // analytics opt-out above stays -- it points at in-app settings.
 
         Container::new(
             Flex::column()
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Start)
                 .with_child(privacy_line)
-                .with_child(Container::new(tos_line).with_margin_top(8.).finish())
                 .finish(),
         )
         .with_margin_top(24.)

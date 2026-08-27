@@ -10,17 +10,16 @@ use warpui_core::elements::shimmering_text::{
 };
 use warpui_core::elements::{
     Align, ConstrainedBox, Container, CrossAxisAlignment, Flex, FormattedTextElement,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Stack,
+    MainAxisAlignment, MainAxisSize, ParentElement,
 };
 use warpui_core::keymap::Keystroke;
 use warpui_core::text_layout::TextAlignment;
-use warpui_core::ui_components::components::{UiComponent as _, UiComponentStyles};
 use warpui_core::{
     AppContext, Element, Entity, ModelHandle, SingletonEntity as _, TypedActionView, View,
     ViewContext,
 };
 
-use super::OnboardingSlide;
+use super::{layout, OnboardingSlide};
 use crate::model::OnboardingStateModel;
 use crate::OnboardingEvent;
 
@@ -39,7 +38,6 @@ pub struct IntroSlide {
     onboarding_state: ModelHandle<OnboardingStateModel>,
     get_started_button: button::Button,
     shimmering_title_handle: ShimmeringTextStateHandle,
-    login_mouse_state: MouseStateHandle,
 }
 
 impl IntroSlide {
@@ -48,7 +46,6 @@ impl IntroSlide {
             onboarding_state,
             get_started_button: button::Button::default(),
             shimmering_title_handle: ShimmeringTextStateHandle::new(),
-            login_mouse_state: MouseStateHandle::default(),
         }
     }
 }
@@ -64,54 +61,23 @@ impl View for IntroSlide {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        let theme = appearance.theme();
-        let content = self.render_centered_content(appearance);
-        let constrained = ConstrainedBox::new(content).with_max_width(421.).finish();
-        // Background is rendered by the parent onboarding view (including background images).
-        let centered = Container::new(Align::new(constrained).finish()).finish();
 
-        let sub_text_color = internal_colors::text_sub(theme, theme.background().into_solid());
-        let ui_builder = appearance.ui_builder();
-        let disclaimer_styles = UiComponentStyles {
-            font_color: Some(sub_text_color),
-            font_size: Some(12.),
-            ..Default::default()
-        };
-
-        // Genesi: this is a local-first editor for Genesi OS — there is no Warp
-        // account. We keep the row constructed (so the field/action stay wired)
-        // but do NOT display the "Already have an account? Log in" affordance.
-        let _login_row = Flex::row()
-            .with_child(
-                ui_builder
-                    .span("Already have an account? ")
-                    .with_style(disclaimer_styles)
-                    .build()
-                    .finish(),
-            )
-            .with_child(
-                ui_builder
-                    .link(
-                        "Log in".into(),
-                        None,
-                        Some(Box::new(|ctx| {
-                            ctx.dispatch_typed_action(IntroSlideAction::LoginClicked);
-                        })),
-                        self.login_mouse_state.clone(),
-                    )
-                    .soft_wrap(false)
-                    .with_style(UiComponentStyles {
-                        font_size: Some(12.),
-                        ..Default::default()
-                    })
-                    .build()
-                    .finish(),
-            )
-            .finish();
-
-        let mut stack = Stack::new();
-        stack.add_child(centered);
-        stack.finish()
+        // Two columns, matching the rest of onboarding: the copy on the left,
+        // the looping clip on the right.
+        //
+        // There is no "Already have an account? Log in" row here. Genesi Code is
+        // a local-first editor for Genesi OS with no account of its own, so the
+        // upstream login affordance was dropped rather than hidden.
+        //
+        // Background is rendered by the parent onboarding view.
+        layout::static_left(
+            || {
+                let content = self.render_centered_content(appearance);
+                let constrained = ConstrainedBox::new(content).with_max_width(421.).finish();
+                Container::new(Align::new(constrained).finish()).finish()
+            },
+            layout::onboarding_right_panel_video,
+        )
     }
 }
 

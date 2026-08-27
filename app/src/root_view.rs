@@ -1669,14 +1669,29 @@ impl RootView {
                 if #[cfg(target_family = "wasm")] {
                     AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
                 } else {
-                    // Genesi Code runs fully logged-out: never show Warp's pre-login
-                    // onboarding slides or the sign-in / subscribe screen. Land directly
-                    // in the workspace with default settings, exactly like upstream's
-                    // SkipFirebaseAnonymousUser path. The first launch must open straight
-                    // into the editor, not the "Welcome to Genesi Code" account flow.
-                    // (Sign-in / BYOK can still be offered later from settings.)
-                    let _ = has_completed_local_onboarding(ctx);
-                    AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
+                    // Genesi Code runs fully logged-out: there is no sign-in or
+                    // subscribe screen, so never enter Warp's pre-login account
+                    // flow. The workspace is the destination.
+                    //
+                    // Onboarding still runs on first launch, but it is the
+                    // account-free flow (pick a theme, set up the UI, open a
+                    // project) and is gated purely on the local flag. The gate
+                    // upstream uses lives on the auth path and also tests
+                    // `!is_anonymous` / `!is_onboarded`, which can never both
+                    // hold without an account -- that is why these slides had
+                    // stopped appearing for everyone.
+                    let mut state =
+                        AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx));
+                    // Deliberately NOT gated on `FeatureFlag::AgentOnboarding`.
+                    // That flag is a Warp experiment switch: it is only turned on
+                    // by the dogfood/preview channels, so on `warp-oss` it reads
+                    // false and would swallow these slides no matter what. Genesi's
+                    // onboarding is its own account-free flow and belongs to every
+                    // new install, so the local completion flag is the whole gate.
+                    if !has_completed_local_onboarding(ctx) {
+                        state.try_open_onboarding_slides(ctx);
+                    }
+                    state
                 }
             }
         };
@@ -2127,84 +2142,31 @@ impl RootView {
             AgentOnboardingEvent::OnboardingCompleted(selected_settings) => {
                 let AuthOnboardingState::Onboarding {
                     target,
-                    onboarding_view,
+                    onboarding_view: _,
                 } = &self.auth_onboarding_state
                 else {
                     return;
                 };
                 let target = target.clone();
-                let onboarding_view = onboarding_view.clone();
 
                 mark_local_onboarding_completed(ctx);
+                // Onboarding is over and never comes back, so let go of its clip.
+                // Nothing evicts it otherwise -- the image cache only drops
+                // `Raw` assets on its own -- and every decoded frame is held
+                // both as RGBA and as a GPU texture.
+                onboarding::evict_onboarding_video(ctx);
                 if FeatureFlag::HOAOnboardingFlow.is_enabled() {
                     mark_hoa_onboarding_completed(ctx);
                 }
 
                 let is_logged_in = AuthStateProvider::as_ref(ctx).get().is_logged_in();
-                // If the user isn't logged in, only require login if the applied
-                // settings need an account (AI or Warp Drive enabled).
-                let ai_enabled = selected_settings.is_ai_enabled();
-                let warp_drive_enabled = selected_settings.is_warp_drive_enabled();
-                // With old onboarding, we ask user to log in before onboarding, so don't do it after onboarding completes.
-                let requires_login = !is_logged_in
-                    && (ai_enabled || warp_drive_enabled)
-                    && FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-
-                if requires_login {
-                    let tutorial = OnboardingTutorial::from(selected_settings.clone());
-                    self.pending_tutorial = Some(tutorial);
-
-                    let appearance = Appearance::as_ref(ctx);
-                    let theme_name = appearance
-                        .theme()
-                        .name()
-                        .unwrap_or_else(|| "Dark".to_string());
-                    let (use_vertical_tabs, intention) = match selected_settings {
-                        SelectedSettings::AgentDrivenDevelopment {
-                            ui_customization, ..
-                        } => (
-                            ui_customization
-                                .as_ref()
-                                .map(|c| c.use_vertical_tabs)
-                                .unwrap_or(true),
-                            OnboardingIntention::AgentDrivenDevelopment,
-                        ),
-                        SelectedSettings::Terminal {
-                            ui_customization, ..
-                        } => (
-                            ui_customization
-                                .as_ref()
-                                .map(|c| c.use_vertical_tabs)
-                                .unwrap_or(false),
-                            OnboardingIntention::Terminal,
-                        ),
-                    };
-
-                    let login_slide_view = ctx.add_typed_action_view(|ctx| {
-                        LoginSlideView::new(
-                            ai_enabled,
-                            &theme_name,
-                            use_vertical_tabs,
-                            intention,
-                            LoginSlideSource::OnboardingFlow,
-                            ctx,
-                        )
-                    });
-                    ctx.subscribe_to_view(&login_slide_view, |me, _view, event, ctx| {
-                        me.handle_login_slide_event(event, ctx);
-                    });
-
-                    self.pending_post_auth_onboarding_settings = Some(selected_settings.clone());
-                    self.auth_onboarding_state = AuthOnboardingState::LoginSlide {
-                        login_slide_view,
-                        onboarding_view,
-                        target,
-                    };
-                    ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
-                    self.focus(ctx);
-                    ctx.notify();
-                    return;
-                }
+                // Finishing onboarding lands straight in the editor. There is
+                // deliberately no sign-in step here: upstream ended the flow by
+                // demanding a Warp login whenever the chosen settings enabled AI
+                // or Warp Drive -- which are the defaults -- so the last slide
+                // handed the user off to "Get started with AI" and then to a
+                // browser sign-in. Genesi Code has no account, and its AI is
+                // local (Ollama / Turbo) or bring-your-own-key.
 
                 apply_onboarding_settings(selected_settings, ctx);
 
