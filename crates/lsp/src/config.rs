@@ -7,10 +7,11 @@ use anyhow::Result;
 use command::r#async::Command;
 use lsp_types::{
     ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
-    DidChangeWatchedFilesClientCapabilities, GotoCapability, HoverClientCapabilities,
-    InitializeParams, MarkupKind, PublishDiagnosticsClientCapabilities,
-    TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri,
-    WindowClientCapabilities, WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceFolder,
+    CompletionItemCapabilityResolveSupport, DidChangeWatchedFilesClientCapabilities,
+    GotoCapability, HoverClientCapabilities, InitializeParams, MarkupKind,
+    PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
+    TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkDoneProgressParams,
+    WorkspaceClientCapabilities, WorkspaceFolder,
 };
 
 use crate::supported_servers::LSPServerType;
@@ -421,6 +422,18 @@ fn default_client_capabilities() -> ClientCapabilities {
                     snippet_support: Some(true),
                     insert_replace_support: Some(true),
                     documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                    // Servers withhold the expensive fields unless the client
+                    // says it will ask for them later, so both of these have to
+                    // be on for the popup to ever show documentation.
+                    label_details_support: Some(true),
+                    resolve_support: Some(CompletionItemCapabilityResolveSupport {
+                        properties: vec![
+                            "documentation".to_string(),
+                            "detail".to_string(),
+                            "labelDetails".to_string(),
+                            "additionalTextEdits".to_string(),
+                        ],
+                    }),
                     ..Default::default()
                 }),
                 context_support: Some(true),

@@ -275,7 +275,7 @@ pub enum CompletionTrigger {
 
 /// A single completion candidate returned from `textDocument/completion`,
 /// flattened from `lsp_types::CompletionItem` into the fields the editor needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionItem {
     /// The text shown in the completion list.
     pub label: String,
@@ -296,6 +296,42 @@ pub struct CompletionItem {
     pub sort_text: Option<String>,
     /// Text the client should match the typed prefix against; falls back to `label`.
     pub filter_text: Option<String>,
+    /// The signature fragment servers attach to the label itself (rust-analyzer
+    /// sends `(&self, x: u32)` here), shown dimmed straight after the label.
+    pub label_detail: Option<String>,
+    /// Where the item comes from (`std::vec`, `react/hooks`, ...), shown at the
+    /// far right of the row.
+    pub label_description: Option<String>,
+    /// The doc comment for the candidate, flattened to plain text. This is what
+    /// makes the popup explain what it is offering rather than just naming it.
+    pub documentation: Option<String>,
+    /// The untouched item as the server sent it. `completionItem/resolve` has to
+    /// be handed the original back (rust-analyzer keys off its `data` field), so
+    /// we keep it rather than trying to reconstruct one from the flattened
+    /// fields. Boxed because the list can hold hundreds of these.
+    pub raw: Box<lsp_types::CompletionItem>,
+}
+
+impl CompletionItem {
+    /// Fold a resolved item's extra content into this one. Servers answer
+    /// `completionItem/resolve` with the same item plus whatever they left out
+    /// of the list response -- for most servers that is exactly the
+    /// documentation and the detail line.
+    pub fn merge_resolved(&mut self, resolved: lsp_types::CompletionItem) {
+        if let Some(detail) = resolved.detail {
+            self.detail = Some(detail);
+        }
+        if let Some(documentation) = resolved.documentation {
+            self.documentation = Some(match documentation {
+                lsp_types::Documentation::String(text) => text,
+                lsp_types::Documentation::MarkupContent(markup) => markup.value,
+            });
+        }
+        if let Some(details) = resolved.label_details {
+            self.label_detail = details.detail.or(self.label_detail.take());
+            self.label_description = details.description.or(self.label_description.take());
+        }
+    }
 }
 
 /// The result of a `textDocument/completion` request.
@@ -311,6 +347,7 @@ pub struct CompletionList {
 
 impl From<lsp_types::CompletionItem> for CompletionItem {
     fn from(item: lsp_types::CompletionItem) -> Self {
+        let raw = Box::new(item.clone());
         // Prefer an explicit insert_text, then a text edit's new_text, then the
         // label.
         let insert_text = item
@@ -325,6 +362,15 @@ impl From<lsp_types::CompletionItem> for CompletionItem {
             })
             .unwrap_or_else(|| item.label.clone());
 
+        let documentation = item.documentation.map(|documentation| match documentation {
+            lsp_types::Documentation::String(text) => text,
+            lsp_types::Documentation::MarkupContent(markup) => markup.value,
+        });
+        let (label_detail, label_description) = match item.label_details {
+            Some(details) => (details.detail, details.description),
+            None => (None, None),
+        };
+
         Self {
             label: item.label,
             insert_text,
@@ -334,6 +380,10 @@ impl From<lsp_types::CompletionItem> for CompletionItem {
             kind: item.kind,
             sort_text: item.sort_text,
             filter_text: item.filter_text,
+            label_detail,
+            label_description,
+            documentation,
+            raw,
         }
     }
 }

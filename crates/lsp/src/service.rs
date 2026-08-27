@@ -186,6 +186,17 @@ impl LspService {
         &self.server_capabilities
     }
 
+    /// Whether the server announced it can answer `completionItem/resolve`.
+    /// Sending the request to a server that cannot is a guaranteed error reply,
+    /// and we would send one per keystroke.
+    pub fn supports_completion_resolve(&self) -> bool {
+        self.server_capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.completion_provider.as_ref())
+            .and_then(|provider| provider.resolve_provider)
+            .unwrap_or(false)
+    }
+
     pub fn log_to_server_log(&self, level: LspServerLogLevel, message: impl Into<String>) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -799,5 +810,36 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// Ask the server to fill in the parts of a candidate it left out of the
+    /// list response.
+    ///
+    /// Servers are allowed to answer `textDocument/completion` with just enough
+    /// to render a row and defer the expensive fields, and the ones people
+    /// actually use do exactly that: rust-analyzer and typescript-language-server
+    /// both send documentation only from here. Without this call the popup can
+    /// never explain a candidate, no matter what the client advertises.
+    pub async fn resolve_completion_item(
+        &self,
+        item: lsp_types::CompletionItem,
+    ) -> anyhow::Result<lsp_types::CompletionItem> {
+        if !self.service.supports_completion_resolve() {
+            anyhow::bail!("server does not support completionItem/resolve");
+        }
+
+        let result = self
+            .service
+            .send_request::<request::ResolveCompletionItem>(item)
+            .await;
+
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("completionItem/resolve failed: {e}"),
+            );
+        }
+
+        result
     }
 }

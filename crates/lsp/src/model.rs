@@ -746,6 +746,15 @@ impl LspServerModel {
                 .await
         })
     }
+
+    /// Fetch the deferred half of a completion candidate (documentation, detail).
+    pub fn resolve_completion_item(
+        &self,
+        item: lsp_types::CompletionItem,
+    ) -> Result<impl Future<Output = Result<lsp_types::CompletionItem>>> {
+        let service = self.service()?;
+        Ok(async move { service.text_document().resolve_completion_item(item).await })
+    }
 }
 
 impl Entity for LspServerModel {
