@@ -165,6 +165,17 @@ pub fn sanitize_completion(raw: &str) -> String {
         return String::new();
     }
 
+    // Cut at the first control token, whatever the server did with the stop
+    // list. `stop` is honoured by llama-server but not by the chat path, and an
+    // older build may not know a token this list carries -- either way what
+    // follows one is the model narrating its training format, not code, and it
+    // must not reach the buffer.
+    for token in COMPLETION_STOP_TOKENS {
+        if let Some(index) = text.find(token) {
+            text.truncate(index);
+        }
+    }
+
     text.trim_end().to_string()
 }
 
@@ -228,7 +239,44 @@ struct InfillRequest<'a> {
     /// the feature.
     temperature: f32,
     stream: bool,
+    stop: &'static [&'static str],
 }
+
+/// Where a completion has to stop.
+///
+/// Code models are trained on repository-level FIM, where files arrive one
+/// after another separated by control tokens:
+///
+/// ```text
+/// <|repo_name|>project
+/// <|file_sep|>src/main.rs
+/// fn main() {}
+/// <|file_sep|>src/lib.rs
+/// ```
+///
+/// Given a bare prefix and suffix, a model finishes the short completion and
+/// then keeps going into what its training says comes next -- a file separator
+/// and a path. That is why suggestions arrived as the word "filename" followed
+/// by a file name: not the model failing to understand the code, but nobody
+/// telling it where the answer ended.
+const COMPLETION_STOP_TOKENS: &[&str] = &[
+    "<|file_sep|>",
+    "<|repo_name|>",
+    "<|fim_prefix|>",
+    "<|fim_suffix|>",
+    "<|fim_middle|>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+    "<file_sep>",
+    "<fim_prefix>",
+    "<fim_suffix>",
+    "<fim_middle>",
+    // CodeLlama spells its own the long way round.
+    "<PRE>",
+    "<SUF>",
+    "<MID>",
+    "<EOT>",
+];
 
 #[derive(Deserialize)]
 struct InfillResponse {
@@ -255,6 +303,7 @@ pub async fn infill_completion(prefix: &str, suffix: &str) -> Option<String> {
         n_predict: COMPLETION_MAX_TOKENS,
         temperature: 0.1,
         stream: false,
+        stop: COMPLETION_STOP_TOKENS,
     };
 
     let client = http_client::Client::new();
