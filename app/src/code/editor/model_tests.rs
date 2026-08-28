@@ -1043,9 +1043,11 @@ fn test_enter_keeps_current_line_indentation() {
         );
         layout_model(&mut app, &editor).await;
 
-        // End of the indented line.
+        // End of the indented line. Buffer offsets are 1-indexed --
+        // `CharOffset::from(n)` sits before the nth char -- so the end of the
+        // buffer is one past the character count.
         let end = editor.read(&app, |editor, ctx| {
-            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
         });
         editor.update(&mut app, |editor, ctx| {
             editor.cursor_at(end, ctx);
@@ -1079,7 +1081,7 @@ fn test_enter_keeps_indentation_in_plain_text() {
         layout_model(&mut app, &editor).await;
 
         let end = editor.read(&app, |editor, ctx| {
-            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
         });
         editor.update(&mut app, |editor, ctx| {
             editor.cursor_at(end, ctx);
@@ -1103,10 +1105,11 @@ fn test_enter_between_brackets_expands_block() {
         let editor = mock_model(&mut app, "    fn f() {}", ContentVersion::new());
         layout_model(&mut app, &editor).await;
 
-        // Between `{` and `}`.
+        // Between `{` and `}` -- i.e. before the final `}`, which with
+        // 1-indexed offsets is the character count.
         let between = editor.read(&app, |editor, ctx| {
             let text = editor.content.as_ref(ctx).text();
-            CharOffset::from(text.as_str().chars().count() - 1)
+            CharOffset::from(text.as_str().chars().count())
         });
         editor.update(&mut app, |editor, ctx| {
             editor.cursor_at(between, ctx);
@@ -1215,7 +1218,7 @@ fn test_enter_never_dedents_below_the_current_line() {
         layout_model(&mut app, &editor).await;
 
         let end = editor.read(&app, |editor, ctx| {
-            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
         });
         editor.update(&mut app, |editor, ctx| {
             editor.cursor_at(end, ctx);

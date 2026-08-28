@@ -3218,10 +3218,6 @@ impl CodeEditorModel {
 
             let line_start = Point::new(position.row, 0).to_buffer_char_offset(buffer);
 
-            // The current indent level of the end selection position (used only by
-            // IndentMode::Enter).
-            let current_indent_num = buffer.indented_line_tab_stops(line_start).unwrap_or(0);
-
             // The literal leading whitespace of the reference line, kept verbatim
             // (tabs stay tabs). This is what we fall back on whenever the syntax
             // tree cannot answer, which is common: the tree is reparsed
@@ -3270,41 +3266,44 @@ impl CodeEditorModel {
             // `insert_before_cursor` is the indentation the new line starts with;
             // `closing_indent` is the indentation the trailing bracket or closing
             // tag gets when we expand `{|}` across three lines.
-            let (insert_before_cursor, closing_indent) = match (syntax_levels, &one_unit) {
-                (Some(mut levels), Some(unit)) if wrapped => {
-                    // Make sure we don't increase more than one from the current indent level of the line.
-                    levels = (levels + 1).min(current_indent_num as u8 + 1);
-                    (
-                        unit.repeat(levels.into()),
-                        unit.repeat(levels.saturating_sub(1).into()),
-                    )
-                }
-                (Some(levels), Some(unit)) => {
-                    // Continuing a line, so the floor is that line's own
-                    // indentation. The indent query can come back short -- it
-                    // resolves against a tree that lags the keystroke, and a
-                    // half-typed line often parses as an error node -- and
-                    // dedenting a continuation to the margin is never what the
-                    // typist meant. Growing past the line is fine, that is the
-                    // query reporting a block the caret just entered.
-                    let from_syntax = unit.repeat(levels.into());
-                    let indent = if indent_columns(&from_syntax) >= indent_columns(&existing_indent)
-                    {
-                        from_syntax
-                    } else {
-                        existing_indent.clone()
-                    };
-                    (indent.clone(), indent)
-                }
-                _ => {
-                    // No syntax answer: keep the line's own indentation, and add
-                    // one level when the caret sits inside a pair.
-                    let unit = one_unit.clone().unwrap_or_else(|| " ".repeat(4));
-                    let mut opened = existing_indent.clone();
-                    if wrapped {
-                        opened.push_str(&unit);
+            let (insert_before_cursor, closing_indent) = if wrapped {
+                // One step deeper than the line the pair sits on, with the closer
+                // back at that line's own indentation.
+                //
+                // This deliberately ignores the indent query. The query
+                // undercounts a pair opened on the current line -- the tree still
+                // sees `{}` as an empty block and reports the level outside it --
+                // so `    fn f() {|}` came back one step short and the body landed
+                // level with its own signature. Deriving both lines from text
+                // already on screen also means the same keystroke cannot produce
+                // different output depending on whether a reparse has landed yet.
+                let unit = one_unit.clone().unwrap_or_else(|| " ".repeat(4));
+                (format!("{existing_indent}{unit}"), existing_indent.clone())
+            } else {
+                match (syntax_levels, &one_unit) {
+                    (Some(levels), Some(unit)) => {
+                        // Continuing a line, so the floor is that line's own
+                        // indentation. The indent query can come back short -- it
+                        // resolves against a tree that lags the keystroke, and a
+                        // half-typed line often parses as an error node -- and
+                        // dedenting a continuation to the margin is never what the
+                        // typist meant. Growing past the line is fine, that is the
+                        // query reporting a block the caret just entered.
+                        let from_syntax = unit.repeat(levels.into());
+                        let indent =
+                            if indent_columns(&from_syntax) >= indent_columns(&existing_indent) {
+                                from_syntax
+                            } else {
+                                existing_indent.clone()
+                            };
+                        (indent.clone(), indent)
                     }
-                    (opened, existing_indent.clone())
+                    _ => {
+                        // No syntax answer -- an unparsed version, a language with no
+                        // indents query, or plain text. Keep the line's own
+                        // indentation.
+                        (existing_indent.clone(), existing_indent.clone())
+                    }
                 }
             };
 
