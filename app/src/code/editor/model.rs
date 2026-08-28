@@ -2042,6 +2042,28 @@ impl CodeEditorModel {
     }
 
     /// Whether the given range is wrapped in the supported bracket pairs of the active language.
+    /// Whether the caret sits between a markup tag and its closing partner, as
+    /// in `<div>|</div>`.
+    ///
+    /// Bracket pairs cannot express this: the characters either side of the
+    /// caret are `>` and `<`, which are not a pair, so HTML got a bare newline
+    /// where every other editor splits the element open. The `>` immediately
+    /// followed by `</` is specific enough to be safe -- no language puts those
+    /// two together with nothing in between unless a tag is being closed.
+    pub fn range_wrapped_in_tag(&self, range: Range<CharOffset>, ctx: &AppContext) -> bool {
+        if range.start == CharOffset::zero() {
+            return false;
+        }
+
+        let buffer = self.content.as_ref(ctx);
+        if buffer.char_at(range.start - 1) != Some('>') {
+            return false;
+        }
+
+        buffer.char_at(range.end) == Some('<')
+            && buffer.char_at(range.end + CharOffset::from(1)) == Some('/')
+    }
+
     pub fn range_wrapped_in_bracket(&self, range: Range<CharOffset>, ctx: &AppContext) -> bool {
         let Some(bracket_pairs) = self.syntax_tree.as_ref(ctx).bracket_pairs() else {
             return false;
@@ -3232,39 +3254,63 @@ impl CodeEditorModel {
             // This is relevant in cases like fn {|}, if the cursor is the | and
             // we want to create a higher level of indentation and extra newline
             // when we press enter.
-            let range_wrapped_in_bracket = self.range_wrapped_in_bracket(start..end, ctx);
+            // `<div>|</div>` splits the same way `{|}` does.
+            let wrapped = self.range_wrapped_in_bracket(start..end, ctx)
+                || self.range_wrapped_in_tag(start..end, ctx);
 
             let one_unit = indent_unit.map(|indent_unit| indent_unit.text_with_num_tab_stops(1));
+            let unit_width = indent_unit.map(|unit| unit.width()).unwrap_or(4).max(1);
+            let indent_columns = |indent: &str| -> usize {
+                indent
+                    .chars()
+                    .map(|c| if c == '\t' { unit_width } else { 1 })
+                    .sum()
+            };
 
             // `insert_before_cursor` is the indentation the new line starts with;
-            // `closing_indent` is the indentation the trailing bracket gets when
-            // we expand `{|}` across three lines.
+            // `closing_indent` is the indentation the trailing bracket or closing
+            // tag gets when we expand `{|}` across three lines.
             let (insert_before_cursor, closing_indent) = match (syntax_levels, &one_unit) {
-                (Some(mut levels), Some(unit)) => {
-                    if range_wrapped_in_bracket {
-                        // Make sure we don't increase more than one from the current indent level of the line.
-                        levels = (levels + 1).min(current_indent_num as u8 + 1);
-                    }
+                (Some(mut levels), Some(unit)) if wrapped => {
+                    // Make sure we don't increase more than one from the current indent level of the line.
+                    levels = (levels + 1).min(current_indent_num as u8 + 1);
                     (
                         unit.repeat(levels.into()),
                         unit.repeat(levels.saturating_sub(1).into()),
                     )
                 }
+                (Some(levels), Some(unit)) => {
+                    // Continuing a line, so the floor is that line's own
+                    // indentation. The indent query can come back short -- it
+                    // resolves against a tree that lags the keystroke, and a
+                    // half-typed line often parses as an error node -- and
+                    // dedenting a continuation to the margin is never what the
+                    // typist meant. Growing past the line is fine, that is the
+                    // query reporting a block the caret just entered.
+                    let from_syntax = unit.repeat(levels.into());
+                    let indent = if indent_columns(&from_syntax) >= indent_columns(&existing_indent)
+                    {
+                        from_syntax
+                    } else {
+                        existing_indent.clone()
+                    };
+                    (indent.clone(), indent)
+                }
                 _ => {
                     // No syntax answer: keep the line's own indentation, and add
-                    // one level when the caret sits between a bracket pair.
+                    // one level when the caret sits inside a pair.
                     let unit = one_unit.clone().unwrap_or_else(|| " ".repeat(4));
                     let mut opened = existing_indent.clone();
-                    if range_wrapped_in_bracket {
+                    if wrapped {
                         opened.push_str(&unit);
                     }
                     (opened, existing_indent.clone())
                 }
             };
 
-            let insert_after_cursor = range_wrapped_in_bracket.then(|| {
-                // If we are applying bracket expansion, we need to insert additional newline and indentation
-                // for the trailing bracket after the selection.
+            let insert_after_cursor = wrapped.then(|| {
+                // Expanding a pair needs a further newline and indentation for
+                // the closer that now follows the caret.
                 format!("\n{closing_indent}")
             });
 

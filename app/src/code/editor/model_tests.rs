@@ -1130,3 +1130,105 @@ fn test_enter_between_brackets_expands_block() {
         });
     })
 }
+
+/// `<div>|</div>` has to split the element open the way `{|}` splits a block.
+/// Bracket pairs cannot describe it -- the characters either side of the caret
+/// are `>` and `<` -- so HTML used to get a bare newline and the caret stayed
+/// glued to the closing tag.
+#[test]
+fn test_enter_between_tags_expands_element() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = app.add_model(|ctx| {
+            let styles = code_text_styles(Appearance::as_ref(ctx), FontSettings::as_ref(ctx), None);
+            let mut model = CodeEditorModel::new(styles, None, false, None, ctx);
+            let state = InitialBufferState::plain_text("<div></div>");
+            model.reset_content(state, ctx);
+            model.set_language_with_local_path(Path::new("/test.html"), ctx);
+            model
+        });
+        layout_model(&mut app, &editor).await;
+
+        // Between `>` and `<`.
+        let between = CharOffset::from("<div>".len() + 1);
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(between, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(lines.len(), 3, "expected three lines, got {text:?}");
+            assert_eq!(lines[0], "<div>");
+            assert_eq!(
+                lines[1], "  ",
+                "the caret line should carry one indent step, got {:?}",
+                lines[1]
+            );
+            assert_eq!(lines[2], "</div>");
+        });
+    })
+}
+
+/// HTML nests deep enough that four-space steps push content off the right
+/// edge, so the unit is two.
+#[test]
+fn test_html_indents_by_two_spaces() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = app.add_model(|ctx| {
+            let styles = code_text_styles(Appearance::as_ref(ctx), FontSettings::as_ref(ctx), None);
+            let mut model = CodeEditorModel::new(styles, None, false, None, ctx);
+            model.reset_content(InitialBufferState::plain_text("<p></p>"), ctx);
+            model.set_language_with_local_path(Path::new("/test.html"), ctx);
+            model
+        });
+        layout_model(&mut app, &editor).await;
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(CharOffset::from("<p>".len() + 1), ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(lines[1], "  ", "got {text:?}");
+        });
+    })
+}
+
+/// Continuing a line must never dedent below that line. The indent query
+/// resolves against a tree that lags the keystroke, and a half-typed line often
+/// parses as an error node, so it can report a level lower than the text on
+/// screen -- which used to drag the caret back toward the margin.
+#[test]
+fn test_enter_never_dedents_below_the_current_line() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(
+            &mut app,
+            "fn main() {\n    if x {\n        deeply_nested_call();",
+            ContentVersion::new(),
+        );
+        layout_model(&mut app, &editor).await;
+
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count())
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let last_line = text.as_str().lines().last().unwrap_or_default();
+            assert!(
+                last_line.len() >= 8,
+                "expected at least the 8 spaces the line above carries, got {last_line:?} in {text:?}"
+            );
+        });
+    })
+}

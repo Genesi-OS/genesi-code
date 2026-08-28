@@ -1,4 +1,13 @@
 display_name: "HTML"
+# Two spaces: markup nests deep (html > body > div > div > ...) and four-space
+# steps push real content off the right edge within a few levels. This is what
+# every web toolchain defaults to.
 indent_unit:
-  space: 4
-brackets: []
+  space: 2
+brackets:
+  - start: "{"
+    end: "}"
+  - start: "("
+    end: ")"
+  - start: "["
+    end: "]"
