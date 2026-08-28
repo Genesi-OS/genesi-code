@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ai::local_chat::{
     stream_chat, transport_for, ChatMessage, ChatStreamItem, LocalEndpoint,
 };
@@ -208,6 +210,87 @@ fn head(text: &str, budget: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// llama-server's fill-in-the-middle endpoint.
+///
+/// Not under `/v1`: `/infill` is llama.cpp's own API, not part of the
+/// OpenAI-compatible surface.
+pub const TURBO_INFILL_URL: &str = "http://localhost:11435/infill";
+
+#[derive(Serialize)]
+struct InfillRequest<'a> {
+    input_prefix: &'a str,
+    input_suffix: &'a str,
+    n_predict: u32,
+    /// Sampling is kept cold. A completion that guesses creatively is worse than
+    /// no completion: the user reads it, sees it is wrong, and stops trusting
+    /// the feature.
+    temperature: f32,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct InfillResponse {
+    #[serde(default)]
+    content: String,
+}
+
+/// Asks llama-server to fill the gap between `prefix` and `suffix`.
+///
+/// This is the endpoint that makes local completion work at all. Code models
+/// are trained with fill-in-the-middle tokens, and `/infill` wraps the request
+/// in whichever tokens the loaded GGUF declares. Asking the same model the same
+/// question through `/v1/chat/completions` instead gets a chat answer -- prose,
+/// apologies, a fenced block restating the function -- because that is the
+/// shape the chat template puts it in.
+///
+/// Returns `None` when the server has no FIM support for the loaded model, so
+/// the caller can fall back rather than showing an error for something the user
+/// never asked for.
+pub async fn infill_completion(prefix: &str, suffix: &str) -> Option<String> {
+    let body = InfillRequest {
+        input_prefix: prefix,
+        input_suffix: suffix,
+        n_predict: COMPLETION_MAX_TOKENS,
+        temperature: 0.1,
+        stream: false,
+    };
+
+    let client = http_client::Client::new();
+    let response = match client.post(TURBO_INFILL_URL).json(&body).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            log::debug!("inline completion: /infill unreachable: {err}");
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        // A model without FIM metadata answers 501 here. That is a fact about
+        // the model, not a failure worth surfacing.
+        log::debug!(
+            "inline completion: /infill returned {} - falling back",
+            response.status()
+        );
+        return None;
+    }
+
+    match response.json::<InfillResponse>().await {
+        Ok(parsed) => Some(parsed.content),
+        Err(err) => {
+            log::debug!("inline completion: could not read /infill reply: {err}");
+            None
+        }
+    }
+}
+
+/// Splits `text` at `offset` into the prefix and suffix `/infill` expects,
+/// trimmed to the same budgets the chat path uses.
+pub fn infill_context(text: &str, offset: usize) -> (&str, &str) {
+    let offset = offset.min(text.len());
+    let (before, after) = text.split_at(offset);
+    (tail(before, PREFIX_BUDGET_CHARS), head(after, SUFFIX_BUDGET_CHARS))
 }
 
 #[cfg(test)]

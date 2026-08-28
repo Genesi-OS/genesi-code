@@ -125,3 +125,30 @@ fn the_cursor_may_sit_at_the_very_end_of_the_buffer() {
     let messages = build_completion_messages(text, text.len(), None);
     assert!(messages[1].content.ends_with("<CURSOR>"));
 }
+
+#[test]
+fn infill_splits_the_buffer_at_the_cursor() {
+    // `/infill` takes the two sides separately rather than a marked-up string,
+    // so the split has to land exactly on the cursor.
+    let (prefix, suffix) = infill_context("let x = 1;\nlet y = ", 11);
+    assert_eq!(prefix, "let x = 1;\n");
+    assert_eq!(suffix, "let y = ");
+}
+
+#[test]
+fn infill_context_survives_multi_byte_text() {
+    // Same hazard as the chat path: the budgets are byte counts, and a cut
+    // inside a multi-byte character panics.
+    let text = format!("{}fn ", "á".repeat(4000));
+    let (prefix, suffix) = infill_context(&text, text.len());
+    assert!(prefix.ends_with("fn "));
+    assert!(suffix.is_empty());
+}
+
+#[test]
+fn infill_context_handles_a_cursor_past_the_end() {
+    // Defensive: an offset from a stale buffer read must clamp, not panic.
+    let (prefix, suffix) = infill_context("abc", 99);
+    assert_eq!(prefix, "abc");
+    assert_eq!(suffix, "");
+}

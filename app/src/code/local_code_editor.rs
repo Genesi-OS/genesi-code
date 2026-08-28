@@ -71,8 +71,8 @@ use crate::ai::local_chat::{list_models, read_ai_mode_state, ChatStreamItem, Loc
 use crate::ai::persisted_workspace::{LSPInstallationStatus, LspRepoStatus};
 use crate::ai::persisted_workspace::{PersistedWorkspace, PersistedWorkspaceEvent};
 use crate::code::ai_completion::{
-    build_completion_messages, completion_stream, sanitize_completion, InlineCompletionState,
-    InlineSuggestion, COMPLETION_DEBOUNCE,
+    build_completion_messages, completion_stream, infill_completion, infill_context,
+    sanitize_completion, InlineCompletionState, InlineSuggestion, COMPLETION_DEBOUNCE,
 };
 use crate::code::buffer_location::LocalOrRemotePath as BufferFileLocation;
 use crate::code::editor::model::HoverableLink;
@@ -832,6 +832,10 @@ impl LocalCodeEditorView {
             .map(|id| format!("{id:?}"));
 
         let messages = build_completion_messages(&text, byte_offset, language.as_deref());
+        let (prefix, suffix) = {
+            let (prefix, suffix) = infill_context(&text, byte_offset);
+            (prefix.to_string(), suffix.to_string())
+        };
 
         ctx.spawn(
             async move {
@@ -853,6 +857,19 @@ impl LocalCodeEditorView {
                 } else {
                     configured_model
                 };
+
+                // Fill-in-the-middle first, when the backend can do it. A code
+                // model asked to complete through the chat endpoint answers like
+                // a chat: prose, apologies, a fenced block restating the
+                // function. `/infill` wraps the request in the FIM tokens the
+                // loaded GGUF declares -- the shape the model was trained on --
+                // and that is the difference between a completion that continues
+                // the line and one that talks about it.
+                if endpoint == LocalEndpoint::Turbo {
+                    if let Some(filled) = infill_completion(&prefix, &suffix).await {
+                        return sanitize_completion(&filled);
+                    }
+                }
 
                 let mut stream = completion_stream(&model, endpoint, messages);
                 let mut answer = String::new();
