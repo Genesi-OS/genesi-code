@@ -32,9 +32,9 @@ use warpify_page::WarpifyPageAction;
 use warpui::elements::{
     Align, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
     ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty,
-    EventHandler, Expanded, Fill, Flex, MainAxisSize, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack,
-    Text,
+    EventHandler, Expanded, Fill, Flex, Hoverable, MainAxisSize, MouseStateHandle,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition,
+    ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::keymap::{ContextPredicate, EnabledPredicate, FixedBinding};
@@ -54,7 +54,6 @@ use crate::menu::{self, Menu, MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view;
 use crate::pane_group::{BackingView, Direction, PaneConfiguration, PaneEvent, SplitPaneState};
-use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::MCPServerCollectionPaneEntrypoint;
 use crate::settings::{AISettings, BlockVisibilitySettings, SettingsFileError};
 use crate::settings_view::mcp_servers_page::{MCPServersSettingsPage, MCPServersSettingsPageEvent};
@@ -1107,6 +1106,9 @@ pub struct SettingsView {
     /// per `SettingsView` per `WARP.md`'s guidance that inline
     /// `MouseStateHandle::default()` breaks hover/click tracking.
     footer_mouse_states: SettingsFooterMouseStates,
+    /// Hover state for the close button. Same reason as the footer states
+    /// above: an inline default would reset every frame and never register.
+    close_button_state: MouseStateHandle,
 }
 
 impl SettingsView {
@@ -1312,6 +1314,7 @@ impl SettingsView {
             settings_file_error: None,
             settings_error_banner_dismissed: false,
             footer_mouse_states: SettingsFooterMouseStates::default(),
+            close_button_state: MouseStateHandle::default(),
         }
     }
 
@@ -2183,6 +2186,52 @@ impl SettingsView {
         }
     }
 
+    /// The close button in the top-right corner.
+    ///
+    /// Settings had no visible way out at all: it closes on the pane shortcut
+    /// or through the right-click menu, neither of which the panel advertises,
+    /// so the only discoverable exit was to go looking for one. Every panel
+    /// that opens over the workspace needs an X where people reach for it.
+    fn render_close_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme().clone();
+
+        Container::new(
+            EventHandler::new(
+                Hoverable::new(self.close_button_state.clone(), move |mouse_state| {
+                    let hovered = mouse_state.is_hovered();
+                    let icon_color = if hovered {
+                        theme.active_ui_text_color()
+                    } else {
+                        theme.nonactive_ui_text_color()
+                    };
+
+                    let button = Container::new(
+                        ConstrainedBox::new(icons::Icon::X.to_warpui_icon(icon_color).finish())
+                            .with_width(12.)
+                            .with_height(12.)
+                            .finish(),
+                    )
+                    .with_uniform_padding(7.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
+
+                    if hovered {
+                        button.with_background(theme.surface_2()).finish()
+                    } else {
+                        button.finish()
+                    }
+                })
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _, _| {
+                ctx.dispatch_typed_action(SettingsAction::Close);
+                DispatchEventResult::StopPropagation
+            })
+            .finish(),
+        )
+        .with_uniform_margin(8.)
+        .finish()
+    }
+
     fn render_search_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
         Container::new(
             Flex::row()
@@ -2448,6 +2497,16 @@ impl View for SettingsView {
                 DispatchEventResult::StopPropagation
             })
             .finish(),
+        );
+
+        stack.add_positioned_overlay_child(
+            self.render_close_button(appearance),
+            OffsetPositioning::offset_from_parent(
+                pathfinder_geometry::vector::vec2f(0., 0.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::TopRight,
+                ChildAnchor::TopRight,
+            ),
         );
 
         if let Some(position) = &self.context_menu_state {
