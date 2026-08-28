@@ -42,22 +42,20 @@ use warpui::{
 };
 use warpui_extras::secure_storage::AppContextExt as _;
 
+use super::api_probe::{
+    build_url, method_takes_body, scan_ports, send_request, survey_project, ProbePort,
+    ProbeRequest, ProbeResponse, ProbeRoute, ProbeSurvey, PROBE_METHODS,
+};
+use super::lenses::{architecture, performance, ArchitectureLens, PerformanceLens, Severity};
 use super::local_agent::{self, AgentTool, MAX_AGENT_STEPS};
 use super::local_chat::{
-    cloud_presets, ensure_turbo_serving, is_gguf_ref, list_gguf_models, list_models,
-    load_cloud_config, load_legacy_cloud_key, read_ai_mode_state, save_cloud_config,
-    estimate_tokens, is_tools_unsupported_error, model_supports_vision, reply_budget,
-    set_ai_mode_force, stream_chat, stream_chat_cloud, transport_for, turbo_context_size,
-    turbo_health_ok, AiModeState, AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem,
-    CloudConfig, CloudKeyStore, CloudProviderKind, CodeContext, LocalEndpoint,
-    ASSUMED_CONTEXT_TOKENS, CLOUD_KEYS_STORAGE_KEY, DEFAULT_LOCAL_BASE_URL, LOCAL_MAX_TOKENS,
-};
-use super::api_probe::{
-    build_url, method_takes_body, scan_ports, send_request, survey_project, ProbePort, ProbeRequest,
-    ProbeResponse, ProbeRoute, ProbeSurvey, PROBE_METHODS,
-};
-use super::lenses::{
-    architecture, performance, ArchitectureLens, PerformanceLens, Severity,
+    cloud_presets, ensure_turbo_serving, estimate_tokens, is_gguf_ref, is_tools_unsupported_error,
+    list_gguf_models, list_models, load_cloud_config, load_legacy_cloud_key, model_supports_vision,
+    read_ai_mode_state, reply_budget, save_cloud_config, set_ai_mode_force, stream_chat,
+    stream_chat_cloud, transport_for, turbo_context_size, turbo_health_ok, AiModeState,
+    AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore,
+    CloudProviderKind, CodeContext, LocalEndpoint, ASSUMED_CONTEXT_TOKENS, CLOUD_KEYS_STORAGE_KEY,
+    DEFAULT_LOCAL_BASE_URL, LOCAL_MAX_TOKENS,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -68,8 +66,8 @@ use super::project_canvas_view::{
 };
 use crate::appearance::Appearance;
 use crate::code::file_tree::FileTreeView;
-use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions};
 use crate::code::local_code_editor::LocalCodeEditorView;
+use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions};
 use crate::settings_view::SettingsSection;
 use crate::util::bindings::CustomAction;
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
@@ -648,6 +646,10 @@ pub enum LocalAiChatAction {
     NewChat,
     /// Submit whatever is currently typed into the compose input.
     SubmitPromptInput,
+    /// Drop a starter prompt into the compose box and focus it. The zero-state
+    /// cards are the only thing on screen before a conversation exists, so they
+    /// may as well start one instead of describing that one could be started.
+    StartPrompt(&'static str),
     ToggleSoundscape,
     CycleSoundscape,
     ToggleKeyboardAsmr,
@@ -1618,7 +1620,10 @@ impl LocalAiChatView {
         // Only THIS model blocks: a load left running for a model the user has
         // since switched away from must not hold the send button hostage.
         if self.preparing_model.as_deref() == Some(model.as_str()) {
-            self.error = Some(format!("{} is still loading — give it a moment.", self.model_label(&model)));
+            self.error = Some(format!(
+                "{} is still loading — give it a moment.",
+                self.model_label(&model)
+            ));
             ctx.notify();
             return;
         }
@@ -1645,7 +1650,11 @@ impl LocalAiChatView {
         // transcript keeps the record of what went with the message.
         let attachments = std::mem::take(&mut self.attachments);
         let context_label = {
-            let mut parts: Vec<String> = context.as_ref().map(CodeContext::label).into_iter().collect();
+            let mut parts: Vec<String> = context
+                .as_ref()
+                .map(CodeContext::label)
+                .into_iter()
+                .collect();
             parts.extend(attachments.iter().map(|a| a.name.clone()));
             (!parts.is_empty()).then(|| parts.join(" · "))
         };
@@ -1678,17 +1687,18 @@ impl LocalAiChatView {
                         request.push(message);
                     }
                 }
-                AttachmentKind::Image => match can_see.then(|| attachment.as_chat_image()).flatten()
-                {
-                    Some(image) => images.push(image),
-                    // Silently dropping it would look like the model ignored the
-                    // picture. Tell the model it exists so it can say so.
-                    None => request.push(ChatMessage::system(format!(
-                        "The user attached the image `{}`, but this model cannot read \
+                AttachmentKind::Image => {
+                    match can_see.then(|| attachment.as_chat_image()).flatten() {
+                        Some(image) => images.push(image),
+                        // Silently dropping it would look like the model ignored the
+                        // picture. Tell the model it exists so it can say so.
+                        None => request.push(ChatMessage::system(format!(
+                            "The user attached the image `{}`, but this model cannot read \
                          images, so its contents are not available. Say so if it matters.",
-                        attachment.name
-                    ))),
-                },
+                            attachment.name
+                        ))),
+                    }
+                }
             }
         }
         let last_user_index = self
@@ -4130,7 +4140,8 @@ impl LocalAiChatView {
             Some(port) => (colors.green.into(), format!("Target:  {}", port.base_url())),
             None => (
                 colors.yellow.into(),
-                "No listening port found — start the server, or send to any URL by hand".to_string(),
+                "No listening port found — start the server, or send to any URL by hand"
+                    .to_string(),
             ),
         };
         let stacks = if survey.stacks.is_empty() {
@@ -4219,8 +4230,7 @@ impl LocalAiChatView {
             list.add_child(
                 Container::new(self.label_text(
                     appearance,
-                    "No endpoints found in source. Type a URL above and send anyway."
-                        .to_string(),
+                    "No endpoints found in source. Type a URL above and send anyway.".to_string(),
                     11.,
                     muted,
                     true,
@@ -4240,11 +4250,7 @@ impl LocalAiChatView {
                     .with_child(
                         Expanded::new(
                             1.,
-                            self.render_probe_section_label(
-                                appearance,
-                                "HISTORY".to_string(),
-                                16.,
-                            ),
+                            self.render_probe_section_label(appearance, "HISTORY".to_string(), 16.),
                         )
                         .finish(),
                     )
@@ -4265,7 +4271,9 @@ impl LocalAiChatView {
         Container::new(
             ClippedScrollable::vertical(
                 self.probe_sidebar_scroll.clone(),
-                Container::new(list.finish()).with_uniform_padding(10.).finish(),
+                Container::new(list.finish())
+                    .with_uniform_padding(10.)
+                    .finish(),
                 ScrollbarWidth::Auto,
                 theme.disabled_ui_text_color().into(),
                 theme.active_ui_text_color().into(),
@@ -4427,13 +4435,18 @@ impl LocalAiChatView {
         let theme = appearance.theme();
         let colors = &theme.terminal_colors().normal;
         let (status_color, status_label): (ColorU, String) = match entry.status {
-            Some(status) if (200..300).contains(&status) => {
-                (colors.green.into(), format!("{status} · {} ms", entry.elapsed_ms))
-            }
-            Some(status) if (300..400).contains(&status) => {
-                (colors.yellow.into(), format!("{status} · {} ms", entry.elapsed_ms))
-            }
-            Some(status) => (colors.red.into(), format!("{status} · {} ms", entry.elapsed_ms)),
+            Some(status) if (200..300).contains(&status) => (
+                colors.green.into(),
+                format!("{status} · {} ms", entry.elapsed_ms),
+            ),
+            Some(status) if (300..400).contains(&status) => (
+                colors.yellow.into(),
+                format!("{status} · {} ms", entry.elapsed_ms),
+            ),
+            Some(status) => (
+                colors.red.into(),
+                format!("{status} · {} ms", entry.elapsed_ms),
+            ),
             None => (colors.red.into(), "no response".to_string()),
         };
 
@@ -4499,11 +4512,7 @@ impl LocalAiChatView {
         }
     }
 
-    fn render_probe_method_badge(
-        &self,
-        appearance: &Appearance,
-        method: &str,
-    ) -> Box<dyn Element> {
+    fn render_probe_method_badge(&self, appearance: &Appearance, method: &str) -> Box<dyn Element> {
         let theme = appearance.theme();
         let accent = self.probe_method_color(appearance, method);
         ConstrainedBox::new(
@@ -4752,11 +4761,8 @@ impl LocalAiChatView {
                     )
                     .finish(),
                 );
-                let mut summary = format!(
-                    "{} ms  ·  {}",
-                    response.elapsed_ms,
-                    response.size_label()
-                );
+                let mut summary =
+                    format!("{} ms  ·  {}", response.elapsed_ms, response.size_label());
                 if response.truncated {
                     summary.push_str("  ·  body truncated for display");
                 }
@@ -5772,7 +5778,10 @@ impl LocalAiChatView {
     /// the whole point of having the port list next to the request.
     pub fn select_probe_port(&mut self, port: u16, ctx: &mut ViewContext<Self>) {
         let current = self.probe_field_text(&self.probe_url, ctx);
-        let url = build_url(&format!("http://127.0.0.1:{port}"), &probe_path_of(&current));
+        let url = build_url(
+            &format!("http://127.0.0.1:{port}"),
+            &probe_path_of(&current),
+        );
         self.seed_probe_url(&url, ctx);
         ctx.notify();
     }
@@ -7044,11 +7053,7 @@ impl LocalAiChatView {
             let selected = mode == current;
             list.add_child(self.picker_row(
                 appearance,
-                format!(
-                    "{}{}",
-                    if selected { "●  " } else { "○  " },
-                    mode.label()
-                ),
+                format!("{}{}", if selected { "●  " } else { "○  " }, mode.label()),
                 LocalAiChatAction::SetChatMode(mode),
                 selected,
             ));
@@ -7538,8 +7543,9 @@ impl LocalAiChatView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.label_text(appearance, label, BODY_FONT_SIZE, text_color, false));
-        heading
-            .add_child(Shrinkable::new(1., Container::new(Empty::new().finish()).finish()).finish());
+        heading.add_child(
+            Shrinkable::new(1., Container::new(Empty::new().finish()).finish()).finish(),
+        );
         heading.add_child(self.label_text(
             appearance,
             if on { "On" } else { "Off" },
@@ -8213,10 +8219,7 @@ impl LocalAiChatView {
         }
         // Trailing thoughts with no tool after them read as the model's closing
         // reasoning; leave them out of the group.
-        while end > start
-            && steps > 0
-            && self.messages[end - 1].role == ChatRole::Thought
-        {
+        while end > start && steps > 0 && self.messages[end - 1].role == ChatRole::Thought {
             end -= 1;
         }
         (steps >= 2).then_some((end, steps))
@@ -8263,7 +8266,10 @@ impl LocalAiChatView {
             ));
         }
         if writes > 0 {
-            parts.push(format!("Edited {writes} {}", plural(writes, "file", "files")));
+            parts.push(format!(
+                "Edited {writes} {}",
+                plural(writes, "file", "files")
+            ));
         }
         if reads > 0 {
             parts.push(format!("Read {reads} {}", plural(reads, "file", "files")));
@@ -8333,31 +8339,43 @@ impl LocalAiChatView {
     /// The three capability tiles under the vibe-mode hero. Informational only —
     /// they describe what this assistant actually does here, so nothing is
     /// promised that the panel can't deliver.
+    /// The zero-state cards.
+    ///
+    /// Each is a way in, not a brochure entry: clicking one seeds the compose
+    /// box with the prompt underneath it. The footer line names the surface the
+    /// card leans on, so the card says what it will actually do.
     fn render_vibe_capability_cards(&self, appearance: &Appearance) -> Box<dyn Element> {
-        const CARDS: [(&str, &str, &str); 3] = [
+        const CARDS: [(&str, &str, &str, &str, &str); 3] = [
             (
                 "bundled/svg/search.svg",
-                "Understands the project",
+                "Understand this project",
                 "Reads files on demand and explains how they fit together.",
+                "Explain how this project is structured and where the entry points are.",
+                "Reads your files",
             ),
             (
                 "bundled/svg/agentmode.svg",
-                "Writes and edits",
+                "Write and edit",
                 "Proposes changes as a diff you review before anything lands.",
+                "Find the rough edges in the file I have open and propose fixes.",
+                "Diff before it lands",
             ),
             (
                 "bundled/svg/lightning-02.svg",
                 "Runs on your machine",
                 "Local models by default - no account and no cloud required.",
+                "Which of my local models is the best fit for this codebase?",
+                "Local models",
             ),
         ];
 
         let theme = appearance.theme();
         let title_color: ColorU = theme.active_ui_text_color().into();
         let body_color: ColorU = theme.disabled_text_color(theme.background()).into();
+        let footer_color: ColorU = theme.nonactive_ui_text_color().into();
 
         let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        for (index, (icon, title, body)) in CARDS.iter().enumerate() {
+        for (index, (icon, title, body, prompt, footer)) in CARDS.iter().enumerate() {
             let card = Container::new(
                 Flex::column()
                     .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -8389,6 +8407,17 @@ impl LocalAiChatView {
                         .with_margin_top(4.)
                         .finish(),
                     )
+                    .with_child(
+                        Container::new(self.label_text(
+                            appearance,
+                            (*footer).to_string(),
+                            CHIP_FONT_SIZE - 1.,
+                            footer_color,
+                            false,
+                        ))
+                        .with_margin_top(14.)
+                        .finish(),
+                    )
                     .finish(),
             )
             .with_uniform_padding(14.)
@@ -8397,8 +8426,65 @@ impl LocalAiChatView {
             .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
             .with_margin_right(if index + 1 < CARDS.len() { 10. } else { 0. })
             .finish();
-            row.add_child(Expanded::new(1., card).finish());
+
+            let clickable = EventHandler::new(card)
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(LocalAiChatAction::StartPrompt(prompt));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+            row.add_child(Expanded::new(1., clickable).finish());
         }
+        row.finish()
+    }
+
+    /// The quick row under the cards: the handful of things people reach for
+    /// before they have typed anything.
+    fn render_vibe_quick_actions(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let mut row = Flex::row()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center);
+
+        for (label, icon, action) in [
+            (
+                "Review my changes",
+                "bundled/svg/git-branch-02.svg",
+                LocalAiChatAction::StartPrompt(
+                    "Review the changes I have not committed yet and tell me what looks wrong.",
+                ),
+            ),
+            (
+                "Write a test",
+                "bundled/svg/check.svg",
+                LocalAiChatAction::StartPrompt(
+                    "Write a test for the code I have open, covering the cases it gets wrong.",
+                ),
+            ),
+            (
+                "Attach a file",
+                "bundled/svg/paperclip.svg",
+                LocalAiChatAction::PickAttachments,
+            ),
+            (
+                "Models",
+                "bundled/svg/layers-three-01.svg",
+                LocalAiChatAction::ToggleModelPicker,
+            ),
+        ] {
+            row.add_child(
+                Container::new(self.chip_with_icon(
+                    appearance,
+                    label.to_string(),
+                    Some(icon),
+                    action,
+                    false,
+                    true,
+                ))
+                .with_margin_right(8.)
+                .finish(),
+            );
+        }
+
         row.finish()
     }
 
@@ -8413,16 +8499,25 @@ impl LocalAiChatView {
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(
                         Container::new(
-                            ConstrainedBox::new(
-                                Icon::new("bundled/svg/sparkle.svg", genesi_green()).finish(),
+                            Container::new(
+                                ConstrainedBox::new(
+                                    Icon::new("bundled/svg/sparkle.svg", genesi_green()).finish(),
+                                )
+                                .with_width(34.)
+                                .with_height(34.)
+                                .finish(),
                             )
-                            .with_width(34.)
-                            .with_height(34.)
+                            .with_uniform_padding(14.)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                            .with_background_color(ColorU::new(15, 143, 106, 46))
+                            .with_border(
+                                Border::all(1.).with_border_color(ColorU::new(15, 143, 106, 90)),
+                            )
                             .finish(),
                         )
-                        .with_uniform_padding(14.)
+                        .with_uniform_padding(7.)
                         .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
-                        .with_background_color(ColorU::new(15, 143, 106, 36))
+                        .with_background_color(ColorU::new(15, 143, 106, 18))
                         .finish(),
                     )
                     .with_child(
@@ -8453,6 +8548,11 @@ impl LocalAiChatView {
                     .with_child(
                         Container::new(self.render_vibe_capability_cards(appearance))
                             .with_margin_top(26.)
+                            .finish(),
+                    )
+                    .with_child(
+                        Container::new(self.render_vibe_quick_actions(appearance))
+                            .with_margin_top(16.)
                             .finish(),
                     )
                     .finish();
@@ -8590,6 +8690,14 @@ impl TypedActionView for LocalAiChatView {
             }
             LocalAiChatAction::FocusTranscript => {
                 ctx.focus_self();
+            }
+            LocalAiChatAction::StartPrompt(prompt) => {
+                let prompt = *prompt;
+                self.input.update(ctx, |input, ctx| {
+                    input.insert_pasted_text(prompt, ctx);
+                });
+                ctx.focus(&self.input);
+                ctx.notify();
             }
             LocalAiChatAction::CycleEndpoint => {
                 self.load_cloud_keys(ctx);
@@ -9284,7 +9392,8 @@ impl View for LocalAiChatView {
         // The prompt field spans the full width on its own line, and every
         // control — including send — sits on the row beneath it, so the send
         // affordance lands in the box's bottom-right corner like the reference.
-        let mut compose_inner = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        let mut compose_inner =
+            Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         // Reference chips sit above the prompt, where the user can see what the
         // next message carries before sending it.
         if let Some(attachments) = self.render_attachment_row(appearance) {
