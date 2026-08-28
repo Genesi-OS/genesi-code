@@ -935,18 +935,36 @@ impl LocalCodeEditorView {
         .with_color(internal_colors::text_disabled(theme, theme.background()))
         .finish();
 
-        // At end-of-line the cursor offset has no glyph box, which is exactly
-        // where completions usually land -- fall back to the character before it
-        // and start from that glyph's right edge.
-        let bounds = editor
+        // Where the ghost starts is the cursor's left edge, and which edge of
+        // which glyph that is depends on where the cursor sits.
+        //
+        // Mid-line the cursor has a glyph box of its own -- the character it is
+        // in front of -- and the text begins at that box's LEFT edge. Taking the
+        // right edge instead drew every suggestion one character too far along,
+        // which is what made the placement look subtly wrong.
+        //
+        // At end-of-line there is no glyph under the cursor, and that is exactly
+        // where completions usually land, so fall back to the character before
+        // it -- and there the cursor really is at that glyph's right edge.
+        let start_x = match editor.character_bounds_in_viewport(cursor, app) {
+            Some(bounds) => bounds.origin_x(),
+            None => {
+                let previous = cursor.saturating_sub(&CharOffset::from(1));
+                editor
+                    .character_bounds_in_viewport(previous, app)
+                    .map(|bounds| bounds.max_x())?
+            }
+        };
+        let line_top = editor
             .character_bounds_in_viewport(cursor, app)
             .or_else(|| {
                 let previous = cursor.saturating_sub(&CharOffset::from(1));
                 editor.character_bounds_in_viewport(previous, app)
-            })?;
+            })
+            .map(|bounds| bounds.origin_y())?;
 
         let positioning = OffsetPositioning::offset_from_parent(
-            Vector2F::new(bounds.max_x(), bounds.origin_y()),
+            Vector2F::new(start_x, line_top),
             ParentOffsetBounds::ParentByPosition,
             ParentAnchor::TopLeft,
             ChildAnchor::TopLeft,

@@ -2005,22 +2005,54 @@ impl CodeFooterView {
         ));
         column.add_child(Self::render_menu_separator(appearance));
 
+        // Spell out what switching this on will actually do, using the settings
+        // below rather than a fixed sentence. Turning completions on quietly
+        // routed everything through Turbo and speculative decoding, and nothing
+        // on screen said so -- the user had to infer it from the toggles under
+        // it, or not notice at all.
+        let consequence = {
+            let backend = if use_turbo { "Turbo" } else { "Ollama" };
+            let model = if chosen_model.is_empty() {
+                "the model already loaded".to_string()
+            } else {
+                chosen_model.clone()
+            };
+            let spec_note = if use_turbo && spec {
+                ", speculative decoding on"
+            } else {
+                ""
+            };
+            if enabled {
+                format!("Completing through {backend} with {model}{spec_note}")
+            } else {
+                format!("Will complete through {backend} with {model}{spec_note}")
+            }
+        };
+
         let mut rows: Vec<(String, String, bool, CodeFooterViewAction)> = vec![
             (
                 "Suggest as I type".to_string(),
-                "Grey text after the cursor; Tab accepts".to_string(),
+                consequence,
                 enabled,
                 CodeFooterViewAction::ToggleAiCompletion,
             ),
             (
                 "Use Turbo".to_string(),
-                "llama-server answers short completions faster than Ollama".to_string(),
+                if state.turbo_up {
+                    "llama-server answers short completions faster than Ollama".to_string()
+                } else {
+                    "Not running - completions will fall back to Ollama".to_string()
+                },
                 use_turbo,
                 CodeFooterViewAction::ToggleAiTurbo,
             ),
             (
                 "Speculative decoding".to_string(),
-                "Faster, and completions are short enough to take the trade".to_string(),
+                if use_turbo {
+                    "Faster, and completions are short enough to take the trade".to_string()
+                } else {
+                    "Turbo only - has no effect while Ollama answers".to_string()
+                },
                 spec,
                 CodeFooterViewAction::ToggleAiSpeculativeDecoding,
             ),
@@ -2036,8 +2068,8 @@ impl CodeFooterView {
         // default for a reason: it reuses the model already resident instead of
         // loading a second one behind it.
         rows.push((
-            "Model: follow the AI panel".to_string(),
-            "Reuses whatever is already loaded".to_string(),
+            "Model: whatever is already loaded".to_string(),
+            "Reuses the running model instead of loading a second one".to_string(),
             chosen_model.is_empty(),
             CodeFooterViewAction::SelectAiModel(String::new()),
         ));
