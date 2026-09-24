@@ -62,7 +62,7 @@ use crate::settings::{
     FontSettingsChangedEvent, GPUSettings, InputBoxType, InputModeSettings, InputModeState,
     InputSettings, InputSettingsChangedEvent, MonospaceFontName, PaneSettings,
     ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes,
-    DEFAULT_MONOSPACE_FONT_NAME,
+    DEFAULT_MONOSPACE_FONT_NAME, MAX_UI_SCALE, MIN_UI_SCALE,
 };
 use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::blockgrid_element::BlockGridElement;
@@ -490,6 +490,8 @@ pub enum AppearancePageAction {
     SetLineHeight,
     SetOpacity(f32),
     SetBlur(f32),
+    UiScaleDragged(f32),
+    SetUiScale(f32),
     OpacitySliderDragged(f32),
     BlurSliderDragged(f32),
     SetFontFamily(String),
@@ -650,6 +652,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             SetInputType(input_type) => self.set_input_type(*input_type, ctx),
             SetAppIcon(new_icon) => self.set_app_icon(*new_icon, ctx),
             SetCursorType(cursor_display_type) => self.set_cursor_type(*cursor_display_type, ctx),
+            UiScaleDragged(val) | SetUiScale(val) => self.set_ui_scale(*val, ctx),
             OpacitySliderDragged(val) => self.set_opacity(*val, false, ctx),
             BlurSliderDragged(val) => self.set_blur(*val, false, ctx),
             OpenUrl(url) => {
@@ -1336,6 +1339,11 @@ impl AppearanceSettingsPageView {
             ));
         }
 
+        categories.push(Category::new(
+            "Size",
+            vec![Box::new(UiScaleWidget::default())],
+        ));
+
         let window_settings = WindowSettings::as_ref(ctx);
         let mut window_settings_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![];
         if window_settings
@@ -1825,6 +1833,13 @@ impl AppearanceSettingsPageView {
                 });
             }
         }
+    }
+
+    fn set_ui_scale(&mut self, scale: f32, ctx: &mut ViewContext<Self>) {
+        let scale = scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+            report_if_error!(font_settings.ui_scale.set_value(scale, ctx));
+        });
     }
 
     fn set_opacity(
@@ -3091,6 +3106,61 @@ impl SettingsWidget for CustomWindowSizeWidget {
             );
         }
         column.finish()
+    }
+}
+
+/// A single control for how large the interface is drawn.
+///
+/// The alternative was a font-size box per surface, which is how you end up
+/// with large text inside boxes built for small text. One multiplier moves the
+/// whole scale together.
+#[derive(Default)]
+struct UiScaleWidget {
+    slider_state: SliderStateHandle,
+}
+
+impl SettingsWidget for UiScaleWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "ui scale size zoom interface text bigger smaller"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let scale = *FontSettings::as_ref(app).ui_scale.value();
+        Flex::column()
+            .with_child(render_body_item::<AppearancePageAction>(
+                format!("Interface size: {}%", (scale * 100.).round() as i32),
+                None,
+                LocalOnlyIconState::Hidden,
+                ToggleState::Enabled,
+                appearance,
+                appearance
+                    .ui_builder()
+                    .slider(self.slider_state.clone())
+                    .with_range(MIN_UI_SCALE..MAX_UI_SCALE)
+                    .with_default_value(scale)
+                    .with_style(UiComponentStyles {
+                        width: Some(OPACITY_SLIDER_WIDTH),
+                        margin: Some(Coords::default().top(3.).bottom(3.)),
+                        ..Default::default()
+                    })
+                    .on_drag(|ctx, _, val| {
+                        ctx.dispatch_typed_action(AppearancePageAction::UiScaleDragged(val))
+                    })
+                    .on_change(|ctx, _, val| {
+                        ctx.dispatch_typed_action(AppearancePageAction::SetUiScale(val))
+                    })
+                    .build()
+                    .finish(),
+                None,
+            ))
+            .finish()
     }
 }
 

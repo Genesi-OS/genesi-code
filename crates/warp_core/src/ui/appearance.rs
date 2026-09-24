@@ -26,6 +26,9 @@ pub struct Appearance {
     // We cache the family id for the ui font - note that this
     // isn't actually a changeable setting right now.
     ui_font_family: FamilyId,
+    /// Multiplier applied to every size outside the terminal. See
+    /// [`Appearance::scale`].
+    ui_scale: f32,
     ai_font_family: FamilyId,
     /// A font that is used for password fields.
     password_font_family: FamilyId,
@@ -78,6 +81,7 @@ impl Appearance {
         line_height_ratio: f32,
         ai_font_family: FamilyId,
         password_font_family: FamilyId,
+        ui_scale: f32,
     ) -> Self {
         Self {
             theme: theme.clone(),
@@ -85,12 +89,13 @@ impl Appearance {
             monospace_font_size,
             monospace_font_weight,
             ui_font_family,
+            ui_scale,
             line_height_ratio,
             ui_builder: UiBuilder::new(
                 theme,
                 ui_font_family,
-                DEFAULT_UI_FONT_SIZE,
-                DEFAULT_COMMAND_PALETTE_FONT_SIZE,
+                DEFAULT_UI_FONT_SIZE * ui_scale,
+                DEFAULT_COMMAND_PALETTE_FONT_SIZE * ui_scale,
                 line_height_ratio,
             ),
             ai_font_family,
@@ -131,6 +136,8 @@ impl Appearance {
                 line_height_ratio,
             ),
             ui_font_family,
+            // Unscaled, so a test's expected sizes are the base numbers.
+            ui_scale: 1.,
             ai_font_family: FamilyId(0),
             password_font_family: FamilyId(0),
         }
@@ -302,7 +309,36 @@ impl Appearance {
     }
 
     pub fn ui_font_size(&self) -> f32 {
-        DEFAULT_UI_FONT_SIZE
+        self.scale(DEFAULT_UI_FONT_SIZE)
+    }
+
+    /// Apply the user's interface scale to a size chosen at a call site.
+    ///
+    /// Font sizes, icon boxes and paddings all have to move together or the
+    /// result is large text in boxes built for small text. Call sites pass
+    /// their own base number through here rather than each growing a setting of
+    /// its own.
+    pub fn scale(&self, size: f32) -> f32 {
+        size * self.ui_scale
+    }
+
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_scale
+    }
+
+    pub fn set_ui_scale(&mut self, ui_scale: f32, ctx: &mut ModelContext<Self>) {
+        if (self.ui_scale - ui_scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.ui_scale = ui_scale;
+        self.ui_builder = UiBuilder::new(
+            self.theme.clone(),
+            self.ui_font_family,
+            DEFAULT_UI_FONT_SIZE * ui_scale,
+            DEFAULT_COMMAND_PALETTE_FONT_SIZE * ui_scale,
+            self.line_height_ratio,
+        );
+        ctx.notify();
     }
 
     pub fn header_font_family(&self) -> FamilyId {
@@ -310,7 +346,7 @@ impl Appearance {
     }
 
     pub fn header_font_size(&self) -> f32 {
-        HEADER_FONT_SIZE
+        self.scale(HEADER_FONT_SIZE)
     }
 
     pub fn overline_font_family(&self) -> FamilyId {
@@ -318,7 +354,7 @@ impl Appearance {
     }
 
     pub fn overline_font_size(&self) -> f32 {
-        OVERLINE_FONT_SIZE
+        self.scale(OVERLINE_FONT_SIZE)
     }
 
     pub fn line_height_ratio(&self) -> f32 {

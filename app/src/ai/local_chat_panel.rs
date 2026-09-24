@@ -2711,6 +2711,10 @@ impl LocalAiChatView {
         } else {
             appearance.ui_font_family()
         };
+        // Every piece of text in the panel funnels through here, so this is the
+        // one place the interface scale has to be applied for the whole surface
+        // to follow it. The call sites keep passing their own base size.
+        let size = appearance.scale(size);
         appearance
             .ui_builder()
             .wrappable_text(text.into(), soft_wrap)
@@ -7892,8 +7896,8 @@ impl LocalAiChatView {
             .with_child(
                 Container::new(
                     ConstrainedBox::new(Icon::new(icon, color).finish())
-                        .with_width(STEP_ICON_SIZE)
-                        .with_height(STEP_ICON_SIZE)
+                        .with_width(appearance.scale(STEP_ICON_SIZE))
+                        .with_height(appearance.scale(STEP_ICON_SIZE))
                         .finish(),
                 )
                 .with_margin_right(6.)
@@ -8132,8 +8136,8 @@ impl LocalAiChatView {
                 .with_child(
                     Container::new(
                         ConstrainedBox::new(Icon::new(icon, color).finish())
-                            .with_width(STEP_ICON_SIZE)
-                            .with_height(STEP_ICON_SIZE)
+                            .with_width(appearance.scale(STEP_ICON_SIZE))
+                            .with_height(appearance.scale(STEP_ICON_SIZE))
                             .finish(),
                     )
                     .with_margin_right(6.)

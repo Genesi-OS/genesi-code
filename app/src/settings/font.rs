@@ -12,6 +12,17 @@ pub const DEFAULT_MONOSPACE_FONT_NAME: &str = "Hack";
 pub const DEFAULT_MONOSPACE_FONT_SIZE: f32 = 13.0;
 pub const DEFAULT_MONOSPACE_FONT_WEIGHT: Weight = Weight::Normal;
 
+/// How much bigger everything outside the terminal is drawn.
+///
+/// The interface was laid out at a size that reads as cramped on a normal
+/// display: 12px labels, 10px overlines, and paddings picked to match. Rather
+/// than re-pick every number and hope, the whole scale moves together and the
+/// user decides where it lands. Default is a step up from the old fixed size,
+/// because the old fixed size is the complaint.
+pub const DEFAULT_UI_SCALE: f32 = 1.15;
+pub const MIN_UI_SCALE: f32 = 0.9;
+pub const MAX_UI_SCALE: f32 = 1.4;
+
 define_settings_group!(FontSettings,
     settings: [
         monospace_font_name: MonospaceFontName {
@@ -43,6 +54,15 @@ define_settings_group!(FontSettings,
             storage_key: "FontWeight",
             toml_path: "appearance.text.font_weight",
             description: "The weight of the monospace font in the terminal.",
+        },
+        ui_scale: UiScale {
+            type: f32,
+            default: DEFAULT_UI_SCALE,
+            supported_platforms: SupportedPlatforms::ALL,
+            sync_to_cloud: SyncToCloud::Never,
+            private: false,
+            toml_path: "appearance.text.ui_scale",
+            description: "How large the interface outside the terminal is drawn.",
         },
         line_height_ratio: LineHeightRatio {
             type: f32,

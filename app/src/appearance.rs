@@ -88,6 +88,12 @@ impl AppearanceManager {
                         appearance.set_monospace_font_weight(new_font_weight, ctx)
                     });
                 }
+                FontSettingsChangedEvent::UiScale { .. } => {
+                    let new_ui_scale = *FontSettings::as_ref(ctx).ui_scale.value();
+                    Appearance::handle(ctx).update(ctx, |appearance, ctx| {
+                        appearance.set_ui_scale(new_ui_scale, ctx)
+                    });
+                }
                 FontSettingsChangedEvent::LineHeightRatio { .. } => {
                     let new_line_height_ratio =
                         *FontSettings::as_ref(ctx).line_height_ratio.value();
@@ -316,7 +322,9 @@ fn load_default_ui_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId>
             "Dosis",
             vec![
                 ASSETS.get("bundled/fonts/dosis/Dosis-Light.ttf")?.to_vec(),
-                ASSETS.get("bundled/fonts/dosis/Dosis-Regular.ttf")?.to_vec(),
+                ASSETS
+                    .get("bundled/fonts/dosis/Dosis-Regular.ttf")?
+                    .to_vec(),
                 ASSETS.get("bundled/fonts/dosis/Dosis-Medium.ttf")?.to_vec(),
                 ASSETS
                     .get("bundled/fonts/dosis/Dosis-SemiBold.ttf")?
@@ -407,6 +415,8 @@ fn build_appearance(ctx: &mut AppContext) -> Appearance {
     #[cfg(target_family = "wasm")]
     emit_theme_background_event(&theme);
 
+    let ui_scale = *FontSettings::as_ref(ctx).ui_scale.value();
+
     Appearance::new(
         theme,
         monospace_font_family_from_settings.unwrap_or(default_monospace_font_family),
@@ -416,6 +426,7 @@ fn build_appearance(ctx: &mut AppContext) -> Appearance {
         line_height_ratio,
         am_font_family_from_settings.unwrap_or(default_monospace_font_family),
         password_font_family,
+        ui_scale,
     )
 }
 
