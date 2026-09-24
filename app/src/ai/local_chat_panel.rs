@@ -79,6 +79,29 @@ const BODY_FONT_SIZE: f32 = 13.;
 /// Slightly smaller monospace size for tool output / terminal blocks.
 const MONO_FONT_SIZE: f32 = 12.;
 const PANEL_PADDING: f32 = 8.;
+/// Size of the icon that leads a transcript step.
+const STEP_ICON_SIZE: f32 = 13.;
+
+/// Resolve a persisted step-icon name back to a bundled asset path.
+///
+/// The name round-trips through the saved chat as an owned `String`, but the
+/// asset loader takes a `&'static str`, so it has to land back on one of the
+/// paths we actually ship. Matching also means a chat saved by an older build,
+/// or one whose file we no longer have, degrades to the generic file icon
+/// instead of rendering nothing.
+fn step_icon_asset(name: Option<&str>) -> &'static str {
+    const GENERIC: &str = "bundled/svg/file-06.svg";
+    const KNOWN: [&str; 6] = [
+        GENERIC,
+        "bundled/svg/folder.svg",
+        "bundled/svg/search.svg",
+        "bundled/svg/terminal.svg",
+        "bundled/svg/pencil-02.svg",
+        "bundled/svg/plus.svg",
+    ];
+    name.and_then(|name| KNOWN.into_iter().find(|known| *known == name))
+        .unwrap_or(GENERIC)
+}
 const MODEL_LABEL_MAX_CHARS: usize = 34;
 const VIBE_COLUMN_WIDTH: f32 = 760.;
 const MEMPALACE_STORAGE_KEY: &str = "GenesiCodeMempalaceV1";
@@ -306,6 +329,13 @@ struct ChatEntry {
     context_label: Option<String>,
     /// For Tool steps: the one-line header (e.g. `read_file src/main.rs`).
     tool_title: Option<String>,
+    /// Bundled SVG for this step's kind, so a read, a search and a command are
+    /// told apart at a glance. `None` for steps that are not a tool call.
+    ///
+    /// Owned rather than `&'static str` because the entry is persisted with the
+    /// chat, and a borrowed str cannot be deserialized back into one.
+    #[serde(default)]
+    tool_icon: Option<String>,
     /// For Command steps: the shell command line that was run.
     command: Option<String>,
     /// Collapsed state for the collapsible step kinds (Thought / Tool / Command).
@@ -326,6 +356,7 @@ impl ChatEntry {
             text,
             context_label,
             tool_title: None,
+            tool_icon: None,
             command: None,
             collapsed: false,
             status: StepStatus::Ok,
@@ -1914,6 +1945,7 @@ impl LocalAiChatView {
             text: String::new(),
             context_label: None,
             tool_title: None,
+            tool_icon: None,
             command: None,
             collapsed: false,
             status: StepStatus::Running,
@@ -2174,7 +2206,12 @@ impl LocalAiChatView {
             } else {
                 let entry = &mut self.messages[idx];
                 entry.text = visible;
-                entry.collapsed = true;
+                // Left open. This is the assistant saying what it is about to do
+                // and why, and collapsing it behind a "Thought" header was what
+                // made a whole turn read as the word "Thinking" and nothing
+                // else: the account existed, the transcript just hid it. Tool
+                // OUTPUT still collapses -- that is the part nobody reads.
+                entry.collapsed = false;
                 entry.status = StepStatus::Ok;
             }
         } else {
@@ -2400,6 +2437,7 @@ impl LocalAiChatView {
                     text: String::new(),
                     context_label: None,
                     tool_title: None,
+                    tool_icon: Some(tool.icon().to_string()),
                     command: Some(command.clone()),
                     collapsed: false,
                     status: StepStatus::Running,
@@ -2436,6 +2474,7 @@ impl LocalAiChatView {
                     text: String::new(),
                     context_label: None,
                     tool_title: Some(title),
+                    tool_icon: Some(tool.icon().to_string()),
                     command: None,
                     collapsed: true,
                     status: StepStatus::Running,
@@ -7836,6 +7875,48 @@ impl LocalAiChatView {
     }
 
     /// A clickable, collapse/expand header for the thought/tool/command steps.
+    /// A step header that leads with the step's own icon, then the chevron and
+    /// the title. Reading down a run of steps, the icon column is what tells a
+    /// file read from a shell command without parsing any words.
+    fn step_header_with_icon(
+        &self,
+        appearance: &Appearance,
+        index: usize,
+        icon: &'static str,
+        title: String,
+        color: ColorU,
+        collapsed: bool,
+    ) -> Box<dyn Element> {
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Container::new(
+                    ConstrainedBox::new(Icon::new(icon, color).finish())
+                        .with_width(STEP_ICON_SIZE)
+                        .with_height(STEP_ICON_SIZE)
+                        .finish(),
+                )
+                .with_margin_right(6.)
+                .finish(),
+            )
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    self.collapsible_header(
+                        appearance,
+                        LocalAiChatAction::ToggleCollapse(index),
+                        title,
+                        color,
+                        collapsed,
+                    ),
+                )
+                .finish(),
+            )
+            .finish();
+
+        Container::new(row).finish()
+    }
+
     fn step_header(
         &self,
         appearance: &Appearance,
@@ -8022,29 +8103,45 @@ impl LocalAiChatView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let muted: ColorU = theme.disabled_text_color(theme.background()).into();
-        let (icon, color): (&str, ColorU) = match entry.status {
-            StepStatus::Running => ("file", muted),
-            StepStatus::Ok => ("file", theme.main_text_color(theme.background()).into()),
-            StepStatus::Error => ("error", theme.ui_error_color().into()),
-            StepStatus::Denied => ("denied", muted),
+        // The status decides the colour and, when something went wrong, replaces
+        // the tool's own icon. It used to be spelled out instead -- the literal
+        // words "file", "error" and "denied" were printed where an icon belongs,
+        // which is how a step came out reading `file: list_files src`.
+        let own_icon = step_icon_asset(entry.tool_icon.as_deref());
+        let (icon, color): (&'static str, ColorU) = match entry.status {
+            StepStatus::Running => (own_icon, muted),
+            StepStatus::Ok => (own_icon, theme.main_text_color(theme.background()).into()),
+            StepStatus::Error => (
+                "bundled/svg/alert-circle.svg",
+                theme.ui_error_color().into(),
+            ),
+            StepStatus::Denied => ("bundled/svg/x-close.svg", muted),
         };
         let suffix = match entry.status {
-            StepStatus::Running => " - running...",
-            StepStatus::Error => " - error",
-            StepStatus::Denied => " - denied",
-            StepStatus::Ok => "",
+            StepStatus::Running => "…",
+            StepStatus::Denied => " — denied",
+            StepStatus::Error | StepStatus::Ok => "",
         };
         let path = entry.tool_title.clone().unwrap_or_default();
         let header: Box<dyn Element> = if let Some((added, removed)) = entry.diff_stat {
-            let caret = if entry.collapsed { ">" } else { "v" };
             let green: ColorU = genesi_green();
             let red: ColorU = theme.ui_error_color().into();
             let row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_main_axis_size(MainAxisSize::Max)
+                .with_child(
+                    Container::new(
+                        ConstrainedBox::new(Icon::new(icon, color).finish())
+                            .with_width(STEP_ICON_SIZE)
+                            .with_height(STEP_ICON_SIZE)
+                            .finish(),
+                    )
+                    .with_margin_right(6.)
+                    .finish(),
+                )
                 .with_child(self.label_text(
                     appearance,
-                    format!("{caret} {path}{suffix}"),
+                    format!("{path}{suffix}"),
                     CHIP_FONT_SIZE,
                     color,
                     false,
@@ -8094,8 +8191,14 @@ impl LocalAiChatView {
             })
             .finish()
         } else {
-            let title = format!("{icon}: {path}{suffix}");
-            self.step_header(appearance, index, title, color, entry.collapsed)
+            self.step_header_with_icon(
+                appearance,
+                index,
+                icon,
+                format!("{path}{suffix}"),
+                color,
+                entry.collapsed,
+            )
         };
 
         let mut column = Flex::column()
@@ -9014,6 +9117,7 @@ impl TypedActionView for LocalAiChatView {
                         text: "(denied by user)".to_string(),
                         context_label: None,
                         tool_title: Some(tool.summary()),
+                        tool_icon: Some(tool.icon().to_string()),
                         command: match &tool {
                             AgentTool::RunCommand { command } => Some(command.clone()),
                             _ => None,

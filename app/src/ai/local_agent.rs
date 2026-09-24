@@ -54,6 +54,14 @@ const ROOT_MARKERS: &[&str] = &[
     ".genesi",
 ];
 
+/// Trim a path down to what is worth reading: a leading `./` is noise.
+fn display_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// The maximum number of agent steps (tool calls) per user turn, so a confused
 /// model can't loop forever. Generous enough to read several files and then
 /// create/edit several more in one turn (multi-file changes), which the old
@@ -104,17 +112,45 @@ impl AgentTool {
     }
 
     /// A compact one-line summary for the transcript, e.g. `read_file src/main.rs`.
+    /// The one line the transcript shows for this call.
+    ///
+    /// Written the way a person would say it, not the way the protocol spells
+    /// it. The transcript used to print the wire name -- `list_files src` --
+    /// which reads as machinery leaking through the UI rather than as an
+    /// account of what the assistant did.
     pub fn summary(&self) -> String {
         match self {
-            AgentTool::ReadFile { path } => format!("read_file {path}"),
-            AgentTool::ListFiles { path } => format!("list_files {path}"),
-            AgentTool::Grep { query, path } => format!("grep \"{query}\" in {path}"),
-            AgentTool::RunCommand { command } => format!("run {command}"),
-            AgentTool::EditFile { path, .. } => format!("edit {path}"),
-            AgentTool::WriteFile { path, .. } => format!("write {path}"),
+            AgentTool::ReadFile { path } => format!("Read {}", display_path(path)),
+            AgentTool::ListFiles { path } => match display_path(path).as_str() {
+                "" | "." => "Listed the project".to_string(),
+                shown => format!("Listed {shown}"),
+            },
+            AgentTool::Grep { query, path } => match display_path(path).as_str() {
+                "" | "." => format!("Searched for \"{query}\""),
+                shown => format!("Searched for \"{query}\" in {shown}"),
+            },
+            AgentTool::RunCommand { command } => format!("Ran {command}"),
+            AgentTool::EditFile { path, .. } => format!("Edited {}", display_path(path)),
+            AgentTool::WriteFile { path, .. } => format!("Wrote {}", display_path(path)),
         }
     }
 
+    /// The icon for this kind of call. Distinguishing a read from a command at a
+    /// glance is most of what makes a run of steps scannable.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            AgentTool::ReadFile { .. } => "bundled/svg/file-06.svg",
+            AgentTool::ListFiles { .. } => "bundled/svg/folder.svg",
+            AgentTool::Grep { .. } => "bundled/svg/search.svg",
+            AgentTool::RunCommand { .. } => "bundled/svg/terminal.svg",
+            AgentTool::EditFile { .. } => "bundled/svg/pencil-02.svg",
+            AgentTool::WriteFile { .. } => "bundled/svg/plus.svg",
+        }
+    }
+
+    /// Trim a path down to what is worth reading. A leading `./` is noise, and
+    /// an absolute path inside the project is mostly the project root repeated.
+    ///
     /// Whether running this tool needs the user's go-ahead (anything that can
     /// change the system). Reads never do.
     pub fn requires_approval(&self) -> bool {
@@ -185,20 +221,21 @@ pub fn announced_tool_without_calling(text: &str) -> bool {
 /// it was trained to do. Declared only where the server understands the `tools`
 /// param — see the caller, which stops sending them if it doesn't.
 pub fn tool_schemas() -> serde_json::Value {
-    let function = |name: &str, description: &str, properties: serde_json::Value, required: &[&str]| {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
+    let function =
+        |name: &str, description: &str, properties: serde_json::Value, required: &[&str]| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
                 },
-            },
-        })
-    };
+            })
+        };
     let path = |description: &str| serde_json::json!({ "path": { "type": "string", "description": description } });
     serde_json::json!([
         function(

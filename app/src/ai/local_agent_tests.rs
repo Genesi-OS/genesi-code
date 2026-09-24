@@ -129,7 +129,9 @@ fn a_real_call_is_not_treated_as_narration() {
     assert!(!announced_tool_without_calling(
         "Let me look: <tool:list_files path=\".\"/>"
     ));
-    assert!(!announced_tool_without_calling("<tool:read_file path=\"a.rs\"/>"));
+    assert!(!announced_tool_without_calling(
+        "<tool:read_file path=\"a.rs\"/>"
+    ));
 }
 
 #[test]
@@ -223,5 +225,91 @@ fn a_leading_slash_cannot_escape_the_project() {
     assert!(
         !escaped.contains("root:x:"),
         "a tool must not read outside the project: {escaped}"
+    );
+}
+
+#[test]
+fn a_step_reads_as_an_account_not_a_wire_call() {
+    // The transcript used to print the protocol's own spelling -- `list_files
+    // src` -- which reads as machinery leaking through the UI.
+    assert_eq!(
+        AgentTool::ReadFile {
+            path: "./src/App.jsx".to_string()
+        }
+        .summary(),
+        "Read src/App.jsx"
+    );
+    assert_eq!(
+        AgentTool::RunCommand {
+            command: "npm install".to_string()
+        }
+        .summary(),
+        "Ran npm install"
+    );
+    assert_eq!(
+        AgentTool::Grep {
+            query: "useState".to_string(),
+            path: "src".to_string()
+        }
+        .summary(),
+        "Searched for \"useState\" in src"
+    );
+}
+
+#[test]
+fn listing_the_root_says_so_rather_than_naming_a_dot() {
+    // The model asks for "." when it means the whole project, and "Listed ."
+    // tells the reader nothing.
+    assert_eq!(
+        AgentTool::ListFiles {
+            path: ".".to_string()
+        }
+        .summary(),
+        "Listed the project"
+    );
+    assert_eq!(
+        AgentTool::ListFiles {
+            path: "src/".to_string()
+        }
+        .summary(),
+        "Listed src"
+    );
+}
+
+#[test]
+fn every_tool_kind_has_its_own_icon() {
+    // The icon column is what makes a run of steps scannable, so two kinds
+    // sharing one icon would defeat the point.
+    let icons = [
+        AgentTool::ReadFile { path: "a".into() }.icon(),
+        AgentTool::ListFiles { path: "a".into() }.icon(),
+        AgentTool::Grep {
+            query: "q".into(),
+            path: "a".into(),
+        }
+        .icon(),
+        AgentTool::RunCommand {
+            command: "c".into(),
+        }
+        .icon(),
+        AgentTool::EditFile {
+            path: "a".into(),
+            search: String::new(),
+            replace: String::new(),
+        }
+        .icon(),
+        AgentTool::WriteFile {
+            path: "a".into(),
+            content: String::new(),
+        }
+        .icon(),
+    ];
+    let mut unique = icons.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        icons.len(),
+        "two tools share an icon: {icons:?}"
     );
 }
