@@ -2050,6 +2050,40 @@ impl CodeEditorModel {
     /// where every other editor splits the element open. The `>` immediately
     /// followed by `</` is specific enough to be safe -- no language puts those
     /// two together with nothing in between unless a tag is being closed.
+    ///
+    /// Whether the text before `offset` ends a line that opens a block, as in
+    /// `fn main() {` with nothing after the brace.
+    ///
+    /// The pair checks only fire when the caret is sandwiched between an opener
+    /// and its closer. That covers `{|}`, which is what auto-close produces, but
+    /// not a brace typed at the end of a line -- and there the next line still
+    /// belongs one level in. Without this, opening a block by hand left the body
+    /// flush with the line that opened it.
+    pub fn line_opens_block(&self, offset: CharOffset, ctx: &AppContext) -> bool {
+        let Some(bracket_pairs) = self.syntax_tree.as_ref(ctx).bracket_pairs() else {
+            return false;
+        };
+
+        let buffer = self.content.as_ref(ctx);
+        let line_start = buffer.containing_line_start(offset);
+
+        // Walk back from the caret over trailing whitespace to the last real
+        // character on the line.
+        let mut cursor = offset;
+        while cursor > line_start {
+            let previous = cursor - CharOffset::from(1);
+            match buffer.char_at(previous) {
+                Some(c) if c == ' ' || c == '\t' => cursor = previous,
+                Some(c) => {
+                    return bracket_pairs.iter().any(|(start, _)| *start == c);
+                }
+                None => return false,
+            }
+        }
+
+        false
+    }
+
     pub fn range_wrapped_in_tag(&self, range: Range<CharOffset>, ctx: &AppContext) -> bool {
         if range.start == CharOffset::zero() {
             return false;
@@ -3253,6 +3287,10 @@ impl CodeEditorModel {
             // `<div>|</div>` splits the same way `{|}` does.
             let wrapped = self.range_wrapped_in_bracket(start..end, ctx)
                 || self.range_wrapped_in_tag(start..end, ctx);
+            // A line that ends on an opener puts the next line one level in, but
+            // has no closer to push down onto a third line.
+            let opens_block =
+                !wrapped && matches!(mode, IndentMode::Enter) && self.line_opens_block(end, ctx);
 
             let one_unit = indent_unit.map(|indent_unit| indent_unit.text_with_num_tab_stops(1));
             let unit_width = indent_unit.map(|unit| unit.width()).unwrap_or(4).max(1);
@@ -3281,6 +3319,14 @@ impl CodeEditorModel {
                 (format!("{existing_indent}{unit}"), existing_indent.clone())
             } else {
                 match (syntax_levels, &one_unit) {
+                    (_, Some(unit)) if opens_block => {
+                        // Derived from the text for the same reason the pair case
+                        // is: the tree still sees the just-typed opener as an
+                        // error node, and reports the level outside the block it
+                        // opens.
+                        let opened = format!("{existing_indent}{unit}");
+                        (opened.clone(), opened)
+                    }
                     (Some(levels), Some(unit)) => {
                         // Continuing a line, so the floor is that line's own
                         // indentation. The indent query can come back short -- it

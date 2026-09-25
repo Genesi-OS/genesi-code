@@ -1235,3 +1235,88 @@ fn test_enter_never_dedents_below_the_current_line() {
         });
     })
 }
+
+/// A brace typed at the end of a line opens a block just as much as `{|}` does,
+/// but the pair checks never saw it: they only fire when the caret is sandwiched
+/// between an opener and its closer. Opening a block by hand used to leave the
+/// body flush with the line that opened it.
+#[test]
+fn test_enter_after_a_line_that_opens_a_block_indents_in() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(&mut app, "    fn f() {", ContentVersion::new());
+        layout_model(&mut app, &editor).await;
+
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(
+                lines.last().copied(),
+                Some("        "),
+                "expected one step past the opening line, got {text:?}"
+            );
+        });
+    })
+}
+
+/// Trailing whitespace after the opener must not hide it.
+#[test]
+fn test_a_trailing_space_does_not_hide_the_opener() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(&mut app, "fn f() {   ", ContentVersion::new());
+        layout_model(&mut app, &editor).await;
+
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(lines.last().copied(), Some("    "), "got {text:?}");
+        });
+    })
+}
+
+/// A line that merely ends in a word is a continuation, not a block, and must
+/// keep its own indentation rather than growing one.
+#[test]
+fn test_enter_after_an_ordinary_line_does_not_indent_in() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(
+            &mut app,
+            "fn f() {
+    let x = 1;",
+            ContentVersion::new(),
+        );
+        layout_model(&mut app, &editor).await;
+
+        let end = editor.read(&app, |editor, ctx| {
+            CharOffset::from(editor.content.as_ref(ctx).text().as_str().chars().count() + 1)
+        });
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(end, ctx);
+            editor.enter(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            let text = editor.content.as_ref(ctx).text();
+            let lines: Vec<&str> = text.as_str().lines().collect();
+            assert_eq!(lines.last().copied(), Some("    "), "got {text:?}");
+        });
+    })
+}
