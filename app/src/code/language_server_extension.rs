@@ -1468,6 +1468,107 @@ impl LocalCodeEditorView {
                 ("false", "false", "JSON boolean"),
                 ("null", "null", "JSON null"),
             ],
+            Some(Bash) => &[
+                (
+                    "if",
+                    "if ${1:condition}; then
+    $0
+fi",
+                    "Bash if block",
+                ),
+                (
+                    "for",
+                    "for ${1:item} in ${2:items}; do
+    $0
+done",
+                    "Bash loop",
+                ),
+                (
+                    "while",
+                    "while ${1:condition}; do
+    $0
+done",
+                    "Bash while loop",
+                ),
+                (
+                    "case",
+                    "case ${1:value} in
+    ${2:pattern})
+        $0
+        ;;
+esac",
+                    "Bash case",
+                ),
+                (
+                    "function",
+                    "${1:name}() {
+    $0
+}",
+                    "Bash function",
+                ),
+                (
+                    "shebang",
+                    "#!/usr/bin/env bash
+set -euo pipefail
+
+$0",
+                    "Bash script header",
+                ),
+            ],
+            Some(Yaml) => &[
+                ("list", "- $0", "YAML list item"),
+                (
+                    "map",
+                    "${1:key}:
+  $0",
+                    "YAML nested mapping",
+                ),
+                (
+                    "block",
+                    "${1:key}: |
+  $0",
+                    "YAML block scalar",
+                ),
+            ],
+            Some(Php) => &[
+                (
+                    "open",
+                    "<?php
+
+$0",
+                    "PHP open tag",
+                ),
+                (
+                    "function",
+                    "function ${1:name}(${2}) {
+    $0
+}",
+                    "PHP function",
+                ),
+                (
+                    "if",
+                    "if (${1:condition}) {
+    $0
+}",
+                    "PHP if block",
+                ),
+                (
+                    "foreach",
+                    "foreach (${1:$items} as ${2:$item}) {
+    $0
+}",
+                    "PHP foreach",
+                ),
+                (
+                    "class",
+                    "class ${1:Name}
+{
+    $0
+}",
+                    "PHP class",
+                ),
+                ("echo", "echo $0;", "PHP echo"),
+            ],
             Some(Html) | None => &[],
         }
     }

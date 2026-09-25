@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use lsp_types::Uri;
 
-use crate::config::{lsp_uri_to_path, path_to_lsp_uri};
+use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId, LANGUAGES};
 
 // Unix-specific tests use Unix paths
 #[cfg(not(windows))]
@@ -215,4 +215,53 @@ fn test_path_to_lsp_uri_rejects_relative_path() {
     let result = path_to_lsp_uri(&path);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("must be absolute"));
+}
+
+#[test]
+fn every_language_resolves_to_exactly_one_spec() {
+    // LANGUAGES is the single source of truth, and `LanguageId::spec` panics on
+    // a language that has no entry -- so a variant added without one takes the
+    // editor down the first time that file type is opened.
+    for spec in LANGUAGES {
+        let matches = LANGUAGES.iter().filter(|s| s.id == spec.id).count();
+        assert_eq!(matches, 1, "{:?} has {matches} entries", spec.id);
+    }
+}
+
+#[test]
+fn no_extension_is_claimed_by_two_languages() {
+    // First match wins, so a duplicate silently hands files to whichever entry
+    // happens to come first in the list.
+    let mut seen: Vec<(&str, LanguageId)> = Vec::new();
+    for spec in LANGUAGES {
+        for extension in spec.extensions {
+            if let Some((_, other)) = seen.iter().find(|(e, _)| e == extension) {
+                panic!(
+                    "`{extension}` is claimed by both {other:?} and {:?}",
+                    spec.id
+                );
+            }
+            seen.push((extension, spec.id));
+        }
+    }
+}
+
+#[test]
+fn the_languages_added_for_shell_yaml_and_php_are_wired_up() {
+    let lookup = |name: &str| LanguageId::from_path(std::path::Path::new(name));
+    assert_eq!(lookup("deploy.sh"), Some(LanguageId::Bash));
+    assert_eq!(lookup("docker-compose.yml"), Some(LanguageId::Yaml));
+    assert_eq!(lookup("index.php"), Some(LanguageId::Php));
+}
+
+#[test]
+fn every_language_offers_a_trigger_or_deliberately_none() {
+    // A language with no trigger characters still completes on identifier
+    // input; this is here so adding one with an empty list is a decision rather
+    // than an oversight.
+    for spec in LANGUAGES {
+        if spec.trigger_chars.is_empty() {
+            panic!("{:?} has no trigger characters", spec.id);
+        }
+    }
 }

@@ -15,6 +15,7 @@ use crate::servers::css::CssLanguageServerCandidate;
 use crate::servers::go::GoPlsCandidate;
 use crate::servers::html::HtmlLanguageServerCandidate;
 use crate::servers::json::JsonLanguageServerCandidate;
+use crate::servers::npm::{self, NpmLanguageServerCandidate};
 use crate::servers::pyright::PyrightCandidate;
 use crate::servers::rust::RustAnalyzerCandidate;
 use crate::servers::typescript_language_server::TypeScriptLanguageServerCandidate;
@@ -50,6 +51,9 @@ pub enum LSPServerType {
     VscodeHtmlLanguageServer,
     VscodeCssLanguageServer,
     VscodeJsonLanguageServer,
+    BashLanguageServer,
+    YamlLanguageServer,
+    Intelephense,
 }
 
 /// Provides server-specific configuration for each LSP server type.
@@ -85,6 +89,11 @@ impl LSPServerType {
             | LSPServerType::VscodeJsonLanguageServer => {
                 &["package.json", "tsconfig.json", "jsconfig.json"]
             }
+            // A shell script's "project" is whatever directory it sits in, so
+            // only the repo itself is a meaningful boundary.
+            LSPServerType::BashLanguageServer => &[".git"],
+            LSPServerType::YamlLanguageServer => &[".git"],
+            LSPServerType::Intelephense => &["composer.json", ".git"],
         };
 
         if !file_path.starts_with(workspace_root) {
@@ -184,6 +193,18 @@ impl LSPServerType {
             LSPServerType::VscodeJsonLanguageServer => {
                 JsonLanguageServerCandidate::find_installed_binary_config(path_env_var).await
             }
+            LSPServerType::BashLanguageServer => {
+                NpmLanguageServerCandidate::find_installed_binary_config(&npm::BASH, path_env_var)
+                    .await
+            }
+            LSPServerType::YamlLanguageServer => {
+                NpmLanguageServerCandidate::find_installed_binary_config(&npm::YAML, path_env_var)
+                    .await
+            }
+            LSPServerType::Intelephense => {
+                NpmLanguageServerCandidate::find_installed_binary_config(&npm::PHP, path_env_var)
+                    .await
+            }
         }
     }
 
@@ -210,6 +231,9 @@ impl LSPServerType {
             LSPServerType::VscodeHtmlLanguageServer => "vscode-html-language-server",
             LSPServerType::VscodeCssLanguageServer => "vscode-css-language-server",
             LSPServerType::VscodeJsonLanguageServer => "vscode-json-language-server",
+            LSPServerType::BashLanguageServer => "bash-language-server",
+            LSPServerType::YamlLanguageServer => "yaml-language-server",
+            LSPServerType::Intelephense => "intelephense",
         }
     }
 
@@ -222,7 +246,10 @@ impl LSPServerType {
             | LSPServerType::TypeScriptLanguageServer
             | LSPServerType::VscodeHtmlLanguageServer
             | LSPServerType::VscodeCssLanguageServer
-            | LSPServerType::VscodeJsonLanguageServer => vec!["--stdio"],
+            | LSPServerType::VscodeJsonLanguageServer
+            | LSPServerType::BashLanguageServer
+            | LSPServerType::YamlLanguageServer
+            | LSPServerType::Intelephense => vec!["--stdio"],
         }
     }
 
@@ -239,6 +266,9 @@ impl LSPServerType {
             LSPServerType::VscodeHtmlLanguageServer => vec!["--stdio"],
             LSPServerType::VscodeCssLanguageServer => vec!["--stdio"],
             LSPServerType::VscodeJsonLanguageServer => vec!["--stdio"],
+            LSPServerType::BashLanguageServer => vec!["--stdio"],
+            LSPServerType::YamlLanguageServer => vec!["--stdio"],
+            LSPServerType::Intelephense => vec!["--stdio"],
         }
     }
 
@@ -291,6 +321,15 @@ impl LSPServerType {
             }
             LSPServerType::VscodeJsonLanguageServer => {
                 Box::new(JsonLanguageServerCandidate::new(client))
+            }
+            LSPServerType::BashLanguageServer => {
+                Box::new(NpmLanguageServerCandidate::new(npm::BASH, client))
+            }
+            LSPServerType::YamlLanguageServer => {
+                Box::new(NpmLanguageServerCandidate::new(npm::YAML, client))
+            }
+            LSPServerType::Intelephense => {
+                Box::new(NpmLanguageServerCandidate::new(npm::PHP, client))
             }
         }
     }
