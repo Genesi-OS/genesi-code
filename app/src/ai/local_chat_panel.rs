@@ -21,6 +21,7 @@ use similar::{Algorithm, ChangeTag, TextDiff};
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::icons::Icon as CoreIcon;
 use warp_core::ui::theme::Fill as ThemeFill;
+use warp_core::ui::theme::WarpTheme;
 use warpui::clipboard::ClipboardContent;
 use warpui::color::ColorU;
 use warpui::elements::{
@@ -221,6 +222,15 @@ pub fn init(app: &mut AppContext) {
     )]);
 }
 
+/// The AI panel's palette.
+///
+/// These were absolute rgb values, which is what made the panel look pasted in
+/// from another app: 142 colours in this file come from the theme and 48 did
+/// not, so the cards only lined up when the active theme happened to be the
+/// exact dark grey those numbers assumed. Everything structural now comes off
+/// the theme's own scale, and only the accent stays fixed — that one is brand,
+/// not chrome.
+///
 /// The Genesi brand green, used as the panel's accent.
 fn genesi_green() -> ColorU {
     ColorU::new(15, 143, 106, 255)
@@ -238,23 +248,34 @@ fn green_soft() -> ColorU {
     ColorU::new(15, 143, 106, 130)
 }
 
-fn genesi_panel_surface() -> ColorU {
-    ColorU::new(20, 21, 23, 245)
+/// The panel's own ground. Same ground as every other pane, so the seam between
+/// them stops being visible.
+fn genesi_panel_surface(theme: &WarpTheme) -> ColorU {
+    theme.background().into_solid()
 }
 
-fn genesi_card_surface() -> ColorU {
-    ColorU::new(31, 32, 35, 245)
+/// One step up from the ground: message cards, tool output, the zero-state
+/// cards.
+fn genesi_card_surface(theme: &WarpTheme) -> ColorU {
+    theme.surface_1().into_solid()
 }
 
-/// The compose box. Clearly lighter than the panel fill it sits on
-/// (`genesi_shell_panel_surface`, rgb 30/31/34) so it reads as a raised card
-/// without needing a border.
-fn genesi_compose_surface() -> ColorU {
-    ColorU::new(46, 48, 53, 255)
+/// The compose box, a step above the cards so it reads as the thing you act in.
+fn genesi_compose_surface(theme: &WarpTheme) -> ColorU {
+    theme.surface_2().into_solid()
 }
 
-fn genesi_subtle_border() -> ColorU {
-    ColorU::new(255, 255, 255, 24)
+/// The theme's error colour at a chosen opacity, for the wash behind a removed
+/// diff line or the border of a denied step.
+fn error_tint(theme: &WarpTheme, alpha: u8) -> ColorU {
+    let base = theme.ui_error_color();
+    ColorU::new(base.r, base.g, base.b, alpha)
+}
+
+/// Hairlines between surfaces. The theme's own outline, so a light theme gets a
+/// dark line rather than the white-on-white a fixed value produced.
+fn genesi_subtle_border(theme: &WarpTheme) -> ColorU {
+    theme.outline().into_solid()
 }
 
 fn truncate_middle(value: &str, max_chars: usize) -> String {
@@ -2763,26 +2784,28 @@ impl LocalAiChatView {
         selected: bool,
         enabled: bool,
     ) -> Box<dyn Element> {
-        let text_color: ColorU = if enabled {
-            if selected {
-                ColorU::new(215, 248, 234, 255)
-            } else {
-                ColorU::new(228, 231, 236, 255)
-            }
+        // Fixed greys here meant a chip kept dark-theme text on a light theme,
+        // where it reads as grey-on-white. The selected state keeps the brand
+        // accent; everything else is the theme's own text and surface scale.
+        let theme = appearance.theme();
+        let text_color: ColorU = if !enabled {
+            theme.disabled_ui_text_color().into()
+        } else if selected {
+            theme.active_ui_text_color().into()
         } else {
-            ColorU::new(132, 137, 145, 255)
+            theme.nonactive_ui_text_color().into()
         };
         let background = if selected {
-            ColorU::new(15, 143, 106, 44)
+            green_tint()
         } else if enabled {
-            ColorU::new(255, 255, 255, 14)
+            theme.surface_2().into_solid()
         } else {
-            ColorU::new(255, 255, 255, 8)
+            theme.surface_1().into_solid()
         };
         let border = if selected {
             green_soft()
         } else {
-            ColorU::new(255, 255, 255, 32)
+            genesi_subtle_border(theme)
         };
         let icon_color = if selected { genesi_green() } else { text_color };
 
@@ -6520,8 +6543,11 @@ impl LocalAiChatView {
                         .with_horizontal_padding(10.)
                         .with_vertical_padding(8.)
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                        // A white wash only reads as "selected" on a dark
+                        // theme; the theme's own raised surface reads that way
+                        // on either.
                         .with_background_color(if edit_path == selected_path {
-                            ColorU::new(255, 255, 255, 18)
+                            theme.surface_2().into_solid()
                         } else {
                             ColorU::new(0, 0, 0, 0)
                         })
@@ -6672,11 +6698,9 @@ impl LocalAiChatView {
                     theme.disabled_text_color(theme.background()).into(),
                 ),
                 DiffPreviewLineKind::Added => ("+", ColorU::new(15, 143, 106, 36), genesi_green()),
-                DiffPreviewLineKind::Removed => (
-                    "-",
-                    ColorU::new(181, 68, 68, 36),
-                    theme.ui_error_color().into(),
-                ),
+                DiffPreviewLineKind::Removed => {
+                    ("-", error_tint(theme, 36), theme.ui_error_color().into())
+                }
             };
 
             let old_line = line
@@ -6754,8 +6778,8 @@ impl LocalAiChatView {
             .with_uniform_padding(6.)
             .with_margin_top(4.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-            .with_background_color(genesi_card_surface())
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
+            .with_background_color(genesi_card_surface(theme))
             .finish()
     }
 
@@ -6803,21 +6827,25 @@ impl LocalAiChatView {
             .with_child(Shrinkable::new(1., Empty::new().finish()).finish())
             // Starting a fresh chat had a working action and no way to reach it.
             .with_child(self.utility_icon_button(
+                appearance,
                 "bundled/svg/clock-rewind.svg",
                 LocalAiChatAction::ToggleChatPicker,
                 true,
             ))
             .with_child(self.utility_icon_button(
+                appearance,
                 "bundled/svg/add.svg",
                 LocalAiChatAction::NewChat,
                 !self.messages.is_empty(),
             ))
             .with_child(self.utility_icon_button(
+                appearance,
                 "bundled/svg/refresh-cw-04.svg",
                 LocalAiChatAction::Refresh,
                 true,
             ));
         row.add_child(self.utility_icon_button(
+            appearance,
             "bundled/svg/trash-02.svg",
             LocalAiChatAction::Clear,
             !self.messages.is_empty(),
@@ -6827,14 +6855,16 @@ impl LocalAiChatView {
 
     fn utility_icon_button(
         &self,
+        appearance: &Appearance,
         icon_path: &'static str,
         action: LocalAiChatAction,
         enabled: bool,
     ) -> Box<dyn Element> {
-        let icon_color = if enabled {
-            ColorU::new(222, 225, 231, 255)
+        let theme = appearance.theme();
+        let icon_color: ColorU = if enabled {
+            theme.active_ui_text_color().into()
         } else {
-            ColorU::new(126, 130, 138, 255)
+            theme.disabled_ui_text_color().into()
         };
         let button = Container::new(
             ConstrainedBox::new(Icon::new(icon_path, icon_color).finish())
@@ -7037,8 +7067,8 @@ impl LocalAiChatView {
         .with_horizontal_padding(7.)
         .with_vertical_padding(4.)
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
-        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-        .with_background_color(genesi_card_surface())
+        .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
+        .with_background_color(genesi_card_surface(theme))
         .with_margin_right(5.)
         .with_margin_top(4.);
 
@@ -7119,7 +7149,7 @@ impl LocalAiChatView {
                 .finish(),
             );
         }
-        Some(self.popup_surface(list.finish()))
+        Some(self.popup_surface(appearance.theme(), list.finish()))
     }
 
     /// The saved-conversation list.
@@ -7148,7 +7178,7 @@ impl LocalAiChatView {
                 .with_uniform_padding(10.)
                 .finish(),
             );
-            return Some(self.popup_surface(list.finish()));
+            return Some(self.popup_surface(appearance.theme(), list.finish()));
         }
 
         for summary in summaries {
@@ -7172,6 +7202,7 @@ impl LocalAiChatView {
                         .finish(),
                     )
                     .with_child(self.utility_icon_button(
+                        appearance,
                         "bundled/svg/trash-02.svg",
                         LocalAiChatAction::DeleteChat(summary.id.clone()),
                         true,
@@ -7179,15 +7210,15 @@ impl LocalAiChatView {
                     .finish(),
             );
         }
-        Some(self.popup_surface(list.finish()))
+        Some(self.popup_surface(appearance.theme(), list.finish()))
     }
 
     /// Shared framing for the popups that float above the compose box.
-    fn popup_surface(&self, contents: Box<dyn Element>) -> Box<dyn Element> {
+    fn popup_surface(&self, theme: &WarpTheme, contents: Box<dyn Element>) -> Box<dyn Element> {
         Container::new(contents)
-            .with_background_color(genesi_card_surface())
+            .with_background_color(genesi_card_surface(theme))
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
             .with_uniform_padding(6.)
             .with_margin_bottom(6.)
             .finish()
@@ -7290,13 +7321,16 @@ impl LocalAiChatView {
             .finish()
     }
 
-    fn render_prompt_action_button(&self, _appearance: &Appearance) -> Box<dyn Element> {
+    fn render_prompt_action_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
         let (icon_path, action, fill, icon_color) = if self.in_flight {
             (
                 "bundled/svg/stop-filled.svg",
                 LocalAiChatAction::Stop,
-                ColorU::new(117, 34, 34, 255),
-                ColorU::new(255, 214, 214, 255),
+                // The stop button is a destructive affordance, so it borrows the
+                // theme's error colour rather than a maroon of its own.
+                error_tint(theme, 220),
+                theme.active_ui_text_color().into(),
             )
         } else {
             (
@@ -7317,7 +7351,7 @@ impl LocalAiChatView {
         .with_vertical_padding(8.)
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
         .with_border(Border::all(1.).with_border_color(if self.in_flight {
-            ColorU::new(181, 68, 68, 90)
+            error_tint(theme, 90)
         } else {
             green_soft()
         }))
@@ -7473,7 +7507,7 @@ impl LocalAiChatView {
             }
         }
 
-        let card = self.popup_surface(list.finish());
+        let card = self.popup_surface(appearance.theme(), list.finish());
         let wrapped = if self.vibe_mode {
             ConstrainedBox::new(card)
                 .with_width(VIBE_COLUMN_WIDTH)
@@ -7776,8 +7810,8 @@ impl LocalAiChatView {
                     Container::new(row)
                         .with_uniform_padding(8.)
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                        .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-                        .with_background_color(genesi_panel_surface())
+                        .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
+                        .with_background_color(genesi_panel_surface(theme))
                         .finish(),
                 )
                 .on_left_mouse_down(move |ctx, _, _| {
@@ -8009,7 +8043,7 @@ impl LocalAiChatView {
             .with_horizontal_padding(6.)
             .with_vertical_padding(2.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
             .with_background_color(ColorU::new(0, 0, 0, 0))
             .finish();
 
@@ -8052,8 +8086,8 @@ impl LocalAiChatView {
         let bubble = if is_user {
             bubble
                 .with_uniform_padding(10.)
-                .with_background_color(genesi_card_surface())
-                .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+                .with_background_color(genesi_card_surface(theme))
+                .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
         } else {
             bubble.with_vertical_padding(2.)
         };
@@ -8185,8 +8219,8 @@ impl LocalAiChatView {
                     .with_horizontal_padding(8.)
                     .with_vertical_padding(6.)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-                    .with_background_color(genesi_card_surface())
+                    .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
+                    .with_background_color(genesi_card_surface(theme))
                     .finish(),
             )
             .on_left_mouse_down(move |ctx, _, _| {
@@ -8221,8 +8255,8 @@ impl LocalAiChatView {
                 .with_uniform_padding(8.)
                 .with_margin_top(2.)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
-                .with_background_color(genesi_card_surface())
+                .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
+                .with_background_color(genesi_card_surface(theme))
                 .finish();
                 column.add_child(body);
             }
@@ -8535,8 +8569,8 @@ impl LocalAiChatView {
             )
             .with_uniform_padding(14.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
-            .with_background_color(genesi_card_surface())
-            .with_border(Border::all(1.).with_border_color(genesi_subtle_border()))
+            .with_background_color(genesi_card_surface(theme))
+            .with_border(Border::all(1.).with_border_color(genesi_subtle_border(theme)))
             .with_margin_right(if index + 1 < CARDS.len() { 10. } else { 0. })
             .finish();
 
@@ -9556,7 +9590,7 @@ impl View for LocalAiChatView {
                 .with_horizontal_padding(11.)
                 .with_vertical_padding(10.)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
-                .with_background_color(genesi_compose_surface())
+                .with_background_color(genesi_compose_surface(theme))
                 .finish(),
             LocalAiDropTargetData {
                 panel: self.weak_handle.clone(),
