@@ -1164,6 +1164,23 @@ fn empty_stream_reason(reason: &str) -> Option<String> {
 /// Pull the human-readable part out of an error body. llama-server and the
 /// OpenAI-compatible providers answer `{"error":{"message":"…"}}`; anything else
 /// is shown verbatim, trimmed so a huge HTML page can't flood the panel.
+/// Advice to append when a provider says it is out of capacity.
+///
+/// Nothing the user can change about their request fixes this, so the message
+/// has to point at the only lever they have: a different model. Returns `None`
+/// for anything that is not a capacity refusal, because appending "try another
+/// model" to a bad-key error would send them the wrong way.
+fn capacity_advice(message: &str) -> Option<&'static str> {
+    let lowered = message.to_ascii_lowercase();
+    let out_of_capacity = lowered.contains("high demand")
+        || lowered.contains("overloaded")
+        || lowered.contains("currently unavailable")
+        || lowered.contains("service unavailable")
+        || lowered.contains("unavailable");
+    out_of_capacity
+        .then_some("This is the provider running out of capacity, not your setup — pick another model from the Model chip.")
+}
+
 fn format_server_detail(body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
@@ -1172,6 +1189,13 @@ fn format_server_detail(body: &str) -> String {
     let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
+            // Gemini wraps its error in an ARRAY -- `[{"error": {...}}]` -- so
+            // looking for `error` on the top level found nothing and the whole
+            // JSON blob was shown verbatim. Unwrap a single-element array first.
+            let value = match value.as_array().and_then(|items| items.first()) {
+                Some(first) => first.clone(),
+                None => value,
+            };
             value
                 .get("error")
                 .and_then(|error| {
@@ -1186,6 +1210,13 @@ fn format_server_detail(body: &str) -> String {
     if message.is_empty() {
         return String::new();
     }
+    // A capacity refusal is not something the user misconfigured, and the
+    // provider's own wording ("Spikes in demand are usually temporary") does not
+    // say the one thing that helps. Name the way out.
+    let message = match capacity_advice(&message) {
+        Some(advice) => format!("{message} {advice}"),
+        None => message,
+    };
     const MAX_CHARS: usize = 400;
     let mut shown: String = message.chars().take(MAX_CHARS).collect();
     // Compare CHAR counts of the same string — comparing byte lengths against the
@@ -1720,7 +1751,13 @@ impl CloudProviderKind {
             Self::OpenAI => "gpt-4o-mini",
             Self::Groq => "llama-3.3-70b-versatile",
             Self::Anthropic => "claude-sonnet-4-6",
-            Self::Gemini => "gemini-3.5-flash",
+            // Not the newest flash. `gemini-3.5-flash` is the one every free
+            // key is pointed at, and its free tier answers 503 "experiencing
+            // high demand" far more often than it answers a prompt. The
+            // previous generation is the same shape of model with capacity to
+            // spare, and it is one pick away from the newest if the user wants
+            // to try their luck.
+            Self::Gemini => "gemini-2.5-flash",
         }
     }
 
@@ -1733,12 +1770,16 @@ impl CloudProviderKind {
                 "meta-llama/Llama-3.1-8B-Instruct",
             ],
             Self::OpenAI => &["gpt-5.4", "gpt-4o-mini"],
+            // Groq retires models faster than most, and three of the five
+            // listed here had been decommissioned: picking one returned a
+            // model-not-found that reads as "the provider is broken". Checked
+            // against Groq's own production list.
             Self::Groq => &[
                 "llama-3.3-70b-versatile",
                 "openai/gpt-oss-120b",
-                "moonshotai/kimi-k2-instruct",
-                "qwen/qwen3-32b",
-                "deepseek-r1-distill-llama-70b",
+                "openai/gpt-oss-20b",
+                "qwen/qwen3.8-27b",
+                "llama-3.1-8b-instant",
             ],
             Self::Anthropic => &[
                 "claude-fable-5",
@@ -1746,7 +1787,16 @@ impl CloudProviderKind {
                 "claude-sonnet-4-6",
                 "claude-haiku-4-5",
             ],
-            Self::Gemini => &["gemini-3.5-flash"],
+            // A single entry left nowhere to go when that one model was out of
+            // capacity, which for the newest flash is most of the time on a
+            // free key.
+            Self::Gemini => &[
+                "gemini-2.5-flash",
+                "gemini-3.5-flash",
+                "gemini-3-flash",
+                "gemini-2.5-flash-lite",
+                "gemini-2.5-pro",
+            ],
         }
     }
 

@@ -400,3 +400,35 @@ fn an_ordinary_stop_explains_nothing() {
     assert_eq!(empty_stream_reason("stop"), None);
     assert_eq!(empty_stream_reason("tool_calls"), None);
 }
+
+#[test]
+fn a_gemini_error_array_is_unwrapped_like_an_object() {
+    // Gemini answers `[{"error": {...}}]`, not `{"error": {...}}`. Looking for
+    // `error` on the top level found nothing, so the whole JSON blob was shown
+    // to the user verbatim -- braces, status field and all.
+    let body = r#"[{"error":{"code":503,"message":"This model is currently experiencing high demand.","status":"UNAVAILABLE"}}]"#;
+    let shown = format_server_detail(body);
+    assert!(
+        shown.contains("This model is currently experiencing high demand."),
+        "got {shown}"
+    );
+    assert!(!shown.contains("\"status\""), "raw JSON leaked: {shown}");
+}
+
+#[test]
+fn a_capacity_refusal_names_the_way_out() {
+    // Nothing about the request is wrong, so the message has to point at the
+    // only lever the user has.
+    let shown = format_server_detail(
+        r#"{"error":{"message":"The model is overloaded. Please try again later."}}"#,
+    );
+    assert!(shown.contains("pick another model"), "got {shown}");
+}
+
+#[test]
+fn an_ordinary_error_gets_no_capacity_advice() {
+    // Telling someone with a bad key to try another model sends them the wrong
+    // way entirely.
+    let shown = format_server_detail(r#"{"error":{"message":"Invalid API key"}}"#);
+    assert!(!shown.contains("pick another model"), "got {shown}");
+}
