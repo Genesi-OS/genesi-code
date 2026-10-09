@@ -11,6 +11,8 @@ use warpui::AppContext;
 pub mod find_references_view;
 #[cfg(not(target_family = "wasm"))]
 pub mod language_server_extension;
+#[cfg(not(target_family = "wasm"))]
+pub mod rename_view;
 #[cfg_attr(not(target_family = "wasm"), path = "local_code_editor.rs")]
 #[cfg_attr(target_family = "wasm", path = "local_code_editor_wasm.rs")]
 pub mod local_code_editor;

@@ -4,6 +4,7 @@ use num_traits::SaturatingSub;
 use pathfinder_color::ColorU;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::Path;
 use string_offset::CharOffset;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
@@ -28,7 +29,7 @@ use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use super::lsp_telemetry::LspTelemetryEvent;
 use crate::code::local_code_editor::{
     HoverContentSegment, LocalCodeEditorAction, LocalCodeEditorView, LspCompletionState,
-    LspHoverState, COMPLETION_DOC_MAX_HEIGHT, COMPLETION_MAX_VISIBLE_ITEMS,
+    LspHoverState, RenameTarget, COMPLETION_DOC_MAX_HEIGHT, COMPLETION_MAX_VISIBLE_ITEMS,
     COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH, COMPLETION_ROW_HEIGHT,
     HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
@@ -1777,6 +1778,287 @@ $0",
         } else {
             format!("<{tag}>$0</{tag}>")
         }
+    }
+
+    // ── rename ──────────────────────────────────────────────────────────────
+
+    /// The identifier the caret is in or touching, as a char range. Used as the
+    /// rename's starting text when the server does not say what it will replace.
+    fn identifier_range_at(
+        &self,
+        offset: CharOffset,
+        ctx: &ViewContext<Self>,
+    ) -> Range<CharOffset> {
+        let editor = self.editor().as_ref(ctx);
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        let mut start = offset.as_usize();
+        while start > 0
+            && editor
+                .char_at(CharOffset::from(start - 1), ctx)
+                .is_some_and(is_ident)
+        {
+            start -= 1;
+        }
+        let mut end = offset.as_usize();
+        while editor
+            .char_at(CharOffset::from(end), ctx)
+            .is_some_and(is_ident)
+        {
+            end += 1;
+        }
+        CharOffset::from(start)..CharOffset::from(end)
+    }
+
+    fn text_in(&self, range: Range<CharOffset>, ctx: &ViewContext<Self>) -> String {
+        let editor = self.editor().as_ref(ctx);
+        (range.start.as_usize()..range.end.as_usize())
+            .filter_map(|i| editor.char_at(CharOffset::from(i), ctx))
+            .collect()
+    }
+
+    /// Show a one-line message at the caret, cleared by the next interaction.
+    pub(super) fn show_caret_notice(
+        &mut self,
+        message: impl Into<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let offset = self.editor().as_ref(ctx).cursor_head_offset(ctx);
+        self.caret_notice = Some((offset, message.into()));
+        ctx.notify();
+    }
+
+    pub(super) fn render_caret_notice(&self, message: &str, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        Container::new(
+            Text::new_inline(
+                message.to_string(),
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(theme.active_ui_text_color().into())
+            .finish(),
+        )
+        .with_horizontal_padding(10.)
+        .with_vertical_padding(6.)
+        .with_background(theme.surface_2())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .finish()
+    }
+
+    /// F2: ask the server what would be renamed, then ask the user for a name.
+    ///
+    /// Asking first matters. A rename on a keyword, a literal or a comment is
+    /// refused here, before the user has typed anything, instead of after.
+    pub(super) fn start_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        self.dismiss_lsp_overlays(ctx);
+
+        if !self.is_lsp_server_available(ctx) {
+            self.show_caret_notice("Rename needs a language server for this file.", ctx);
+            return;
+        }
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        if !server.as_ref(ctx).supports_rename() {
+            let name = server.as_ref(ctx).server_name();
+            self.show_caret_notice(format!("{name} can't rename symbols."), ctx);
+            return;
+        }
+        let Some(path) = self.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let editor = self.editor().as_ref(ctx);
+        let position = editor.cursor_lsp_position(ctx);
+        let cursor = editor.cursor_head_offset(ctx);
+        let word = self.identifier_range_at(cursor, ctx);
+
+        let request = match server
+            .as_ref(ctx)
+            .prepare_rename(path.clone(), position.clone())
+        {
+            Ok(request) => request,
+            Err(e) => {
+                log::warn!("prepareRename unavailable: {e}");
+                return;
+            }
+        };
+
+        ctx.spawn(request, move |me, result, ctx| {
+            let (anchor, name) = match result {
+                // The server said nothing here can be renamed.
+                Ok(None) => {
+                    me.show_caret_notice("Nothing to rename here.", ctx);
+                    return;
+                }
+                Ok(Some(Some(prepared))) => {
+                    let editor = me.editor().as_ref(ctx);
+                    let start = editor.lsp_location_to_offset(&prepared.range.start, ctx);
+                    let end = editor.lsp_location_to_offset(&prepared.range.end, ctx);
+                    let name = prepared
+                        .placeholder
+                        .unwrap_or_else(|| me.text_in(start..end, ctx));
+                    (start, name)
+                }
+                // The server takes renames but did not preview, or the preview
+                // failed: start from the identifier under the caret and let the
+                // rename itself be the judge.
+                Ok(Some(None)) | Err(_) => (word.start, me.text_in(word.clone(), ctx)),
+            };
+
+            if name.trim().is_empty() {
+                me.show_caret_notice("Nothing to rename here.", ctx);
+                return;
+            }
+
+            me.rename_target = Some(RenameTarget {
+                path: path.clone(),
+                position: position.clone(),
+                anchor,
+            });
+            me.rename_dialog
+                .update(ctx, |dialog, ctx| dialog.open(&name, ctx));
+            ctx.focus(&me.rename_dialog);
+            ctx.notify();
+        });
+    }
+
+    pub(super) fn close_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        self.rename_target = None;
+        self.rename_dialog
+            .update(ctx, |dialog, ctx| dialog.close(ctx));
+        ctx.focus(&self.editor);
+        ctx.notify();
+    }
+
+    pub(super) fn confirm_rename(&mut self, new_name: String, ctx: &mut ViewContext<Self>) {
+        let Some(target) = self.rename_target.clone() else {
+            return;
+        };
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        let request =
+            match server
+                .as_ref(ctx)
+                .rename(target.path.clone(), target.position.clone(), new_name)
+            {
+                Ok(request) => request,
+                Err(e) => {
+                    self.rename_dialog
+                        .update(ctx, |dialog, ctx| dialog.set_error(e.to_string(), ctx));
+                    return;
+                }
+            };
+
+        ctx.spawn(request, move |me, result, ctx| match result {
+            Ok(Some(edit)) => match me.apply_workspace_edit(edit, ctx) {
+                Ok(()) => me.close_rename(ctx),
+                Err(e) => me
+                    .rename_dialog
+                    .update(ctx, |dialog, ctx| dialog.set_error(e.to_string(), ctx)),
+            },
+            Ok(None) => me.rename_dialog.update(ctx, |dialog, ctx| {
+                dialog.set_error("The language server found nothing to rename.", ctx)
+            }),
+            // Servers explain a refused rename in the error ("x is already
+            // defined in this scope"), which is exactly what the user needs.
+            Err(e) => me
+                .rename_dialog
+                .update(ctx, |dialog, ctx| dialog.set_error(e.to_string(), ctx)),
+        });
+    }
+
+    /// Apply a server's workspace edit.
+    ///
+    /// The file in this editor is edited through the editor, so the whole
+    /// change is one undo step. Every other file is rewritten on disk; an open
+    /// tab picks the change up through the file watcher, and one with unsaved
+    /// edits of its own gets the existing conflict banner rather than having
+    /// either version silently thrown away.
+    pub(super) fn apply_workspace_edit(
+        &mut self,
+        edit: lsp_types::WorkspaceEdit,
+        ctx: &mut ViewContext<Self>,
+    ) -> anyhow::Result<()> {
+        let (files, skipped) = lsp::edits::workspace_edit_to_file_edits(edit)?;
+        if skipped > 0 {
+            // Creating, renaming or deleting files mid-edit is not supported yet,
+            // and applying the text half of such an edit would leave the
+            // project inconsistent. Refuse the whole thing.
+            anyhow::bail!(
+                "This change also creates, moves or deletes files, which isn't supported yet."
+            );
+        }
+
+        let current = self.file_path().map(Path::to_path_buf);
+        let mut others = Vec::new();
+        for file in files {
+            if current.as_deref() == Some(file.path.as_path()) {
+                self.apply_edits_to_open_file(&file.edits, ctx);
+            } else {
+                others.push(file);
+            }
+        }
+
+        if !others.is_empty() {
+            ctx.spawn(
+                async move {
+                    let mut failures = Vec::new();
+                    for file in others {
+                        let result = async {
+                            let content = async_fs::read_to_string(&file.path).await?;
+                            let updated = lsp::edits::apply_text_edits(&content, &file.edits)?;
+                            async_fs::write(&file.path, updated).await?;
+                            anyhow::Ok(())
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            failures.push(format!("{}: {e}", file.path.display()));
+                        }
+                    }
+                    failures
+                },
+                |me, failures, ctx| {
+                    if !failures.is_empty() {
+                        log::warn!("rename: could not update {}", failures.join("; "));
+                        me.show_caret_notice(
+                            format!(
+                                "Renamed here, but {} other file(s) could not be updated.",
+                                failures.len()
+                            ),
+                            ctx,
+                        );
+                    }
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_edits_to_open_file(
+        &mut self,
+        edits: &[lsp::types::TextEdit],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.editor.update(ctx, |editor, ctx| {
+            let mut converted: Vec<(String, Range<CharOffset>)> = edits
+                .iter()
+                .filter_map(|edit| {
+                    let start = editor.lsp_location_to_offset(&edit.range.start, ctx);
+                    let end = editor.lsp_location_to_offset(&edit.range.end, ctx);
+                    (start <= end).then(|| (edit.text.clone(), start..end))
+                })
+                .collect();
+            // Back to front, so each edit's offsets still refer to the original
+            // text when it is applied.
+            converted.sort_by(|a, b| b.1.start.cmp(&a.1.start));
+            if let Ok(converted) = Vec1::try_from_vec(converted) {
+                editor.apply_edits(converted, ctx);
+            }
+        });
     }
 
     /// Close the completion popup (if any) and stop the editor from intercepting

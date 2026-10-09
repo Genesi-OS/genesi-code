@@ -24,8 +24,8 @@ use warp_util::on_cancel::OnCancelFutureExt;
 
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
-    CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, ReferenceLocation,
-    TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
+    CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, PrepareRename,
+    ReferenceLocation, TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
 
@@ -184,6 +184,30 @@ impl LspService {
 
     pub fn server_capabilities(&self) -> &Option<lsp_types::ServerCapabilities> {
         &self.server_capabilities
+    }
+
+    /// Whether the server can rename symbols at all.
+    pub fn supports_rename(&self) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.rename_provider.as_ref()),
+            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+        )
+    }
+
+    /// Whether the server answers `textDocument/prepareRename`, which says what
+    /// will be renamed before the user commits to a new name.
+    pub fn supports_prepare_rename(&self) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.rename_provider.as_ref()),
+            Some(OneOf::Right(lsp_types::RenameOptions {
+                prepare_provider: Some(true),
+                ..
+            }))
+        )
     }
 
     /// Whether the server announced it can answer `completionItem/resolve`.
@@ -810,6 +834,86 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// What a rename at `position` would touch, before committing to it.
+    ///
+    /// Returns `None` when the server says nothing renameable is there -- a
+    /// keyword, a literal, a comment -- which is the moment to tell the user,
+    /// not after they have typed a new name. `Ok(Some(None))` means the server
+    /// accepts a rename but did not say which text, so the caller falls back to
+    /// the word under the caret.
+    pub async fn prepare_rename(
+        &self,
+        path: &Path,
+        position: Position,
+    ) -> anyhow::Result<Option<Option<PrepareRename>>> {
+        if !self.service.supports_prepare_rename() {
+            // Not an error: the server just doesn't preview. Treat it as "yes,
+            // with no range", and let the rename itself be the judge.
+            return Ok(Some(None));
+        }
+
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: path_to_lsp_uri(path)?,
+            },
+            position,
+        };
+        let result = self
+            .service
+            .send_request::<request::PrepareRenameRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/prepareRename failed: {e}"),
+            );
+        }
+
+        Ok(match result? {
+            None => None,
+            Some(lsp_types::PrepareRenameResponse::Range(range)) => Some(Some(PrepareRename {
+                range: range.into(),
+                placeholder: None,
+            })),
+            Some(lsp_types::PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }) => {
+                Some(Some(PrepareRename {
+                    range: range.into(),
+                    placeholder: Some(placeholder),
+                }))
+            }
+            Some(lsp_types::PrepareRenameResponse::DefaultBehavior { default_behavior }) => {
+                default_behavior.then_some(None)
+            }
+        })
+    }
+
+    /// Rename the symbol at `position` to `new_name` across the workspace.
+    pub async fn rename(
+        &self,
+        path: &Path,
+        position: Position,
+        new_name: String,
+    ) -> anyhow::Result<Option<lsp_types::WorkspaceEdit>> {
+        let params = lsp_types::RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: path_to_lsp_uri(path)?,
+                },
+                position,
+            },
+            new_name,
+            work_done_progress_params: Default::default(),
+        };
+        let result = self.service.send_request::<request::Rename>(params).await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/rename failed: {e}"),
+            );
+        }
+        result
     }
 
     /// Ask the server to fill in the parts of a candidate it left out of the

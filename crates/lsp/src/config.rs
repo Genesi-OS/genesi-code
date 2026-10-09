@@ -9,7 +9,7 @@ use lsp_types::{
     ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
     CompletionItemCapabilityResolveSupport, DidChangeWatchedFilesClientCapabilities,
     GotoCapability, HoverClientCapabilities, InitializeParams, MarkupKind,
-    PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
+    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, TextDocumentClientCapabilities,
     TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkDoneProgressParams,
     WorkspaceClientCapabilities, WorkspaceFolder,
 };
@@ -461,6 +461,14 @@ fn default_client_capabilities() -> ClientCapabilities {
                     ..Default::default()
                 }),
                 context_support: Some(true),
+                ..Default::default()
+            }),
+            // Without prepare support a server renames blind; with it, the
+            // editor can refuse a rename on a keyword before the user types a
+            // name, and prefill the input with exactly what will change.
+            rename: Some(RenameClientCapabilities {
+                dynamic_registration: Some(false),
+                prepare_support: Some(true),
                 ..Default::default()
             }),
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {

@@ -48,8 +48,8 @@ use warp_util::path::to_relative_path;
 use warp_util::sync::Condition;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DropShadow, Expanded, Fill, Flex, Hoverable,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    Container, CornerRadius, CrossAxisAlignment, Dismiss, DropShadow, Expanded, Fill, Flex,
+    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
     ParentElement, ParentOffsetBounds, Radius, Rect, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::keymap::macros::*;
@@ -79,6 +79,7 @@ use crate::code::editor::model::HoverableLink;
 use crate::code::editor::EditorReviewComment;
 use crate::code::footer::{CodeFooterView, CodeFooterViewEvent};
 use crate::code::global_buffer_model::{BufferState, GlobalBufferModel, GlobalBufferModelEvent};
+use crate::code::rename_view::{Event as RenameEvent, RenameView};
 use crate::code::{SaveOutcome, ShowFindReferencesCardProvider};
 use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
@@ -137,11 +138,19 @@ type SaveCallback =
     Box<dyn FnOnce(SaveOutcome, &mut ViewContext<LocalCodeEditorView>) + Send + Sync + 'static>;
 
 pub fn init(app: &mut AppContext) {
-    app.register_fixed_bindings([FixedBinding::new(
-        "cmdorctrl-l",
-        LocalCodeEditorAction::InsertSelectedTextToInput,
-        id!("LocalCodeEditorView") & !id!("IMEOpen"),
-    )]);
+    app.register_fixed_bindings([
+        FixedBinding::new(
+            "cmdorctrl-l",
+            LocalCodeEditorAction::InsertSelectedTextToInput,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
+        // F2, the binding every editor since Visual Studio has used for this.
+        FixedBinding::new(
+            "f2",
+            LocalCodeEditorAction::RenameSymbol,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
+    ]);
 }
 
 pub enum LocalCodeEditorEvent {
@@ -234,6 +243,10 @@ pub enum LocalCodeEditorAction {
         lsp_position: lsp::types::Location,
         anchor_offset: CharOffset,
     },
+    /// Rename the symbol under the caret, everywhere the server finds it.
+    RenameSymbol,
+    /// Close the rename input without renaming (a click outside it).
+    CancelRename,
     /// The pointer moved onto a completion row: highlight it, the way hovering
     /// a list item does everywhere else.
     HighlightCompletionRow(usize),
@@ -318,6 +331,16 @@ impl LspHoverState {
 
         false
     }
+}
+
+/// What a pending rename applies to. Captured when the input opens, so moving
+/// the caret while typing the new name does not retarget the rename.
+#[derive(Clone)]
+pub(super) struct RenameTarget {
+    pub(super) path: PathBuf,
+    pub(super) position: lsp::types::Location,
+    /// Where to anchor the input: the start of the symbol.
+    pub(super) anchor: CharOffset,
 }
 
 /// State for the LSP completion popup (classic, non-AI autocomplete).
@@ -443,6 +466,12 @@ pub struct LocalCodeEditorView {
     pub(super) diagnostic_decorations: Vec<Decoration>,
     /// View for the find references feature.
     find_references_view: Option<ViewHandle<FindReferencesView>>,
+    /// The input that asks for a symbol's new name.
+    pub(super) rename_dialog: ViewHandle<RenameView>,
+    pub(super) rename_target: Option<RenameTarget>,
+    /// A one-line message anchored at the caret -- "nothing to rename here".
+    /// Cleared by the next keystroke, click or Escape, like the hover card.
+    pub(super) caret_notice: Option<(CharOffset, String)>,
     autosave_handle: Option<SpawnedFutureHandle>,
     /// The live inline suggestion, and the staleness bookkeeping that decides
     /// whether it may still be shown. See [`crate::code::ai_completion`].
@@ -463,6 +492,12 @@ impl LocalCodeEditorView {
         display_mode: Option<DisplayMode>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
+        let rename_dialog = ctx.add_typed_action_view(RenameView::new);
+        ctx.subscribe_to_view(&rename_dialog, |me, _, event, ctx| match event {
+            RenameEvent::Close => me.close_rename(ctx),
+            RenameEvent::Confirm { new_name } => me.confirm_rename(new_name.clone(), ctx),
+        });
+
         let context_menu = ctx.add_typed_action_view(|_| {
             Menu::new()
                 .prevent_interaction_with_other_elements()
@@ -488,6 +523,9 @@ impl LocalCodeEditorView {
                 }
 
                 if origin.from_user() {
+                    // A message about the caret's last position is stale the
+                    // moment the user types.
+                    me.caret_notice = None;
                     me.was_edited = true;
                     me.register_flow_keystroke(ctx);
                     ctx.emit(LocalCodeEditorEvent::UserEdited);
@@ -526,7 +564,8 @@ impl LocalCodeEditorView {
                 // prefix the popup was completing is no longer under the cursor.
                 // Leaving it open was the bug where clicking away from the list
                 // left it floating over unrelated code.
-                if me.dismiss_completion(ctx) {
+                let had_notice = me.caret_notice.take().is_some();
+                if me.dismiss_completion(ctx) || had_notice {
                     ctx.notify();
                 }
             }
@@ -716,6 +755,9 @@ impl LocalCodeEditorView {
             processed_diagnostics: Vec::new(),
             diagnostic_decorations: Vec::new(),
             find_references_view: None,
+            rename_dialog,
+            rename_target: None,
+            caret_notice: None,
             autosave_handle: None,
             inline_completion: InlineCompletionState::default(),
             inline_completion_handle: None,
@@ -1754,7 +1796,7 @@ impl LocalCodeEditorView {
         });
     }
 
-    fn is_lsp_server_available(&self, ctx: &mut ViewContext<Self>) -> bool {
+    pub(super) fn is_lsp_server_available(&self, ctx: &mut ViewContext<Self>) -> bool {
         self.lsp_server
             .as_ref()
             .map(|server| server.as_ref(ctx).is_ready_for_requests())
@@ -2804,6 +2846,9 @@ impl LocalCodeEditorView {
             MenuItemFields::new("Find references")
                 .with_on_select_action(LocalCodeEditorAction::FindReferences)
                 .into_item(),
+            MenuItemFields::new("Rename symbol")
+                .with_on_select_action(LocalCodeEditorAction::RenameSymbol)
+                .into_item(),
         ]
     }
 
@@ -2819,11 +2864,12 @@ impl LocalCodeEditorView {
     }
 
     /// Dismiss any open LSP overlays (hover tooltip and find references card).
-    fn dismiss_lsp_overlays(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+    pub(super) fn dismiss_lsp_overlays(&mut self, ctx: &mut ViewContext<Self>) -> bool {
         let had_refs = self.close_find_references_card(ctx);
         let had_hover = self.lsp_hover_state.clear();
         let had_completion = self.dismiss_completion(ctx);
-        had_refs || had_hover || had_completion
+        let had_notice = self.caret_notice.take().is_some();
+        had_refs || had_hover || had_completion || had_notice
     }
 
     /// Perform goto definition at the cursor position and navigate directly.
@@ -3145,6 +3191,30 @@ impl View for LocalCodeEditorView {
             stack.add_positioned_overlay_child(card, positioning);
         }
 
+        if self.rename_dialog.as_ref(app).is_open() {
+            if let Some(positioning) = self
+                .rename_target
+                .as_ref()
+                .and_then(|target| self.compute_card_positioning(target.anchor, 90., app))
+            {
+                let dialog = Dismiss::new(ChildView::new(&self.rename_dialog).finish())
+                    .on_dismiss(|ctx, _| {
+                        ctx.dispatch_typed_action(LocalCodeEditorAction::CancelRename);
+                    })
+                    .finish();
+                stack.add_positioned_overlay_child(dialog, positioning);
+            }
+        }
+
+        if let Some((offset, message)) = &self.caret_notice {
+            if let Some(positioning) = self.compute_card_positioning(*offset, 40., app) {
+                stack.add_positioned_overlay_child(
+                    self.render_caret_notice(message, app),
+                    positioning,
+                );
+            }
+        }
+
         // Render the classic (non-AI) LSP completion popup when active.
         if let (Some(popup), Some(positioning)) = (
             self.render_completion_popup(app),
@@ -3243,6 +3313,8 @@ impl TypedActionView for LocalCodeEditorView {
                 // This is triggered on cmd-click when go-to-definition has no different location.
                 self.fetch_find_references_and_show(lsp_position.clone(), *anchor_offset, ctx);
             }
+            LocalCodeEditorAction::RenameSymbol => self.start_rename(ctx),
+            LocalCodeEditorAction::CancelRename => self.close_rename(ctx),
             LocalCodeEditorAction::HighlightCompletionRow(row) => {
                 self.select_completion_row(*row, ctx);
             }

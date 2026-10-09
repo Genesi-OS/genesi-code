@@ -141,6 +141,7 @@ impl TryFrom<LspLocation> for ReferenceLocation {
 }
 
 /// Edit returned by the LSP.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEdit {
     pub range: Range,
     pub text: String,
@@ -153,6 +154,16 @@ impl From<lsp_types::TextEdit> for TextEdit {
             text: edit.new_text,
         }
     }
+}
+
+/// What a rename would replace, from `textDocument/prepareRename`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareRename {
+    /// The text the rename replaces -- usually the identifier, sometimes less
+    /// (a rename on `self.x` targets just `x`).
+    pub range: Range,
+    /// The server's suggestion for the input's initial text, when it has one.
+    pub placeholder: Option<String>,
 }
 
 /// Document version that should be tracked by the LSP.

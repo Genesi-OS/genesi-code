@@ -26,7 +26,8 @@ use crate::server_repo_watcher::LspRepoWatcher;
 use crate::supported_servers::LSPServerType;
 use crate::types::{
     CompletionList, CompletionTrigger, DefinitionLocation, DocumentVersion, HoverResult, Location,
-    ReferenceLocation, TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
+    PrepareRename, ReferenceLocation, TextDocumentContentChangeEvent, TextEdit,
+    WatchedFileChangeEvent,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{spawn_lsp_service, LspServiceInitializationResult};
@@ -743,6 +744,44 @@ impl LspServerModel {
             service
                 .text_document()
                 .completion(&path, position.into_lsp(), trigger)
+                .await
+        })
+    }
+
+    /// Whether this server can rename symbols.
+    pub fn supports_rename(&self) -> bool {
+        self.service()
+            .map(|service| service.supports_rename())
+            .unwrap_or(false)
+    }
+
+    /// See [`crate::service::TextDocumentService::prepare_rename`].
+    pub fn prepare_rename(
+        &self,
+        path: PathBuf,
+        position: Location,
+    ) -> Result<impl Future<Output = Result<Option<Option<PrepareRename>>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .prepare_rename(&path, position.into_lsp())
+                .await
+        })
+    }
+
+    /// Rename the symbol at `position` across the workspace.
+    pub fn rename(
+        &self,
+        path: PathBuf,
+        position: Location,
+        new_name: String,
+    ) -> Result<impl Future<Output = Result<Option<lsp_types::WorkspaceEdit>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .rename(&path, position.into_lsp(), new_name)
                 .await
         })
     }
