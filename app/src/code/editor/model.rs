@@ -3216,6 +3216,129 @@ impl CodeEditorModel {
         self.vim_set_selections(new_selections, AutoScrollBehavior::Selection, ctx);
     }
 
+    // ── multiple cursors ────────────────────────────────────────────────────
+
+    /// The buffer as chars, and the zero-based char range each selection covers.
+    ///
+    /// Offsets are one-based -- `CharOffset::from(n)` sits before the nth char --
+    /// so a selection from offset `a` to `b` covers chars `a - 1 .. b - 1`.
+    fn chars_and_selection_ranges(
+        &self,
+        ctx: &AppContext,
+    ) -> (Vec<char>, Vec<std::ops::Range<usize>>) {
+        let chars: Vec<char> = self.content().as_ref(ctx).text().as_str().chars().collect();
+        let ranges = self
+            .selections(ctx)
+            .iter()
+            .map(|selection| {
+                let (start, end) = if selection.head > selection.tail {
+                    (selection.tail, selection.head)
+                } else {
+                    (selection.head, selection.tail)
+                };
+                start.as_usize().saturating_sub(1)..end.as_usize().saturating_sub(1)
+            })
+            .collect();
+        (chars, ranges)
+    }
+
+    fn selection_for_chars(range: std::ops::Range<usize>) -> SelectionOffsets {
+        SelectionOffsets {
+            tail: CharOffset::from(range.start + 1),
+            head: CharOffset::from(range.end + 1),
+        }
+    }
+
+    /// Ctrl+D. With a bare caret, select the word under it; with a selection,
+    /// add a cursor at the next place that text occurs.
+    ///
+    /// The first press only selects, matching every editor that has this: it
+    /// shows what the next presses will match before adding anything.
+    pub fn add_next_occurrence(&mut self, ctx: &mut ModelContext<Self>) {
+        let (chars, ranges) = self.chars_and_selection_ranges(ctx);
+        let Some(primary) = ranges.last().cloned() else {
+            return;
+        };
+
+        if primary.is_empty() {
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            let mut start = primary.start;
+            while start > 0 && chars.get(start - 1).copied().is_some_and(is_word) {
+                start -= 1;
+            }
+            let mut end = primary.start;
+            while chars.get(end).copied().is_some_and(is_word) {
+                end += 1;
+            }
+            if start == end {
+                return;
+            }
+            let mut selections: Vec<SelectionOffsets> = self.selections(ctx).into_iter().collect();
+            if let Some(last) = selections.last_mut() {
+                *last = Self::selection_for_chars(start..end);
+            }
+            if let Ok(selections) = Vec1::try_from_vec(selections) {
+                self.vim_set_selections(selections, AutoScrollBehavior::Selection, ctx);
+            }
+            return;
+        }
+
+        let needle = chars[primary.clone()].to_vec();
+        let Some(start) = next_occurrence(&chars, &needle, primary.end, &ranges) else {
+            return;
+        };
+        let mut selections: Vec<SelectionOffsets> = self.selections(ctx).into_iter().collect();
+        selections.push(Self::selection_for_chars(start..start + needle.len()));
+        if let Ok(selections) = Vec1::try_from_vec(selections) {
+            self.vim_set_selections(selections, AutoScrollBehavior::Selection, ctx);
+        }
+    }
+
+    /// Ctrl+Shift+L: a cursor at every occurrence of the selected text (or the
+    /// word under the caret).
+    pub fn select_all_occurrences(&mut self, ctx: &mut ModelContext<Self>) {
+        let (_, ranges) = self.chars_and_selection_ranges(ctx);
+        if ranges.last().is_some_and(|primary| primary.is_empty()) {
+            // Expand the caret to its word first, so there is something to match.
+            self.add_next_occurrence(ctx);
+        }
+        let (chars, ranges) = self.chars_and_selection_ranges(ctx);
+        let Some(primary) = ranges.last().cloned() else {
+            return;
+        };
+        if primary.is_empty() {
+            return;
+        }
+        let needle = chars[primary].to_vec();
+        let selections: Vec<SelectionOffsets> = all_occurrences(&chars, &needle)
+            .into_iter()
+            .map(|start| Self::selection_for_chars(start..start + needle.len()))
+            .collect();
+        if let Ok(selections) = Vec1::try_from_vec(selections) {
+            self.vim_set_selections(selections, AutoScrollBehavior::None, ctx);
+        }
+    }
+
+    /// Escape with several cursors: keep only the newest. Returns whether there
+    /// was anything to collapse, so Escape can fall through to closing overlays
+    /// when there wasn't.
+    pub fn collapse_to_primary_selection(&mut self, ctx: &mut ModelContext<Self>) -> bool {
+        let selections = self.selections(ctx);
+        if selections.len() <= 1 {
+            return false;
+        }
+        let primary = *selections.last();
+        self.vim_set_selections(
+            vec1::vec1![SelectionOffsets {
+                head: primary.head,
+                tail: primary.head,
+            }],
+            AutoScrollBehavior::Selection,
+            ctx,
+        );
+        true
+    }
+
     fn compute_smart_indent_results(
         &self,
         mode: IndentMode,
@@ -3982,6 +4105,55 @@ impl CodeEditorModel {
             });
         });
     }
+}
+
+/// The next place `needle` occurs in `haystack`, searching forward from char
+/// index `from` and wrapping around to the start.
+///
+/// `taken` holds the char ranges already selected; an occurrence that overlaps
+/// one is skipped, so pressing Ctrl+D past the last occurrence wraps to the
+/// first one not yet selected instead of re-selecting it. Returns `None` once
+/// every occurrence is taken. Indices are zero-based char indices, not offsets.
+pub(crate) fn next_occurrence(
+    haystack: &[char],
+    needle: &[char],
+    from: usize,
+    taken: &[std::ops::Range<usize>],
+) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let last_start = haystack.len() - needle.len();
+    let overlaps_taken = |start: usize| {
+        let end = start + needle.len();
+        taken
+            .iter()
+            .any(|range| start < range.end && range.start < end)
+    };
+    let matches_at = |start: usize| haystack[start..start + needle.len()] == *needle;
+
+    let from = from.min(last_start + 1);
+    (from..=last_start)
+        .chain(0..from.min(last_start + 1))
+        .find(|&start| matches_at(start) && !overlaps_taken(start))
+}
+
+/// Every place `needle` occurs in `haystack`, without overlaps, as char indices.
+pub(crate) fn all_occurrences(haystack: &[char], needle: &[char]) -> Vec<usize> {
+    let mut found = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return found;
+    }
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        if haystack[start..start + needle.len()] == *needle {
+            found.push(start);
+            start += needle.len();
+        } else {
+            start += 1;
+        }
+    }
+    found
 }
 
 impl PlainTextEditorModel for CodeEditorModel {

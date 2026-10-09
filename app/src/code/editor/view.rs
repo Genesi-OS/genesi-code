@@ -755,6 +755,17 @@ impl CodeEditorView {
             return;
         }
 
+        // Several cursors: Escape drops back to one before it does anything
+        // else, which is the only way out of multi-cursor that every editor
+        // agrees on.
+        if !self.vim_mode_enabled(ctx)
+            && self
+                .model
+                .update(ctx, |model, ctx| model.collapse_to_primary_selection(ctx))
+        {
+            return;
+        }
+
         // If find bar is open, close it (editor handles escape)
         if self.find_bar_open(ctx) {
             self.close_find_bar(true, ctx);

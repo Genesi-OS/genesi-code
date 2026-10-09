@@ -526,11 +526,28 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(text_entry.clone())
         .with_key_binding("cmdorctrl-/"),
+        // Ctrl+D is forward-delete only on macOS, where it is the platform's
+        // own binding and Cmd is the primary modifier. Everywhere else it is
+        // the multi-cursor key, as in every other editor there.
         EditableBinding::new("editor_view:delete", "Delete", CodeEditorViewAction::Delete)
             .with_context_predicate(
                 text_entry.clone() & !id!("VimNormalMode") & !id!("VimVisualMode"),
             )
-            .with_key_binding("ctrl-d"),
+            .with_mac_key_binding("ctrl-d"),
+        EditableBinding::new(
+            "editor_view:add_next_occurrence",
+            "Add cursor at next occurrence",
+            CodeEditorViewAction::AddNextOccurrence,
+        )
+        .with_context_predicate(text_entry.clone() & !id!("VimNormalMode") & !id!("VimVisualMode"))
+        .with_key_binding("cmdorctrl-d"),
+        EditableBinding::new(
+            "editor_view:select_all_occurrences",
+            "Add cursors at all occurrences",
+            CodeEditorViewAction::SelectAllOccurrences,
+        )
+        .with_context_predicate(text_entry.clone() & !id!("VimNormalMode") & !id!("VimVisualMode"))
+        .with_key_binding("cmdorctrl-shift-l"),
         EditableBinding::new(
             "editor_view:vim_scroll_half_page_down",
             "Scroll down half a page (vim)",
@@ -661,6 +678,10 @@ pub fn init(app: &mut AppContext) {
 
 #[derive(Debug, Clone)]
 pub enum CodeEditorViewAction {
+    /// Ctrl+D: select the word, then add a cursor at each next occurrence.
+    AddNextOccurrence,
+    /// Ctrl+Shift+L: a cursor at every occurrence.
+    SelectAllOccurrences,
     UserTyped(UserInput<String>),
     VimUserTyped(UserInput<String>),
     Enter,
@@ -824,6 +845,10 @@ impl CodeEditorViewAction {
             | Self::SelectToLineStart
             | Self::SelectToLineEnd
             | Self::SelectAll
+            // Adding cursors only moves the selection; it edits nothing, so a
+            // read-only view may still use it to highlight every occurrence.
+            | Self::AddNextOccurrence
+            | Self::SelectAllOccurrences
             | Self::ToggleDiffNav(_)
             | Self::MoveUp
             | Self::MoveDown
@@ -1124,6 +1149,12 @@ impl TypedActionView for CodeEditorView {
             ShowFindBar => self.show_find_bar(ctx),
             ShowGoToLine => self.show_goto_line(ctx),
             Escape => self.escape(ctx),
+            AddNextOccurrence => self
+                .model
+                .update(ctx, |model, ctx| model.add_next_occurrence(ctx)),
+            SelectAllOccurrences => self
+                .model
+                .update(ctx, |model, ctx| model.select_all_occurrences(ctx)),
             HiddenSectionExpansion {
                 line_range,
                 expansion_type,

@@ -1320,3 +1320,117 @@ fn test_enter_after_an_ordinary_line_does_not_indent_in() {
         });
     })
 }
+
+fn chars(text: &str) -> Vec<char> {
+    text.chars().collect()
+}
+
+#[test]
+fn next_occurrence_searches_forward_then_wraps() {
+    let haystack = chars("foo bar foo baz foo");
+    let needle = chars("foo");
+    // The first `foo` is selected; the next is at 8, then 16, then nothing.
+    assert_eq!(next_occurrence(&haystack, &needle, 3, &[0..3]), Some(8));
+    assert_eq!(
+        next_occurrence(&haystack, &needle, 11, &[0..3, 8..11]),
+        Some(16)
+    );
+    assert_eq!(
+        next_occurrence(&haystack, &needle, 19, &[0..3, 8..11, 16..19]),
+        None,
+        "every occurrence is already taken"
+    );
+}
+
+#[test]
+fn next_occurrence_wraps_to_one_not_yet_taken() {
+    // Starting from the last `foo` when the middle one is the only free one:
+    // the search must wrap rather than stop at the end.
+    let haystack = chars("foo foo foo");
+    let needle = chars("foo");
+    assert_eq!(
+        next_occurrence(&haystack, &needle, 11, &[0..3, 8..11]),
+        Some(4)
+    );
+}
+
+#[test]
+fn all_occurrences_does_not_overlap() {
+    // `aaaa` holds `aa` twice end to end, not three times overlapping -- two
+    // overlapping cursors would type into each other.
+    assert_eq!(all_occurrences(&chars("aaaa"), &chars("aa")), vec![0, 2]);
+    assert_eq!(
+        all_occurrences(&chars("x"), &chars("")),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn ctrl_d_first_selects_the_word_then_adds_the_next() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(
+            &mut app,
+            "let count = count + count;",
+            ContentVersion::new(),
+        );
+        layout_model(&mut app, &editor).await;
+
+        // Caret inside the first `count` (chars 4..9 -> offsets 5..10).
+        editor.update(&mut app, |editor, ctx| {
+            editor.cursor_at(CharOffset::from(6), ctx);
+            editor.add_next_occurrence(ctx);
+        });
+        editor.read(&app, |editor, ctx| {
+            let selections = editor.selections(ctx);
+            assert_eq!(selections.len(), 1, "the first press only selects the word");
+            assert_eq!(
+                (selections.first().tail, selections.first().head),
+                (CharOffset::from(5), CharOffset::from(10))
+            );
+        });
+
+        editor.update(&mut app, |editor, ctx| editor.add_next_occurrence(ctx));
+        editor.read(&app, |editor, ctx| {
+            assert_eq!(editor.selections(ctx).len(), 2);
+        });
+
+        editor.update(&mut app, |editor, ctx| {
+            assert!(editor.collapse_to_primary_selection(ctx));
+            assert!(
+                !editor.collapse_to_primary_selection(ctx),
+                "nothing left to collapse"
+            );
+        });
+    })
+}
+
+#[test]
+fn typing_with_several_cursors_edits_every_occurrence() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+        let editor = mock_model(&mut app, "a = x; b = x;", ContentVersion::new());
+        layout_model(&mut app, &editor).await;
+
+        // Select the first `x` (char 4 -> offsets 5..6) and grab them all.
+        editor.update(&mut app, |editor, ctx| {
+            editor.vim_set_selections(
+                vec1![SelectionOffsets {
+                    tail: CharOffset::from(5),
+                    head: CharOffset::from(6),
+                }],
+                AutoScrollBehavior::None,
+                ctx,
+            );
+            editor.select_all_occurrences(ctx);
+            editor.insert("value", EditOrigin::UserTyped, ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            assert_eq!(
+                editor.content.as_ref(ctx).text().as_str(),
+                "a = value; b = value;"
+            );
+        });
+    })
+}
