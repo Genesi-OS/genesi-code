@@ -186,6 +186,34 @@ impl LspService {
         &self.server_capabilities
     }
 
+    /// Whether the server offers code actions (quick fixes, refactors).
+    pub fn supports_code_actions(&self) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.code_action_provider.as_ref()),
+            Some(lsp_types::CodeActionProviderCapability::Simple(true))
+                | Some(lsp_types::CodeActionProviderCapability::Options(_))
+        )
+    }
+
+    /// Whether the server fills in a code action's edit lazily, through
+    /// `codeAction/resolve`. rust-analyzer does this for every assist: the list
+    /// carries titles only, and the edit comes back on request.
+    pub fn supports_code_action_resolve(&self) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.code_action_provider.as_ref()),
+            Some(lsp_types::CodeActionProviderCapability::Options(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..
+                }
+            ))
+        )
+    }
+
     /// Whether the server can rename symbols at all.
     pub fn supports_rename(&self) -> bool {
         matches!(
@@ -834,6 +862,77 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// The code actions available for `range`: quick fixes for the diagnostics
+    /// it overlaps, and refactors that apply there.
+    ///
+    /// Bare commands are dropped. A command's effect usually arrives as a
+    /// `workspace/applyEdit` request from the server, which this client does
+    /// not answer yet, so offering one would be offering a menu entry that does
+    /// nothing. Disabled actions are dropped for the same reason.
+    pub async fn code_actions(
+        &self,
+        path: &Path,
+        range: lsp_types::Range,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> anyhow::Result<Vec<lsp_types::CodeAction>> {
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: path_to_lsp_uri(path)?,
+            },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics,
+                only: None,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let result = self
+            .service
+            .send_request::<request::CodeActionRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/codeAction failed: {e}"),
+            );
+        }
+
+        let resolves_lazily = self.service.supports_code_action_resolve();
+        Ok(result?
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| match item {
+                lsp_types::CodeActionOrCommand::CodeAction(action) => Some(action),
+                lsp_types::CodeActionOrCommand::Command(_) => None,
+            })
+            .filter(|action| action.disabled.is_none())
+            // An action with neither an edit nor a way to get one does nothing
+            // this client can carry out.
+            .filter(|action| action.edit.is_some() || (resolves_lazily && action.data.is_some()))
+            .collect())
+    }
+
+    /// Fill in a code action's edit, for servers that send titles first.
+    pub async fn resolve_code_action(
+        &self,
+        action: lsp_types::CodeAction,
+    ) -> anyhow::Result<lsp_types::CodeAction> {
+        let result = self
+            .service
+            .send_request::<request::CodeActionResolveRequest>(action)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("codeAction/resolve failed: {e}"),
+            );
+        }
+        result
     }
 
     /// What a rename at `position` would touch, before committing to it.

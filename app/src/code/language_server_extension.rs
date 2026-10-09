@@ -34,6 +34,7 @@ use crate::code::local_code_editor::{
     HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
 use crate::editor::InteractionState;
+use crate::menu::MenuItemFields;
 use vec1::Vec1;
 
 /// A processed diagnostic with its converted offset range.
@@ -1778,6 +1779,144 @@ $0",
         } else {
             format!("<{tag}>$0</{tag}>")
         }
+    }
+
+    // ── code actions ────────────────────────────────────────────────────────
+
+    /// Ctrl+.: ask the server what it can do at the caret, and list it there.
+    pub(super) fn show_code_actions(&mut self, ctx: &mut ViewContext<Self>) {
+        self.dismiss_lsp_overlays(ctx);
+
+        if !self.is_lsp_server_available(ctx) {
+            self.show_caret_notice("Quick fixes need a language server for this file.", ctx);
+            return;
+        }
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        if !server.as_ref(ctx).supports_code_actions() {
+            let name = server.as_ref(ctx).server_name();
+            self.show_caret_notice(format!("{name} doesn't offer quick fixes."), ctx);
+            return;
+        }
+        let Some(path) = self.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let cursor = self.editor().as_ref(ctx).cursor_lsp_position(ctx);
+        let position = lsp_types::Position {
+            line: cursor.line as u32,
+            character: cursor.column as u32,
+        };
+        // The diagnostics on the caret's line. A fix is offered for a
+        // diagnostic the server is told about, and the caret rarely sits
+        // exactly inside the red squiggle when the user reaches for it.
+        let diagnostics = server
+            .as_ref(ctx)
+            .diagnostics_for_path(&path)
+            .ok()
+            .flatten()
+            .map(|document| {
+                document
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.range.start.line <= position.line
+                            && position.line <= diagnostic.range.end.line
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let request = match server.as_ref(ctx).code_actions(
+            path,
+            lsp_types::Range {
+                start: position,
+                end: position,
+            },
+            diagnostics,
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                log::warn!("codeAction unavailable: {e}");
+                return;
+            }
+        };
+
+        ctx.spawn(request, |me, result, ctx| {
+            let mut actions = match result {
+                Ok(actions) => actions,
+                Err(e) => {
+                    me.show_caret_notice(format!("Couldn't get quick fixes: {e}"), ctx);
+                    return;
+                }
+            };
+            if actions.is_empty() {
+                me.show_caret_notice("No quick fixes here.", ctx);
+                return;
+            }
+            // The server's own pick first, then fixes before refactors. That
+            // puts the likely answer under Enter.
+            actions.sort_by_key(|action| {
+                let preferred = action.is_preferred.unwrap_or(false);
+                let quickfix = action
+                    .kind
+                    .as_ref()
+                    .is_some_and(|kind| kind.as_str().starts_with("quickfix"));
+                (!preferred, !quickfix)
+            });
+
+            let items = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    MenuItemFields::new(action.title.clone())
+                        .with_on_select_action(LocalCodeEditorAction::ApplyCodeAction(index))
+                        .into_item()
+                })
+                .collect();
+            me.pending_code_actions = actions;
+            me.open_context_menu_with(items, ctx);
+        });
+    }
+
+    /// Apply the chosen code action, resolving its edit first if the server
+    /// only sent a title.
+    pub(super) fn apply_code_action(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(action) = self.pending_code_actions.get(index).cloned() else {
+            return;
+        };
+        self.pending_code_actions.clear();
+
+        if let Some(edit) = action.edit.clone() {
+            if let Err(e) = self.apply_workspace_edit(edit, ctx) {
+                self.show_caret_notice(e.to_string(), ctx);
+            }
+            return;
+        }
+
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        let request = match server.as_ref(ctx).resolve_code_action(action) {
+            Ok(request) => request,
+            Err(e) => {
+                self.show_caret_notice(e.to_string(), ctx);
+                return;
+            }
+        };
+        ctx.spawn(request, |me, result, ctx| match result {
+            Ok(resolved) => match resolved.edit {
+                Some(edit) => {
+                    if let Err(e) = me.apply_workspace_edit(edit, ctx) {
+                        me.show_caret_notice(e.to_string(), ctx);
+                    }
+                }
+                None => me.show_caret_notice("That fix didn't produce any change.", ctx),
+            },
+            Err(e) => me.show_caret_notice(format!("Couldn't apply the fix: {e}"), ctx),
+        });
     }
 
     // ── rename ──────────────────────────────────────────────────────────────

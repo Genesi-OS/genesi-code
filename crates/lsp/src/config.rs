@@ -413,6 +413,13 @@ fn default_client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(true),
                 relative_pattern_support: Some(true),
             }),
+            // `documentChanges` lets servers address edits to a specific
+            // version of a file, which is the shape most of them prefer for
+            // rename and fixes. `lsp::edits` reads both shapes.
+            workspace_edit: Some(lsp_types::WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         window: Some(WindowClientCapabilities {
@@ -466,6 +473,37 @@ fn default_client_capabilities() -> ClientCapabilities {
             // Without prepare support a server renames blind; with it, the
             // editor can refuse a rename on a keyword before the user types a
             // name, and prefill the input with exactly what will change.
+            // Literal support and the kind list are what make servers send
+            // CodeAction objects rather than bare commands; resolve support is
+            // what lets rust-analyzer send its assists at all, since it only
+            // computes each edit on request.
+            code_action: Some(lsp_types::CodeActionClientCapabilities {
+                dynamic_registration: Some(false),
+                code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                    code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                        value_set: [
+                            "",
+                            "quickfix",
+                            "refactor",
+                            "refactor.extract",
+                            "refactor.inline",
+                            "refactor.rewrite",
+                            "source",
+                            "source.organizeImports",
+                        ]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    },
+                }),
+                is_preferred_support: Some(true),
+                disabled_support: Some(true),
+                data_support: Some(true),
+                resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".to_string()],
+                }),
+                honors_change_annotations: Some(false),
+            }),
             rename: Some(RenameClientCapabilities {
                 dynamic_registration: Some(false),
                 prepare_support: Some(true),

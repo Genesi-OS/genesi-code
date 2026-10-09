@@ -748,6 +748,38 @@ impl LspServerModel {
         })
     }
 
+    /// Whether this server offers code actions.
+    pub fn supports_code_actions(&self) -> bool {
+        self.service()
+            .map(|service| service.supports_code_actions())
+            .unwrap_or(false)
+    }
+
+    /// Code actions for `range` in `path`, with the given diagnostics as context.
+    pub fn code_actions(
+        &self,
+        path: PathBuf,
+        range: lsp_types::Range,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> Result<impl Future<Output = Result<Vec<lsp_types::CodeAction>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .code_actions(&path, range, diagnostics)
+                .await
+        })
+    }
+
+    /// Fill in a code action's edit.
+    pub fn resolve_code_action(
+        &self,
+        action: lsp_types::CodeAction,
+    ) -> Result<impl Future<Output = Result<lsp_types::CodeAction>>> {
+        let service = self.service()?;
+        Ok(async move { service.text_document().resolve_code_action(action).await })
+    }
+
     /// Whether this server can rename symbols.
     pub fn supports_rename(&self) -> bool {
         self.service()

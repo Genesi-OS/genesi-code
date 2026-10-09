@@ -150,6 +150,13 @@ pub fn init(app: &mut AppContext) {
             LocalCodeEditorAction::RenameSymbol,
             id!("LocalCodeEditorView") & !id!("IMEOpen"),
         ),
+        // Ctrl+. / Cmd+., VS Code's quick-fix binding, so it lands under the
+        // fingers that already reach for it.
+        FixedBinding::new(
+            "cmdorctrl-.",
+            LocalCodeEditorAction::ShowCodeActions,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
     ]);
 }
 
@@ -247,6 +254,10 @@ pub enum LocalCodeEditorAction {
     RenameSymbol,
     /// Close the rename input without renaming (a click outside it).
     CancelRename,
+    /// List the quick fixes and refactors available at the caret.
+    ShowCodeActions,
+    /// Apply the code action at this index of the list last shown.
+    ApplyCodeAction(usize),
     /// The pointer moved onto a completion row: highlight it, the way hovering
     /// a list item does everywhere else.
     HighlightCompletionRow(usize),
@@ -469,6 +480,9 @@ pub struct LocalCodeEditorView {
     /// The input that asks for a symbol's new name.
     pub(super) rename_dialog: ViewHandle<RenameView>,
     pub(super) rename_target: Option<RenameTarget>,
+    /// The code actions behind the menu currently showing, so a selection can
+    /// be resolved back to the action it names.
+    pub(super) pending_code_actions: Vec<lsp_types::CodeAction>,
     /// A one-line message anchored at the caret -- "nothing to rename here".
     /// Cleared by the next keystroke, click or Escape, like the hover card.
     pub(super) caret_notice: Option<(CharOffset, String)>,
@@ -757,6 +771,7 @@ impl LocalCodeEditorView {
             find_references_view: None,
             rename_dialog,
             rename_target: None,
+            pending_code_actions: Vec::new(),
             caret_notice: None,
             autosave_handle: None,
             inline_completion: InlineCompletionState::default(),
@@ -2833,7 +2848,27 @@ impl LocalCodeEditorView {
     fn handle_menu_event(&mut self, event: &Event, ctx: &mut ViewContext<Self>) {
         if let Event::Close { .. } = event {
             self.context_menu_state.is_open = false;
+            // The quick-fix menu takes focus so its arrow keys work; give it
+            // back, or the next keystroke goes nowhere.
+            ctx.focus(&self.editor);
         }
+        ctx.notify();
+    }
+
+    /// Show a prepared list of items in the context menu, at the caret, with
+    /// keyboard focus.
+    pub(super) fn open_context_menu_with(
+        &mut self,
+        items: Vec<MenuItem<LocalCodeEditorAction>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.context_menu_state.is_open = true;
+        self.context_menu.update(ctx, move |menu, ctx| {
+            menu.set_items(items, ctx);
+            menu.set_selected_by_index(0, ctx);
+            ctx.notify();
+        });
+        ctx.focus(&self.context_menu);
         ctx.notify();
     }
 
@@ -2848,6 +2883,9 @@ impl LocalCodeEditorView {
                 .into_item(),
             MenuItemFields::new("Rename symbol")
                 .with_on_select_action(LocalCodeEditorAction::RenameSymbol)
+                .into_item(),
+            MenuItemFields::new("Quick fix…")
+                .with_on_select_action(LocalCodeEditorAction::ShowCodeActions)
                 .into_item(),
         ]
     }
@@ -3315,6 +3353,8 @@ impl TypedActionView for LocalCodeEditorView {
             }
             LocalCodeEditorAction::RenameSymbol => self.start_rename(ctx),
             LocalCodeEditorAction::CancelRename => self.close_rename(ctx),
+            LocalCodeEditorAction::ShowCodeActions => self.show_code_actions(ctx),
+            LocalCodeEditorAction::ApplyCodeAction(index) => self.apply_code_action(*index, ctx),
             LocalCodeEditorAction::HighlightCompletionRow(row) => {
                 self.select_completion_row(*row, ctx);
             }
