@@ -25,8 +25,8 @@ use warp_util::on_cancel::OnCancelFutureExt;
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
     CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, PrepareRename,
-    ReferenceLocation, SymbolOccurrence, TextDocumentContentChangeEvent, TextEdit,
-    WatchedFileChangeEvent,
+    ReferenceLocation, SignatureHelpInfo, SymbolOccurrence, TextDocumentContentChangeEvent,
+    TextEdit, WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
 
@@ -185,6 +185,25 @@ impl LspService {
 
     pub fn server_capabilities(&self) -> &Option<lsp_types::ServerCapabilities> {
         &self.server_capabilities
+    }
+
+    /// The characters that open signature help -- `(` and `,` for most
+    /// servers -- or an empty list when the server does not offer it.
+    pub fn signature_help_triggers(&self) -> Vec<char> {
+        let Some(options) = self
+            .server_capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.signature_help_provider.as_ref())
+        else {
+            return Vec::new();
+        };
+        options
+            .trigger_characters
+            .iter()
+            .flatten()
+            .chain(options.retrigger_characters.iter().flatten())
+            .filter_map(|trigger| trigger.chars().next())
+            .collect()
     }
 
     /// Whether the server highlights the other occurrences of a symbol.
@@ -873,6 +892,35 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// The signature of the call `position` is inside, if any.
+    pub async fn signature_help(
+        &self,
+        path: &Path,
+        position: Position,
+    ) -> anyhow::Result<Option<SignatureHelpInfo>> {
+        let params = lsp_types::SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: path_to_lsp_uri(path)?,
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let result = self
+            .service
+            .send_request::<request::SignatureHelpRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/signatureHelp failed: {e}"),
+            );
+        }
+        Ok(result?.and_then(SignatureHelpInfo::from_lsp))
     }
 
     /// Every occurrence of the symbol at `position` in this file, each marked

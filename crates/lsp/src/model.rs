@@ -26,8 +26,8 @@ use crate::server_repo_watcher::LspRepoWatcher;
 use crate::supported_servers::LSPServerType;
 use crate::types::{
     CompletionList, CompletionTrigger, DefinitionLocation, DocumentVersion, HoverResult, Location,
-    PrepareRename, ReferenceLocation, SymbolOccurrence, TextDocumentContentChangeEvent, TextEdit,
-    WatchedFileChangeEvent,
+    PrepareRename, ReferenceLocation, SignatureHelpInfo, SymbolOccurrence,
+    TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{spawn_lsp_service, LspServiceInitializationResult};
@@ -744,6 +744,28 @@ impl LspServerModel {
             service
                 .text_document()
                 .completion(&path, position.into_lsp(), trigger)
+                .await
+        })
+    }
+
+    /// The characters that should open signature help for this server.
+    pub fn signature_help_triggers(&self) -> Vec<char> {
+        self.service()
+            .map(|service| service.signature_help_triggers())
+            .unwrap_or_default()
+    }
+
+    /// The signature of the call at `position`, if the caret is inside one.
+    pub fn signature_help(
+        &self,
+        path: PathBuf,
+        position: Location,
+    ) -> Result<impl Future<Output = Result<Option<SignatureHelpInfo>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .signature_help(&path, position.into_lsp())
                 .await
         })
     }

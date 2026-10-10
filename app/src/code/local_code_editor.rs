@@ -348,6 +348,14 @@ impl LspHoverState {
     }
 }
 
+/// The signature popup that follows the caret through a call's arguments.
+pub(super) struct SignatureHelpState {
+    pub(super) info: lsp::types::SignatureHelpInfo,
+    /// Where it opened. Kept while the caret moves through the arguments, so
+    /// the popup stays put instead of sliding along with every keystroke.
+    pub(super) anchor: CharOffset,
+}
+
 /// What a pending rename applies to. Captured when the input opens, so moving
 /// the caret while typing the new name does not retarget the rename.
 #[derive(Clone)]
@@ -493,6 +501,10 @@ pub struct LocalCodeEditorView {
     /// The input that asks for a symbol's new name.
     pub(super) rename_dialog: ViewHandle<RenameView>,
     pub(super) rename_target: Option<RenameTarget>,
+    /// The signature of the call being typed, when the caret is inside one.
+    pub(super) signature_help: Option<SignatureHelpState>,
+    /// Drops a signature answer for a caret position that has since changed.
+    pub(super) signature_help_generation: u64,
     /// The code actions behind the menu currently showing, so a selection can
     /// be resolved back to the action it names.
     pub(super) pending_code_actions: Vec<lsp_types::CodeAction>,
@@ -564,6 +576,7 @@ impl LocalCodeEditorView {
                     // identifier, keeps the popup filtered as the user types, and
                     // dismisses it when the context no longer applies.
                     me.handle_completion_trigger(ctx);
+                    me.handle_signature_help_trigger(ctx);
                     me.handle_inline_completion_trigger(ctx);
 
                     me.schedule_autosave(ctx);
@@ -594,7 +607,8 @@ impl LocalCodeEditorView {
                 // Leaving it open was the bug where clicking away from the list
                 // left it floating over unrelated code.
                 let had_notice = me.caret_notice.take().is_some();
-                if me.dismiss_completion(ctx) || had_notice {
+                let had_signature = me.dismiss_signature_help();
+                if me.dismiss_completion(ctx) || had_notice || had_signature {
                     ctx.notify();
                 }
             }
@@ -802,6 +816,8 @@ impl LocalCodeEditorView {
             rename_dialog,
             rename_target: None,
             pending_code_actions: Vec::new(),
+            signature_help: None,
+            signature_help_generation: 0,
             caret_notice: None,
             autosave_handle: None,
             inline_completion: InlineCompletionState::default(),
@@ -2937,7 +2953,8 @@ impl LocalCodeEditorView {
         let had_hover = self.lsp_hover_state.clear();
         let had_completion = self.dismiss_completion(ctx);
         let had_notice = self.caret_notice.take().is_some();
-        had_refs || had_hover || had_completion || had_notice
+        let had_signature = self.dismiss_signature_help();
+        had_refs || had_hover || had_completion || had_notice || had_signature
     }
 
     /// Perform goto definition at the cursor position and navigate directly.
@@ -3271,6 +3288,20 @@ impl View for LocalCodeEditorView {
                     })
                     .finish();
                 stack.add_positioned_overlay_child(dialog, positioning);
+            }
+        }
+
+        // Not while the completion list is open: both anchor at the caret and
+        // would land on top of each other, and the list is what the user is
+        // acting on at that moment.
+        if !matches!(self.lsp_completion_state, LspCompletionState::Active { .. }) {
+            if let Some(state) = &self.signature_help {
+                if let Some(positioning) = self.compute_card_positioning(state.anchor, 90., app) {
+                    stack.add_positioned_overlay_child(
+                        self.render_signature_help(&state.info, app),
+                        positioning,
+                    );
+                }
             }
         }
 

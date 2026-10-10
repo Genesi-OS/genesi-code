@@ -156,6 +156,107 @@ impl From<lsp_types::TextEdit> for TextEdit {
     }
 }
 
+/// The signature of the call the caret is inside, from
+/// `textDocument/signatureHelp`, flattened to what the popup draws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureHelpInfo {
+    /// The whole signature, e.g. `fn push(&mut self, value: T)`.
+    pub label: String,
+    /// The parameter being typed, as a char range into `label`.
+    pub active_parameter: Option<std::ops::Range<usize>>,
+    /// Documentation for the active parameter, when the server has it.
+    pub parameter_documentation: Option<String>,
+    /// Documentation for the function as a whole.
+    pub documentation: Option<String>,
+    /// Which overload this is, and how many there are, for `2/3`.
+    pub signature_index: usize,
+    pub signature_count: usize,
+}
+
+fn documentation_text(documentation: lsp_types::Documentation) -> String {
+    match documentation {
+        lsp_types::Documentation::String(text) => text,
+        lsp_types::Documentation::MarkupContent(markup) => markup.value,
+    }
+}
+
+/// Convert a UTF-16 code-unit offset into `text` into a char index.
+fn utf16_to_char_index(text: &str, utf16_offset: usize) -> usize {
+    let mut units = 0;
+    for (index, ch) in text.chars().enumerate() {
+        if units >= utf16_offset {
+            return index;
+        }
+        units += ch.len_utf16();
+    }
+    text.chars().count()
+}
+
+impl SignatureHelpInfo {
+    /// Pick the active signature and parameter out of a server response.
+    ///
+    /// Returns `None` when there is nothing to show, which is also how a server
+    /// says the caret has left the call -- the popup should close then.
+    pub fn from_lsp(help: lsp_types::SignatureHelp) -> Option<Self> {
+        let signature_count = help.signatures.len();
+        if signature_count == 0 {
+            return None;
+        }
+        let signature_index =
+            (help.active_signature.unwrap_or(0) as usize).min(signature_count - 1);
+        let signature = help.signatures.into_iter().nth(signature_index)?;
+
+        // The signature's own active parameter wins over the response-wide
+        // one; servers that support overloads set it per signature.
+        let active_index = signature
+            .active_parameter
+            .or(help.active_parameter)
+            .map(|index| index as usize);
+        let parameter = active_index.and_then(|index| {
+            signature
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get(index).cloned())
+        });
+
+        let active_parameter = parameter
+            .as_ref()
+            .and_then(|parameter| match &parameter.label {
+                // Offsets are UTF-16 code units into the signature label.
+                lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
+                    let start = utf16_to_char_index(&signature.label, *start as usize);
+                    let end = utf16_to_char_index(&signature.label, *end as usize);
+                    (start < end).then_some(start..end)
+                }
+                // A bare string has to be found in the label. Search after the
+                // opening paren, so a parameter named like the function -- `fn
+                // id(id: u32)` -- highlights the parameter and not the name.
+                lsp_types::ParameterLabel::Simple(text) => {
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let search_from = signature.label.find('(').map(|i| i + 1).unwrap_or(0);
+                    let byte_start = signature.label[search_from..]
+                        .find(text.as_str())
+                        .map(|i| i + search_from)?;
+                    let start = signature.label[..byte_start].chars().count();
+                    Some(start..start + text.chars().count())
+                }
+            });
+
+        Some(Self {
+            label: signature.label,
+            active_parameter,
+            parameter_documentation: parameter
+                .and_then(|parameter| parameter.documentation)
+                .map(documentation_text),
+            documentation: signature.documentation.map(documentation_text),
+            signature_index,
+            signature_count,
+        })
+    }
+}
+
 /// One occurrence of a symbol in a file, from `textDocument/documentHighlight`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolOccurrence {
@@ -424,3 +525,7 @@ impl WatchedFileChangeEvent {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod tests;

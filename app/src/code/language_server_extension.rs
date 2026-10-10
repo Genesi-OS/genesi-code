@@ -29,9 +29,9 @@ use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use super::lsp_telemetry::LspTelemetryEvent;
 use crate::code::local_code_editor::{
     HoverContentSegment, LocalCodeEditorAction, LocalCodeEditorView, LspCompletionState,
-    LspHoverState, RenameTarget, COMPLETION_DOC_MAX_HEIGHT, COMPLETION_MAX_VISIBLE_ITEMS,
-    COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH, COMPLETION_ROW_HEIGHT,
-    HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
+    LspHoverState, RenameTarget, SignatureHelpState, COMPLETION_DOC_MAX_HEIGHT,
+    COMPLETION_MAX_VISIBLE_ITEMS, COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH,
+    COMPLETION_ROW_HEIGHT, HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
 use crate::editor::InteractionState;
 use crate::menu::MenuItemFields;
@@ -1861,6 +1861,165 @@ $0",
         } else {
             format!("<{tag}>$0</{tag}>")
         }
+    }
+
+    // ── signature help ──────────────────────────────────────────────────────
+
+    pub(super) fn dismiss_signature_help(&mut self) -> bool {
+        self.signature_help_generation = self.signature_help_generation.wrapping_add(1);
+        self.signature_help.take().is_some()
+    }
+
+    /// Open signature help on the server's trigger characters (`(` and `,` for
+    /// most), and keep it in step with the caret while it is showing.
+    ///
+    /// While open it re-asks on every edit rather than tracking parentheses
+    /// itself: the server knows where the call ends -- through strings,
+    /// generics and nested calls -- and answers with nothing once the caret has
+    /// left it, which is what closes the popup.
+    pub(super) fn handle_signature_help_trigger(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        if !server.as_ref(ctx).is_ready_for_requests() {
+            return;
+        }
+        let (cursor, typed) = {
+            let editor = self.editor().as_ref(ctx);
+            let cursor = editor.cursor_head_offset(ctx);
+            let typed = (cursor.as_usize() > 0)
+                .then(|| editor.char_at(cursor.saturating_sub(&CharOffset::from(1)), ctx))
+                .flatten();
+            (cursor, typed)
+        };
+
+        let showing = self.signature_help.is_some();
+        let triggered = typed.is_some_and(|typed| {
+            server
+                .as_ref(ctx)
+                .signature_help_triggers()
+                .contains(&typed)
+        });
+        if !showing && !triggered {
+            return;
+        }
+
+        let Some(path) = self.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let position = self
+            .editor()
+            .as_ref(ctx)
+            .offset_to_lsp_position(cursor, ctx);
+        let Ok(request) = server.as_ref(ctx).signature_help(path, position) else {
+            return;
+        };
+
+        self.signature_help_generation = self.signature_help_generation.wrapping_add(1);
+        let generation = self.signature_help_generation;
+        ctx.spawn(request, move |me, result, ctx| {
+            if me.signature_help_generation != generation {
+                return;
+            }
+            match result {
+                Ok(Some(info)) => {
+                    let anchor = me
+                        .signature_help
+                        .as_ref()
+                        .map(|state| state.anchor)
+                        .unwrap_or(cursor);
+                    me.signature_help = Some(SignatureHelpState { info, anchor });
+                }
+                // Nothing to show: the caret has left the call.
+                Ok(None) | Err(_) => me.signature_help = None,
+            }
+            ctx.notify();
+        });
+    }
+
+    pub(super) fn render_signature_help(
+        &self,
+        info: &lsp::types::SignatureHelpInfo,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let font_size = appearance.monospace_font_size();
+
+        let mut label = Text::new(
+            info.label.clone(),
+            appearance.monospace_font_family(),
+            font_size,
+        )
+        .with_color(theme.nonactive_ui_text_color().into());
+        if let Some(range) = &info.active_parameter {
+            // The parameter being typed: bold and in the accent, so it reads at
+            // a glance which argument the caret is on.
+            label = label.with_single_highlight(
+                Highlight::new()
+                    .with_properties(Properties::default().weight(Weight::Bold))
+                    .with_foreground_color(theme.accent().into_solid()),
+                range.clone().collect(),
+            );
+        }
+
+        let mut header = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        header.add_child(Shrinkable::new(1., label.finish()).finish());
+        if info.signature_count > 1 {
+            header.add_child(
+                Container::new(
+                    Text::new_inline(
+                        format!("{}/{}", info.signature_index + 1, info.signature_count),
+                        appearance.ui_font_family(),
+                        font_size - 2.,
+                    )
+                    .with_color(theme.disabled_ui_text_color().into())
+                    .finish(),
+                )
+                .with_margin_left(8.)
+                .finish(),
+            );
+        }
+
+        let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        column.add_child(header.finish());
+
+        // The active parameter's own documentation is the most useful line
+        // there is while typing it; the function's is a fallback.
+        if let Some(doc) = info
+            .parameter_documentation
+            .as_deref()
+            .or(info.documentation.as_deref())
+            .map(str::trim)
+            .filter(|doc| !doc.is_empty())
+        {
+            let first_paragraph = doc.split("\n\n").next().unwrap_or(doc);
+            column.add_child(
+                Container::new(
+                    Text::new(
+                        first_paragraph.to_string(),
+                        appearance.ui_font_family(),
+                        font_size - 1.,
+                    )
+                    .with_color(theme.disabled_ui_text_color().into())
+                    .finish(),
+                )
+                .with_margin_top(4.)
+                .finish(),
+            );
+        }
+
+        Container::new(
+            ConstrainedBox::new(column.finish())
+                .with_max_width(appearance.scale(520.))
+                .finish(),
+        )
+        .with_horizontal_padding(10.)
+        .with_vertical_padding(6.)
+        .with_background(theme.surface_2())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .finish()
     }
 
     // ── code actions ────────────────────────────────────────────────────────

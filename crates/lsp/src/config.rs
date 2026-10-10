@@ -504,6 +504,20 @@ fn default_client_capabilities() -> ClientCapabilities {
                 }),
                 honors_change_annotations: Some(false),
             }),
+            // Label offsets let the server point at the active parameter
+            // exactly, rather than leaving the client to search the signature
+            // for a substring that may appear more than once.
+            signature_help: Some(lsp_types::SignatureHelpClientCapabilities {
+                dynamic_registration: Some(false),
+                signature_information: Some(lsp_types::SignatureInformationSettings {
+                    documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                    parameter_information: Some(lsp_types::ParameterInformationSettings {
+                        label_offset_support: Some(true),
+                    }),
+                    active_parameter_support: Some(true),
+                }),
+                context_support: Some(false),
+            }),
             document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
                 dynamic_registration: Some(false),
             }),
