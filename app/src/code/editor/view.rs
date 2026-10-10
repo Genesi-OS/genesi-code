@@ -1743,6 +1743,12 @@ impl CodeEditorView {
         self.offset_to_lsp_position(selection.head, ctx)
     }
 
+    /// Whether the user has a single bare caret: one selection, and empty.
+    pub fn has_single_caret(&self, ctx: &AppContext) -> bool {
+        let selections = self.model.as_ref(ctx).selections(ctx);
+        selections.len() == 1 && selections.first().head == selections.first().tail
+    }
+
     /// Returns the buffer offset at the current cursor head.
     pub fn cursor_head_offset(&self, ctx: &AppContext) -> CharOffset {
         self.model.as_ref(ctx).selections(ctx).first().head

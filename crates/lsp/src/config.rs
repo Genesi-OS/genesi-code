@@ -504,6 +504,9 @@ fn default_client_capabilities() -> ClientCapabilities {
                 }),
                 honors_change_annotations: Some(false),
             }),
+            document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             rename: Some(RenameClientCapabilities {
                 dynamic_registration: Some(false),
                 prepare_support: Some(true),

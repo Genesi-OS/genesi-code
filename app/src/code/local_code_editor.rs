@@ -95,6 +95,10 @@ const DROP_SHADOW_COLOR: ColorU = ColorU {
 };
 
 const HOVER_DEBOUNCE_PERIOD: Duration = Duration::from_millis(500);
+/// How long the caret has to rest before its symbol's occurrences light up.
+/// Short enough to feel immediate, long enough that holding an arrow key does
+/// not send the server one request per character crossed.
+const HIGHLIGHT_DEBOUNCE_PERIOD: Duration = Duration::from_millis(180);
 /// How long the pointer must rest on a component before its rendered preview
 /// appears. Deliberately longer than the LSP hover: the card is large, so it
 /// should only show up when the user clearly meant to ask for it.
@@ -451,6 +455,15 @@ pub struct LocalCodeEditorView {
     context_menu_state: ContextMenuState,
     /// Channel for debouncing hover requests.
     hover_debounce_tx: async_channel::Sender<CharOffset>,
+    /// Caret positions, debounced into `textDocument/documentHighlight`.
+    highlight_debounce_tx: async_channel::Sender<CharOffset>,
+    /// Backgrounds behind the other occurrences of the symbol at the caret.
+    /// Kept apart from the diagnostic decorations and merged when drawn, since
+    /// the render state takes one list for both.
+    pub(super) highlight_decorations: Vec<Decoration>,
+    /// Bumped on every caret move, so a highlight answer that arrives after the
+    /// caret has gone elsewhere is dropped instead of drawn.
+    pub(super) highlight_generation: u64,
     /// Channel for the slower, component-preview hover (see
     /// [`COMPONENT_HOVER_PERIOD`]). Kept separate from the LSP hover so the
     /// preview works with no language server running.
@@ -538,8 +551,10 @@ impl LocalCodeEditorView {
 
                 if origin.from_user() {
                     // A message about the caret's last position is stale the
-                    // moment the user types.
+                    // moment the user types, and so are occurrence ranges: they
+                    // point at text that has just moved.
                     me.caret_notice = None;
+                    me.clear_occurrence_highlights(ctx);
                     me.was_edited = true;
                     me.register_flow_keystroke(ctx);
                     ctx.emit(LocalCodeEditorEvent::UserEdited);
@@ -588,6 +603,11 @@ impl LocalCodeEditorView {
             }
             CodeEditorEvent::SelectionEnd => {
                 ctx.notify();
+            }
+            CodeEditorEvent::SelectionChanged => {
+                me.highlight_generation = me.highlight_generation.wrapping_add(1);
+                let caret = me.editor.as_ref(ctx).cursor_head_offset(ctx);
+                let _ = me.highlight_debounce_tx.try_send(caret);
             }
             CodeEditorEvent::MouseHovered {
                 offset,
@@ -732,6 +752,13 @@ impl LocalCodeEditorView {
             |_, _| {},
         );
 
+        let (highlight_debounce_tx, highlight_debounce_rx) = async_channel::unbounded();
+        ctx.spawn_stream_local(
+            debounce(HIGHLIGHT_DEBOUNCE_PERIOD, highlight_debounce_rx),
+            |me, offset, ctx| me.highlight_occurrences_at(offset, ctx),
+            |_, _| {},
+        );
+
         // The component preview rides the same hover events on a longer fuse.
         let (component_hover_tx, component_hover_rx) = async_channel::unbounded();
         ctx.spawn_stream_local(
@@ -759,6 +786,9 @@ impl LocalCodeEditorView {
             context_menu,
             context_menu_state: Default::default(),
             hover_debounce_tx,
+            highlight_debounce_tx,
+            highlight_decorations: Vec::new(),
+            highlight_generation: 0,
             component_hover_tx,
             component_hover: None,
             lsp_hover_state: LspHoverState::None,

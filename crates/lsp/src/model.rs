@@ -26,7 +26,7 @@ use crate::server_repo_watcher::LspRepoWatcher;
 use crate::supported_servers::LSPServerType;
 use crate::types::{
     CompletionList, CompletionTrigger, DefinitionLocation, DocumentVersion, HoverResult, Location,
-    PrepareRename, ReferenceLocation, TextDocumentContentChangeEvent, TextEdit,
+    PrepareRename, ReferenceLocation, SymbolOccurrence, TextDocumentContentChangeEvent, TextEdit,
     WatchedFileChangeEvent,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -744,6 +744,28 @@ impl LspServerModel {
             service
                 .text_document()
                 .completion(&path, position.into_lsp(), trigger)
+                .await
+        })
+    }
+
+    /// Whether this server highlights the occurrences of a symbol.
+    pub fn supports_document_highlight(&self) -> bool {
+        self.service()
+            .map(|service| service.supports_document_highlight())
+            .unwrap_or(false)
+    }
+
+    /// Every occurrence of the symbol at `position` in `path`.
+    pub fn document_highlights(
+        &self,
+        path: PathBuf,
+        position: Location,
+    ) -> Result<impl Future<Output = Result<Vec<SymbolOccurrence>>>> {
+        let service = self.service()?;
+        Ok(async move {
+            service
+                .text_document()
+                .document_highlights(&path, position.into_lsp())
                 .await
         })
     }

@@ -202,12 +202,94 @@ impl LocalCodeEditorView {
         self.update_editor_decorations(ctx);
     }
 
-    /// Update the editor's text decorations with diagnostic decorations.
+    /// Push every text decoration to the editor. The render state holds a
+    /// single list, so occurrence highlights and diagnostics go in together;
+    /// highlights first, so a squiggle is drawn over a highlighted word rather
+    /// than hidden beneath it.
     fn update_editor_decorations(&self, ctx: &mut ViewContext<Self>) {
-        // Pass diagnostic decorations to the render state.
-        let decorations = self.diagnostic_decorations.clone();
+        let mut decorations = self.highlight_decorations.clone();
+        decorations.extend(self.diagnostic_decorations.iter().cloned());
         self.editor.update(ctx, |editor, ctx| {
             editor.set_diagnostic_decorations(decorations, ctx);
+        });
+    }
+
+    pub(super) fn clear_occurrence_highlights(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.highlight_decorations.is_empty() {
+            return;
+        }
+        self.highlight_decorations.clear();
+        self.update_editor_decorations(ctx);
+    }
+
+    /// Light up the other occurrences of the symbol at `offset`.
+    ///
+    /// Only for a bare caret: with a selection the user is looking at the
+    /// selection, and with several cursors there is no one symbol to follow. A
+    /// lone occurrence is not drawn either -- highlighting the word under the
+    /// caret and nothing else is noise, not information.
+    pub(super) fn highlight_occurrences_at(
+        &mut self,
+        offset: CharOffset,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let generation = self.highlight_generation;
+
+        let single_caret = {
+            let editor = self.editor().as_ref(ctx);
+            editor.cursor_head_offset(ctx) == offset && editor.has_single_caret(ctx)
+        };
+        if !single_caret || !self.is_lsp_server_available(ctx) {
+            self.clear_occurrence_highlights(ctx);
+            return;
+        }
+        let Some(server) = self.lsp_server.as_ref() else {
+            return;
+        };
+        if !server.as_ref(ctx).supports_document_highlight() {
+            return;
+        }
+        let Some(path) = self.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let position = self
+            .editor()
+            .as_ref(ctx)
+            .offset_to_lsp_position(offset, ctx);
+        let Ok(request) = server.as_ref(ctx).document_highlights(path, position) else {
+            return;
+        };
+
+        ctx.spawn(request, move |me, result, ctx| {
+            // The caret moved on while we waited.
+            if me.highlight_generation != generation {
+                return;
+            }
+            let occurrences = result.unwrap_or_default();
+            if occurrences.len() < 2 {
+                me.clear_occurrence_highlights(ctx);
+                return;
+            }
+
+            let theme = Appearance::as_ref(ctx).theme();
+            let read_fill = theme.accent().with_opacity(16);
+            let write_fill = theme.accent().with_opacity(30);
+            let editor = me.editor().as_ref(ctx);
+            me.highlight_decorations = occurrences
+                .into_iter()
+                .filter_map(|occurrence| {
+                    let start = editor.lsp_location_to_offset(&occurrence.range.start, ctx);
+                    let end = editor.lsp_location_to_offset(&occurrence.range.end, ctx);
+                    (start < end).then(|| {
+                        Decoration::new(start, end).with_background(if occurrence.is_write {
+                            write_fill
+                        } else {
+                            read_fill
+                        })
+                    })
+                })
+                .collect();
+            me.update_editor_decorations(ctx);
         });
     }
 

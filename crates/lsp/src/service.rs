@@ -25,7 +25,8 @@ use warp_util::on_cancel::OnCancelFutureExt;
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
     CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, PrepareRename,
-    ReferenceLocation, TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
+    ReferenceLocation, SymbolOccurrence, TextDocumentContentChangeEvent, TextEdit,
+    WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
 
@@ -184,6 +185,16 @@ impl LspService {
 
     pub fn server_capabilities(&self) -> &Option<lsp_types::ServerCapabilities> {
         &self.server_capabilities
+    }
+
+    /// Whether the server highlights the other occurrences of a symbol.
+    pub fn supports_document_highlight(&self) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.document_highlight_provider.as_ref()),
+            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+        )
     }
 
     /// Whether the server offers code actions (quick fixes, refactors).
@@ -862,6 +873,43 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// Every occurrence of the symbol at `position` in this file, each marked
+    /// as a write (assignment, declaration) or a read.
+    pub async fn document_highlights(
+        &self,
+        path: &Path,
+        position: Position,
+    ) -> anyhow::Result<Vec<SymbolOccurrence>> {
+        let params = lsp_types::DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: path_to_lsp_uri(path)?,
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = self
+            .service
+            .send_request::<request::DocumentHighlightRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/documentHighlight failed: {e}"),
+            );
+        }
+        Ok(result?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|highlight| SymbolOccurrence {
+                range: highlight.range.into(),
+                is_write: highlight.kind == Some(lsp_types::DocumentHighlightKind::WRITE),
+            })
+            .collect())
     }
 
     /// The code actions available for `range`: quick fixes for the diagnostics

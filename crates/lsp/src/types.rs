@@ -156,6 +156,15 @@ impl From<lsp_types::TextEdit> for TextEdit {
     }
 }
 
+/// One occurrence of a symbol in a file, from `textDocument/documentHighlight`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolOccurrence {
+    pub range: Range,
+    /// An assignment or declaration rather than a read. Drawn more strongly, so
+    /// the places a value changes stand out from the places it is used.
+    pub is_write: bool,
+}
+
 /// What a rename would replace, from `textDocument/prepareRename`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareRename {
