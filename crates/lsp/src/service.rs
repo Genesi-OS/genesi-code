@@ -25,8 +25,8 @@ use warp_util::on_cancel::OnCancelFutureExt;
 use crate::config::{lsp_uri_to_path, path_to_lsp_uri, LanguageId};
 use crate::types::{
     CompletionList, CompletionTrigger, HoverResult, LspDefinitionLocation, PrepareRename,
-    ReferenceLocation, SignatureHelpInfo, SymbolOccurrence, TextDocumentContentChangeEvent,
-    TextEdit, WatchedFileChangeEvent,
+    ReferenceLocation, SignatureHelpInfo, SymbolEntry, SymbolOccurrence,
+    TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 use crate::LspServerLogLevel;
 
@@ -892,6 +892,52 @@ impl<'a> TextDocumentService<'a> {
             items: items.into_iter().map(Into::into).collect(),
             is_incomplete,
         })
+    }
+
+    /// Every symbol in `path`, outermost first, in source order.
+    pub async fn document_symbols(&self, path: &Path) -> anyhow::Result<Vec<SymbolEntry>> {
+        let params = lsp_types::DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: path_to_lsp_uri(path)?,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = self
+            .service
+            .send_request::<request::DocumentSymbolRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("textDocument/documentSymbol failed: {e}"),
+            );
+        }
+        Ok(result?
+            .map(|response| crate::types::flatten_document_symbols(path, response))
+            .unwrap_or_default())
+    }
+
+    /// Symbols anywhere in the workspace whose name matches `query`.
+    pub async fn workspace_symbols(&self, query: String) -> anyhow::Result<Vec<SymbolEntry>> {
+        let params = lsp_types::WorkspaceSymbolParams {
+            partial_result_params: Default::default(),
+            work_done_progress_params: Default::default(),
+            query,
+        };
+        let result = self
+            .service
+            .send_request::<request::WorkspaceSymbolRequest>(params)
+            .await;
+        if let Err(e) = &result {
+            self.service.log_to_server_log(
+                LspServerLogLevel::Error,
+                format!("workspace/symbol failed: {e}"),
+            );
+        }
+        Ok(result?
+            .map(crate::types::workspace_symbol_entries)
+            .unwrap_or_default())
     }
 
     /// The signature of the call `position` is inside, if any.

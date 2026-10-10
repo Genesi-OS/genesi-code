@@ -125,3 +125,78 @@ fn an_out_of_range_active_signature_is_clamped() {
     .unwrap();
     assert_eq!((info.signature_index, info.signature_count), (1, 2));
 }
+
+#[allow(deprecated)]
+fn document_symbol(
+    name: &str,
+    kind: lsp_types::SymbolKind,
+    line: u32,
+    children: Vec<lsp_types::DocumentSymbol>,
+) -> lsp_types::DocumentSymbol {
+    let range = lsp_types::Range {
+        start: lsp_types::Position { line, character: 0 },
+        end: lsp_types::Position {
+            line,
+            character: 10,
+        },
+    };
+    lsp_types::DocumentSymbol {
+        name: name.to_string(),
+        detail: None,
+        kind,
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range: lsp_types::Range {
+            start: lsp_types::Position { line, character: 4 },
+            end: lsp_types::Position { line, character: 8 },
+        },
+        children: (!children.is_empty()).then_some(children),
+    }
+}
+
+#[test]
+fn nested_symbols_are_flattened_in_source_order_with_their_container() {
+    let tree = vec![document_symbol(
+        "Parser",
+        lsp_types::SymbolKind::STRUCT,
+        0,
+        vec![
+            document_symbol("new", lsp_types::SymbolKind::METHOD, 1, vec![]),
+            document_symbol("parse", lsp_types::SymbolKind::METHOD, 5, vec![]),
+        ],
+    )];
+
+    let entries = flatten_document_symbols(
+        std::path::Path::new("/p/a.rs"),
+        lsp_types::DocumentSymbolResponse::Nested(tree),
+    );
+    let names: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.container.as_deref()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("Parser", None),
+            ("new", Some("Parser")),
+            ("parse", Some("Parser"))
+        ]
+    );
+}
+
+#[test]
+fn a_symbol_jumps_to_its_name_not_the_start_of_its_range() {
+    // The range covers doc comments and attributes; landing there puts the
+    // caret on `///` instead of the name the user picked.
+    let entries = flatten_document_symbols(
+        std::path::Path::new("/p/a.rs"),
+        lsp_types::DocumentSymbolResponse::Nested(vec![document_symbol(
+            "main",
+            lsp_types::SymbolKind::FUNCTION,
+            3,
+            vec![],
+        )]),
+    );
+    assert_eq!(entries[0].location, Location { line: 3, column: 4 });
+}

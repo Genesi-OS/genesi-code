@@ -47,10 +47,11 @@ use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::path::to_relative_path;
 use warp_util::sync::Condition;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, Dismiss, DropShadow, Expanded, Fill, Flex,
-    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, Rect, ScrollbarWidth, Shrinkable, Stack, Text,
+    Align, Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss, DropShadow, Expanded,
+    Fill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning,
+    ParentAnchor, ParentElement, ParentOffsetBounds, Radius, Rect, ScrollbarWidth, Shrinkable,
+    Stack, Text,
 };
 use warpui::keymap::macros::*;
 use warpui::keymap::FixedBinding;
@@ -80,6 +81,7 @@ use crate::code::editor::EditorReviewComment;
 use crate::code::footer::{CodeFooterView, CodeFooterViewEvent};
 use crate::code::global_buffer_model::{BufferState, GlobalBufferModel, GlobalBufferModelEvent};
 use crate::code::rename_view::{Event as RenameEvent, RenameView};
+use crate::code::symbol_picker::{Event as SymbolPickerEvent, SymbolPickerView};
 use crate::code::{SaveOutcome, ShowFindReferencesCardProvider};
 use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
@@ -142,6 +144,18 @@ type SaveCallback =
     Box<dyn FnOnce(SaveOutcome, &mut ViewContext<LocalCodeEditorView>) + Send + Sync + 'static>;
 
 pub fn init(app: &mut AppContext) {
+    // The symbol jumps sit on VS Code's keys where this app leaves them free.
+    // Ctrl+Shift+O is the files palette here on Windows and Linux, and Cmd+T
+    // is a new tab on macOS; shadowing either inside the editor would break the
+    // thing people reach for most, so those two take a neighbouring key.
+    let is_mac = warpui::platform::OperatingSystem::get().is_mac();
+    let file_symbols_key = if is_mac {
+        "cmd-shift-o"
+    } else {
+        "ctrl-shift-r"
+    };
+    let project_symbols_key = if is_mac { "cmd-shift-t" } else { "ctrl-t" };
+
     app.register_fixed_bindings([
         FixedBinding::new(
             "cmdorctrl-l",
@@ -152,6 +166,16 @@ pub fn init(app: &mut AppContext) {
         FixedBinding::new(
             "f2",
             LocalCodeEditorAction::RenameSymbol,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
+        FixedBinding::new(
+            file_symbols_key,
+            LocalCodeEditorAction::GoToSymbolInFile,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
+        FixedBinding::new(
+            project_symbols_key,
+            LocalCodeEditorAction::GoToSymbolInProject,
             id!("LocalCodeEditorView") & !id!("IMEOpen"),
         ),
         // Ctrl+. / Cmd+., VS Code's quick-fix binding, so it lands under the
@@ -260,6 +284,12 @@ pub enum LocalCodeEditorAction {
     CancelRename,
     /// List the quick fixes and refactors available at the caret.
     ShowCodeActions,
+    /// Jump to a symbol in this file.
+    GoToSymbolInFile,
+    /// Jump to a symbol anywhere in the project.
+    GoToSymbolInProject,
+    /// Close the symbol picker (a click outside it).
+    CloseSymbolPicker,
     /// Apply the code action at this index of the list last shown.
     ApplyCodeAction(usize),
     /// The pointer moved onto a completion row: highlight it, the way hovering
@@ -498,6 +528,10 @@ pub struct LocalCodeEditorView {
     pub(super) diagnostic_decorations: Vec<Decoration>,
     /// View for the find references feature.
     find_references_view: Option<ViewHandle<FindReferencesView>>,
+    /// Type part of a symbol's name, jump to it.
+    pub(super) symbol_picker: ViewHandle<SymbolPickerView>,
+    /// Drops project-symbol answers for a query that has since changed.
+    pub(super) symbol_query_generation: u64,
     /// The input that asks for a symbol's new name.
     pub(super) rename_dialog: ViewHandle<RenameView>,
     pub(super) rename_target: Option<RenameTarget>,
@@ -531,6 +565,13 @@ impl LocalCodeEditorView {
         display_mode: Option<DisplayMode>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
+        let symbol_picker = ctx.add_typed_action_view(SymbolPickerView::new);
+        ctx.subscribe_to_view(&symbol_picker, |me, _, event, ctx| match event {
+            SymbolPickerEvent::Close => me.close_symbol_picker(ctx),
+            SymbolPickerEvent::Confirm(entry) => me.jump_to_symbol(entry.clone(), ctx),
+            SymbolPickerEvent::QueryChanged(query) => me.query_project_symbols(query.clone(), ctx),
+        });
+
         let rename_dialog = ctx.add_typed_action_view(RenameView::new);
         ctx.subscribe_to_view(&rename_dialog, |me, _, event, ctx| match event {
             RenameEvent::Close => me.close_rename(ctx),
@@ -813,6 +854,8 @@ impl LocalCodeEditorView {
             processed_diagnostics: Vec::new(),
             diagnostic_decorations: Vec::new(),
             find_references_view: None,
+            symbol_picker,
+            symbol_query_generation: 0,
             rename_dialog,
             rename_target: None,
             pending_code_actions: Vec::new(),
@@ -2933,6 +2976,12 @@ impl LocalCodeEditorView {
             MenuItemFields::new("Quick fix…")
                 .with_on_select_action(LocalCodeEditorAction::ShowCodeActions)
                 .into_item(),
+            MenuItemFields::new("Go to symbol in file…")
+                .with_on_select_action(LocalCodeEditorAction::GoToSymbolInFile)
+                .into_item(),
+            MenuItemFields::new("Go to symbol in project…")
+                .with_on_select_action(LocalCodeEditorAction::GoToSymbolInProject)
+                .into_item(),
         ]
     }
 
@@ -3276,6 +3325,19 @@ impl View for LocalCodeEditorView {
             stack.add_positioned_overlay_child(card, positioning);
         }
 
+        if self.symbol_picker.as_ref(app).is_open() {
+            let picker = Dismiss::new(
+                Align::new(ChildView::new(&self.symbol_picker).finish())
+                    .top_center()
+                    .finish(),
+            )
+            .on_dismiss(|ctx, _| {
+                ctx.dispatch_typed_action(LocalCodeEditorAction::CloseSymbolPicker);
+            })
+            .finish();
+            stack.add_overlay_child(picker);
+        }
+
         if self.rename_dialog.as_ref(app).is_open() {
             if let Some(positioning) = self
                 .rename_target
@@ -3415,6 +3477,9 @@ impl TypedActionView for LocalCodeEditorView {
             LocalCodeEditorAction::RenameSymbol => self.start_rename(ctx),
             LocalCodeEditorAction::CancelRename => self.close_rename(ctx),
             LocalCodeEditorAction::ShowCodeActions => self.show_code_actions(ctx),
+            LocalCodeEditorAction::GoToSymbolInFile => self.open_file_symbols(ctx),
+            LocalCodeEditorAction::GoToSymbolInProject => self.open_project_symbols(ctx),
+            LocalCodeEditorAction::CloseSymbolPicker => self.close_symbol_picker(ctx),
             LocalCodeEditorAction::ApplyCodeAction(index) => self.apply_code_action(*index, ctx),
             LocalCodeEditorAction::HighlightCompletionRow(row) => {
                 self.select_completion_row(*row, ctx);

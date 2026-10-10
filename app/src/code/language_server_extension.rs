@@ -28,11 +28,12 @@ use warpui::{AppContext, Element, SingletonEntity, ViewContext};
 use super::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use super::lsp_telemetry::LspTelemetryEvent;
 use crate::code::local_code_editor::{
-    HoverContentSegment, LocalCodeEditorAction, LocalCodeEditorView, LspCompletionState,
-    LspHoverState, RenameTarget, SignatureHelpState, COMPLETION_DOC_MAX_HEIGHT,
+    HoverContentSegment, LocalCodeEditorAction, LocalCodeEditorEvent, LocalCodeEditorView,
+    LspCompletionState, LspHoverState, RenameTarget, SignatureHelpState, COMPLETION_DOC_MAX_HEIGHT,
     COMPLETION_MAX_VISIBLE_ITEMS, COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH,
     COMPLETION_ROW_HEIGHT, HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
+use crate::code::symbol_picker::SymbolScope;
 use crate::editor::InteractionState;
 use crate::menu::MenuItemFields;
 use vec1::Vec1;
@@ -1861,6 +1862,121 @@ $0",
         } else {
             format!("<{tag}>$0</{tag}>")
         }
+    }
+
+    // ── symbols ─────────────────────────────────────────────────────────────
+
+    fn symbol_server_ready(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        if self.is_lsp_server_available(ctx) {
+            return true;
+        }
+        self.show_caret_notice("Symbol search needs a language server for this file.", ctx);
+        false
+    }
+
+    /// Ctrl+Shift+O: every symbol in this file, filtered as the user types.
+    pub(super) fn open_file_symbols(&mut self, ctx: &mut ViewContext<Self>) {
+        self.dismiss_lsp_overlays(ctx);
+        if !self.symbol_server_ready(ctx) {
+            return;
+        }
+        let (Some(server), Some(path)) = (
+            self.lsp_server.clone(),
+            self.file_path().map(Path::to_path_buf),
+        ) else {
+            return;
+        };
+
+        self.symbol_picker
+            .update(ctx, |picker, ctx| picker.open(SymbolScope::File, ctx));
+        ctx.focus(&self.symbol_picker);
+
+        let Ok(request) = server.as_ref(ctx).document_symbols(path) else {
+            return;
+        };
+        ctx.spawn(request, |me, result, ctx| {
+            me.symbol_picker.update(ctx, |picker, ctx| match result {
+                Ok(entries) => picker.set_entries(entries, ctx),
+                Err(e) => picker.set_status(format!("Couldn't list symbols: {e}"), ctx),
+            });
+        });
+        ctx.notify();
+    }
+
+    /// Ctrl+T: symbols anywhere in the project, asked of the server per query.
+    pub(super) fn open_project_symbols(&mut self, ctx: &mut ViewContext<Self>) {
+        self.dismiss_lsp_overlays(ctx);
+        if !self.symbol_server_ready(ctx) {
+            return;
+        }
+        self.symbol_picker
+            .update(ctx, |picker, ctx| picker.open(SymbolScope::Project, ctx));
+        ctx.focus(&self.symbol_picker);
+        // Most servers answer an empty query with nothing, or with everything;
+        // either way, the first useful answer is for what the user types.
+        self.symbol_picker.update(ctx, |picker, ctx| {
+            picker.set_status("Type to search the project", ctx)
+        });
+        ctx.notify();
+    }
+
+    pub(super) fn query_project_symbols(&mut self, query: String, ctx: &mut ViewContext<Self>) {
+        self.symbol_query_generation = self.symbol_query_generation.wrapping_add(1);
+        let generation = self.symbol_query_generation;
+        if query.is_empty() {
+            self.symbol_picker.update(ctx, |picker, ctx| {
+                picker.set_status("Type to search the project", ctx)
+            });
+            return;
+        }
+        let Some(server) = self.lsp_server.clone() else {
+            return;
+        };
+        let Ok(request) = server.as_ref(ctx).workspace_symbols(query) else {
+            return;
+        };
+        ctx.spawn(request, move |me, result, ctx| {
+            // Typing outran the server; a newer query's answer is coming.
+            if me.symbol_query_generation != generation {
+                return;
+            }
+            me.symbol_picker.update(ctx, |picker, ctx| match result {
+                Ok(entries) => picker.set_entries(entries, ctx),
+                Err(e) => picker.set_status(format!("Couldn't search symbols: {e}"), ctx),
+            });
+        });
+    }
+
+    pub(super) fn close_symbol_picker(&mut self, ctx: &mut ViewContext<Self>) {
+        self.symbol_query_generation = self.symbol_query_generation.wrapping_add(1);
+        self.symbol_picker
+            .update(ctx, |picker, ctx| picker.close(ctx));
+        ctx.focus(&self.editor);
+        ctx.notify();
+    }
+
+    /// Move the caret to the chosen symbol, opening its file if it is elsewhere.
+    pub(super) fn jump_to_symbol(
+        &mut self,
+        entry: lsp::types::SymbolEntry,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.close_symbol_picker(ctx);
+        let Some(source_server_id) = self
+            .lsp_server
+            .as_ref()
+            .map(|server| server.as_ref(ctx).id())
+        else {
+            return;
+        };
+        // The same event go-to-definition uses, so a symbol in another file opens
+        // it the way following a definition does, and one in this file scrolls.
+        ctx.emit(LocalCodeEditorEvent::GotoDefinition {
+            path: entry.path,
+            line: entry.location.line,
+            column: entry.location.column,
+            source_server_id,
+        });
     }
 
     // ── signature help ──────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ use crate::server_repo_watcher::LspRepoWatcher;
 use crate::supported_servers::LSPServerType;
 use crate::types::{
     CompletionList, CompletionTrigger, DefinitionLocation, DocumentVersion, HoverResult, Location,
-    PrepareRename, ReferenceLocation, SignatureHelpInfo, SymbolOccurrence,
+    PrepareRename, ReferenceLocation, SignatureHelpInfo, SymbolEntry, SymbolOccurrence,
     TextDocumentContentChangeEvent, TextEdit, WatchedFileChangeEvent,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -746,6 +746,24 @@ impl LspServerModel {
                 .completion(&path, position.into_lsp(), trigger)
                 .await
         })
+    }
+
+    /// Every symbol in `path`.
+    pub fn document_symbols(
+        &self,
+        path: PathBuf,
+    ) -> Result<impl Future<Output = Result<Vec<SymbolEntry>>>> {
+        let service = self.service()?;
+        Ok(async move { service.text_document().document_symbols(&path).await })
+    }
+
+    /// Symbols across the workspace matching `query`.
+    pub fn workspace_symbols(
+        &self,
+        query: String,
+    ) -> Result<impl Future<Output = Result<Vec<SymbolEntry>>>> {
+        let service = self.service()?;
+        Ok(async move { service.text_document().workspace_symbols(query).await })
     }
 
     /// The characters that should open signature help for this server.

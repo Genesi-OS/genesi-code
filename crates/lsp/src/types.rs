@@ -156,6 +156,121 @@ impl From<lsp_types::TextEdit> for TextEdit {
     }
 }
 
+/// A symbol to jump to, from `textDocument/documentSymbol` or
+/// `workspace/symbol`, flattened to one row of the symbol picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolEntry {
+    pub name: String,
+    /// What it sits inside -- `Parser` for a method `parse`, a module for a
+    /// function -- shown dimmed after the name so two `new`s can be told apart.
+    pub container: Option<String>,
+    pub kind: lsp_types::SymbolKind,
+    pub path: PathBuf,
+    /// Where to put the caret: the symbol's name, not the start of its
+    /// doc comment or attributes.
+    pub location: Location,
+}
+
+/// Flatten a document symbol tree into a list, in source order, recording each
+/// symbol's parent as its container.
+///
+/// Servers answer in one of two shapes. The nested one carries the hierarchy
+/// and is what modern servers send; the flat one is a list that already names
+/// each container. Both come out the same.
+pub fn flatten_document_symbols(
+    path: &std::path::Path,
+    response: lsp_types::DocumentSymbolResponse,
+) -> Vec<SymbolEntry> {
+    fn walk(
+        path: &std::path::Path,
+        symbols: Vec<lsp_types::DocumentSymbol>,
+        container: Option<&str>,
+        out: &mut Vec<SymbolEntry>,
+    ) {
+        for symbol in symbols {
+            out.push(SymbolEntry {
+                name: symbol.name.clone(),
+                container: container.map(str::to_string),
+                kind: symbol.kind,
+                path: path.to_path_buf(),
+                location: symbol.selection_range.start.into_location(),
+            });
+            if let Some(children) = symbol.children {
+                walk(path, children, Some(&symbol.name), out);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    match response {
+        lsp_types::DocumentSymbolResponse::Nested(symbols) => {
+            walk(path, symbols, None, &mut entries)
+        }
+        lsp_types::DocumentSymbolResponse::Flat(symbols) => {
+            entries.extend(symbols.into_iter().map(|symbol| SymbolEntry {
+                name: symbol.name,
+                container: symbol.container_name,
+                kind: symbol.kind,
+                path: path.to_path_buf(),
+                location: symbol.location.range.start.into_location(),
+            }))
+        }
+    }
+    entries
+}
+
+trait IntoLocation {
+    fn into_location(self) -> Location;
+}
+
+impl IntoLocation for lsp_types::Position {
+    fn into_location(self) -> Location {
+        Location {
+            line: self.line as usize,
+            column: self.character as usize,
+        }
+    }
+}
+
+/// Convert `workspace/symbol` results, dropping any whose file cannot be named.
+pub fn workspace_symbol_entries(response: lsp_types::WorkspaceSymbolResponse) -> Vec<SymbolEntry> {
+    match response {
+        lsp_types::WorkspaceSymbolResponse::Flat(symbols) => symbols
+            .into_iter()
+            .filter_map(|symbol| {
+                Some(SymbolEntry {
+                    path: lsp_uri_to_path(&symbol.location.uri).ok()?,
+                    location: symbol.location.range.start.into_location(),
+                    name: symbol.name,
+                    container: symbol.container_name,
+                    kind: symbol.kind,
+                })
+            })
+            .collect(),
+        lsp_types::WorkspaceSymbolResponse::Nested(symbols) => symbols
+            .into_iter()
+            .filter_map(|symbol| {
+                // A symbol may come back with only a file and no range, to be
+                // resolved later. Opening at the top of that file is still the
+                // right destination.
+                let (uri, position) = match symbol.location {
+                    lsp_types::OneOf::Left(location) => (location.uri, location.range.start),
+                    lsp_types::OneOf::Right(location) => {
+                        (location.uri, lsp_types::Position::default())
+                    }
+                };
+                Some(SymbolEntry {
+                    path: lsp_uri_to_path(&uri).ok()?,
+                    location: position.into_location(),
+                    name: symbol.name,
+                    container: symbol.container_name,
+                    kind: symbol.kind,
+                })
+            })
+            .collect(),
+    }
+}
+
 /// The signature of the call the caret is inside, from
 /// `textDocument/signatureHelp`, flattened to what the popup draws.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -416,6 +416,10 @@ fn default_client_capabilities() -> ClientCapabilities {
             // `documentChanges` lets servers address edits to a specific
             // version of a file, which is the shape most of them prefer for
             // rename and fixes. `lsp::edits` reads both shapes.
+            symbol: Some(lsp_types::WorkspaceSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
+            }),
             workspace_edit: Some(lsp_types::WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
                 ..Default::default()
@@ -517,6 +521,13 @@ fn default_client_capabilities() -> ClientCapabilities {
                     active_parameter_support: Some(true),
                 }),
                 context_support: Some(false),
+            }),
+            // Hierarchical symbols are what let the picker name each symbol's
+            // container, so two methods called `new` can be told apart.
+            document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
             }),
             document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
                 dynamic_registration: Some(false),
