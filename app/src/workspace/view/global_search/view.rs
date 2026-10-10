@@ -39,14 +39,17 @@ use crate::code::icon_from_file_path;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::editor::{
     EditorOptions, EditorView, Event as EditorEvent, InteractionState,
-    PropagateAndNoOpNavigationKeys, PropagateHorizontalNavigationKeys, TextOptions,
+    PropagateAndNoOpNavigationKeys, PropagateHorizontalNavigationKeys, SingleLineEditorOptions,
+    TextOptions,
 };
 use crate::search::ItemHighlightState as SearchHighlightState;
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon as UiIcon;
 use crate::ui_components::item_highlight::{ImageOrIcon, ItemHighlightState};
 use crate::ui_components::render_file_search_row::{render_file_search_row, FileSearchRowOptions};
-use crate::view_components::action_button::{ActionButton, ButtonSize, NakedTheme};
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, DangerPrimaryTheme, NakedTheme, SecondaryTheme,
+};
 use crate::workspace::view::global_search::model::GlobalSearch;
 use crate::workspace::view::global_search::SearchConfig;
 use crate::TelemetryEvent;
@@ -101,6 +104,10 @@ pub enum GlobalSearchAction {
     FocusResultsList,
     ToggleRegexSearch,
     ToggleCaseSensitivity,
+    /// Show or hide the replace field.
+    ToggleReplace,
+    /// First press asks for confirmation; the second replaces.
+    ReplaceAll,
 }
 
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -319,6 +326,17 @@ pub struct GlobalSearchView {
     regex_button: ViewHandle<ActionButton>,
     case_sensitivity_enabled: bool,
     case_sensitivity_button: ViewHandle<ActionButton>,
+    replace_editor: ViewHandle<EditorView>,
+    replace_open: bool,
+    replace_toggle_button: ViewHandle<ActionButton>,
+    replace_all_button: ViewHandle<ActionButton>,
+    /// The first press of "Replace all" arms it; only the second rewrites
+    /// files. A replace across a project cannot be undone the way an edit in
+    /// one buffer can, so it should never happen on a single stray click.
+    replace_armed: bool,
+    /// The outcome of the last replace, or why it was refused.
+    replace_status: Option<String>,
+    replace_in_progress: bool,
 }
 
 impl Entity for GlobalSearchView {
@@ -471,6 +489,7 @@ impl TypedActionView for GlobalSearchView {
                 self.regex_button.update(ctx, |button, ctx| {
                     button.set_active(self.regex_search_enabled, ctx);
                 });
+                self.disarm_replace(ctx);
                 self.rerun_search_from_query(ctx, true);
             }
             GlobalSearchAction::ToggleCaseSensitivity => {
@@ -478,8 +497,22 @@ impl TypedActionView for GlobalSearchView {
                 self.case_sensitivity_button.update(ctx, |button, ctx| {
                     button.set_active(self.case_sensitivity_enabled, ctx);
                 });
+                self.disarm_replace(ctx);
                 self.rerun_search_from_query(ctx, true);
             }
+            GlobalSearchAction::ToggleReplace => {
+                self.replace_open = !self.replace_open;
+                self.replace_status = None;
+                self.disarm_replace(ctx);
+                self.replace_toggle_button.update(ctx, |button, ctx| {
+                    button.set_active(self.replace_open, ctx);
+                });
+                if self.replace_open {
+                    ctx.focus(&self.replace_editor);
+                }
+                ctx.notify();
+            }
+            GlobalSearchAction::ReplaceAll => self.replace_all(ctx),
         }
     }
 }
@@ -681,7 +714,52 @@ impl GlobalSearchView {
                 })
         });
 
+        let replace_editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let mut editor = EditorView::single_line(
+                SingleLineEditorOptions {
+                    text: TextOptions::ui_text(Some(14.), appearance),
+                    select_all_on_focus: true,
+                    clear_selections_on_blur: true,
+                    ..Default::default()
+                },
+                ctx,
+            );
+            editor.set_placeholder_text("Replace", ctx);
+            editor
+        });
+        // Changing what will be written disarms a pending confirmation: the
+        // confirmation was for the old text.
+        ctx.subscribe_to_view(&replace_editor, |me, _, event, ctx| {
+            if let EditorEvent::Edited(_) = event {
+                me.disarm_replace(ctx);
+            }
+            if let EditorEvent::Enter = event {
+                ctx.dispatch_typed_action(&GlobalSearchAction::ReplaceAll);
+            }
+        });
+
+        let replace_toggle_button = ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new_with_boxed_theme("Replace", Arc::new(NakedTheme))
+                .with_tooltip("Find and replace across the project")
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(GlobalSearchAction::ToggleReplace);
+                })
+        });
+
+        let replace_all_button = ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new("Replace all", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(GlobalSearchAction::ReplaceAll);
+                })
+        });
+
         ctx.subscribe_to_view(&query_editor, |me, _handle, event, ctx| {
+            if let EditorEvent::Edited(_) = event {
+                me.disarm_replace(ctx);
+            }
             me.handle_query_editor_event(event, ctx);
         });
 
@@ -714,7 +792,136 @@ impl GlobalSearchView {
             regex_button,
             case_sensitivity_enabled: false,
             case_sensitivity_button,
+            replace_editor,
+            replace_open: false,
+            replace_toggle_button,
+            replace_all_button,
+            replace_armed: false,
+            replace_status: None,
+            replace_in_progress: false,
         }
+    }
+
+    fn disarm_replace(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.replace_armed {
+            return;
+        }
+        self.replace_armed = false;
+        self.replace_all_button.update(ctx, |button, ctx| {
+            button.set_label("Replace all", ctx);
+            button.set_theme(SecondaryTheme, ctx);
+        });
+        ctx.notify();
+    }
+
+    /// Every file the current results touch, in the order they are listed.
+    fn matched_files(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        self.directory_entries
+            .iter()
+            .flat_map(|directory| directory.matched_paths.paths.iter())
+            .map(|matched| matched.path.clone())
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    }
+
+    fn replace_all(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.replace_in_progress {
+            return;
+        }
+        let pattern = self.query_editor.as_ref(ctx).buffer_text(ctx);
+        let replacement = self.replace_editor.as_ref(ctx).buffer_text(ctx);
+        let use_regex = self.regex_search_enabled;
+        let case_sensitive = self.case_sensitivity_enabled;
+
+        // Refuse a bad pattern before arming, so the confirmation never offers
+        // to do something that will fail.
+        if let Err(e) = super::replace::build_pattern(&pattern, use_regex, case_sensitive) {
+            self.replace_status = Some(e.to_string());
+            ctx.notify();
+            return;
+        }
+
+        let files = self.matched_files();
+        if files.is_empty() {
+            self.replace_status =
+                Some("Nothing to replace: the search found no matches.".to_string());
+            ctx.notify();
+            return;
+        }
+
+        if !self.replace_armed {
+            self.replace_armed = true;
+            let matches = self.total_match_count;
+            let file_word = if files.len() == 1 { "file" } else { "files" };
+            let label = format!(
+                "Replace {matches} in {} {file_word}? This can't be undone",
+                files.len()
+            );
+            self.replace_all_button.update(ctx, |button, ctx| {
+                button.set_label(label, ctx);
+                button.set_theme(DangerPrimaryTheme, ctx);
+            });
+            self.replace_status = None;
+            ctx.notify();
+            return;
+        }
+
+        self.disarm_replace(ctx);
+        self.replace_in_progress = true;
+        self.replace_status = Some("Replacing…".to_string());
+        ctx.notify();
+
+        ctx.spawn(
+            async move {
+                let mut replaced = 0usize;
+                let mut changed_files = 0usize;
+                let mut failures = Vec::new();
+                for path in files {
+                    let result = async {
+                        let content = async_fs::read_to_string(&path).await?;
+                        let outcome = super::replace::replace_in_text(
+                            &content,
+                            &pattern,
+                            &replacement,
+                            use_regex,
+                            case_sensitive,
+                        )?;
+                        if outcome.count > 0 {
+                            async_fs::write(&path, outcome.text).await?;
+                        }
+                        anyhow::Ok(outcome.count)
+                    }
+                    .await;
+                    match result {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            replaced += count;
+                            changed_files += 1;
+                        }
+                        Err(e) => failures.push(format!("{}: {e}", path.display())),
+                    }
+                }
+                (replaced, changed_files, failures)
+            },
+            |me, (replaced, changed_files, failures), ctx| {
+                me.replace_in_progress = false;
+                let file_word = if changed_files == 1 { "file" } else { "files" };
+                me.replace_status = Some(if failures.is_empty() {
+                    format!("Replaced {replaced} in {changed_files} {file_word}.")
+                } else {
+                    log::warn!("global replace: {}", failures.join("; "));
+                    format!(
+                        "Replaced {replaced} in {changed_files} {file_word}; {} file(s) couldn't be written.",
+                        failures.len()
+                    )
+                });
+                // Show what is left: usually nothing, which is the confirmation
+                // that it worked.
+                me.rerun_search_from_query(ctx, true);
+                ctx.notify();
+            },
+        );
     }
 
     pub fn on_left_panel_focused(
@@ -2058,10 +2265,53 @@ impl View for GlobalSearchView {
             })
             .finish();
 
+        let search_header = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Shrinkable::new(1., search_label).finish())
+            .with_child(ChildView::new(&self.replace_toggle_button).finish())
+            .finish();
+
         let mut header_column = Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Start)
-            .with_child(search_label)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(search_header)
             .with_child(query_row);
+
+        if self.replace_open {
+            let replace_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Shrinkable::new(
+                        1.,
+                        Container::new(
+                            Clipped::new(ChildView::new(&self.replace_editor).finish()).finish(),
+                        )
+                        .with_padding(Padding::uniform(6.))
+                        .with_border(Border::all(BORDER_WIDTH).with_border_fill(theme.surface_3()))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(BORDER_RADIUS)))
+                        .finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(ChildView::new(&self.replace_all_button).finish())
+                        .with_margin_left(6.)
+                        .finish(),
+                )
+                .finish();
+            header_column.add_child(Container::new(replace_row).with_margin_bottom(4.).finish());
+
+            if let Some(status) = &self.replace_status {
+                header_column.add_child(
+                    Container::new(
+                        Text::new(status.clone(), appearance.ui_font_family(), 12.)
+                            .with_color(blended_colors::text_sub(theme, theme.background()))
+                            .finish(),
+                    )
+                    .with_margin_bottom(4.)
+                    .finish(),
+                );
+            }
+        }
 
         let files = self.unique_match_count();
         let file_word = if files == 1 { "file" } else { "files" };
