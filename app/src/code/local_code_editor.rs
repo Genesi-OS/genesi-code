@@ -150,11 +150,11 @@ pub fn init(app: &mut AppContext) {
     // thing people reach for most, so those two take a neighbouring key.
     let is_mac = warpui::platform::OperatingSystem::get().is_mac();
     let file_symbols_key = if is_mac {
-        "cmd-shift-o"
+        "cmd-shift-O"
     } else {
-        "ctrl-shift-r"
+        "ctrl-shift-R"
     };
-    let project_symbols_key = if is_mac { "cmd-shift-t" } else { "ctrl-t" };
+    let project_symbols_key = if is_mac { "cmd-shift-T" } else { "ctrl-t" };
 
     app.register_fixed_bindings([
         FixedBinding::new(
@@ -170,7 +170,7 @@ pub fn init(app: &mut AppContext) {
         ),
         // Ctrl+Shift+M, the Problems key in VS Code.
         FixedBinding::new(
-            "cmdorctrl-shift-m",
+            "cmdorctrl-shift-M",
             LocalCodeEditorAction::ShowProblems,
             id!("LocalCodeEditorView") & !id!("IMEOpen"),
         ),

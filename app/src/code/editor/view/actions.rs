@@ -547,7 +547,7 @@ pub fn init(app: &mut AppContext) {
             CodeEditorViewAction::SelectAllOccurrences,
         )
         .with_context_predicate(text_entry.clone() & !id!("VimNormalMode") & !id!("VimVisualMode"))
-        .with_key_binding("cmdorctrl-shift-l"),
+        .with_key_binding("cmdorctrl-shift-L"),
         EditableBinding::new(
             "editor_view:vim_scroll_half_page_down",
             "Scroll down half a page (vim)",
