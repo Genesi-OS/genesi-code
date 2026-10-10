@@ -171,13 +171,13 @@ fn match_data_countable_zero_is_not_truthy() {
 
 #[test]
 fn subpage_display_names_are_correct() {
-    assert_eq!(SettingsSection::WarpAgent.to_string(), "Warp Agent");
+    assert_eq!(SettingsSection::WarpAgent.to_string(), "Genesi AI");
     assert_eq!(SettingsSection::AgentProfiles.to_string(), "Profiles");
     assert_eq!(SettingsSection::AgentMCPServers.to_string(), "MCP servers");
     assert_eq!(SettingsSection::Knowledge.to_string(), "Knowledge");
     assert_eq!(
         SettingsSection::ThirdPartyCLIAgents.to_string(),
-        "Third party CLI agents"
+        "CLI agents"
     );
     assert_eq!(
         SettingsSection::CodeIndexing.to_string(),
@@ -185,7 +185,7 @@ fn subpage_display_names_are_correct() {
     );
     assert_eq!(
         SettingsSection::EditorAndCodeReview.to_string(),
-        "Editor and Code Review"
+        "Editor and Review"
     );
     assert_eq!(
         SettingsSection::CloudEnvironments.to_string(),
@@ -231,6 +231,30 @@ fn subpage_from_str_parses_display_names() {
         SettingsSection::from_str("Oz Cloud API Keys"),
         Ok(SettingsSection::OzCloudAPIKeys)
     );
+}
+
+#[test]
+fn every_subpage_display_name_parses_back() {
+    // The name a page is shown under must lead back to that page, or a link
+    // built from it opens nothing.
+    for section in [
+        SettingsSection::WarpAgent,
+        SettingsSection::AgentProfiles,
+        SettingsSection::AgentMCPServers,
+        SettingsSection::Knowledge,
+        SettingsSection::ThirdPartyCLIAgents,
+        SettingsSection::CodeIndexing,
+        SettingsSection::EditorAndCodeReview,
+        SettingsSection::CloudEnvironments,
+        SettingsSection::OzCloudAPIKeys,
+    ] {
+        assert_eq!(
+            SettingsSection::from_str(&section.to_string()),
+            Ok(section),
+            "{section:?} is shown as {:?}",
+            section.to_string()
+        );
+    }
 }
 
 // ── Subpage search filter simulation ────────────────────────────────────────
