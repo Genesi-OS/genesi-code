@@ -4,7 +4,7 @@ use num_traits::SaturatingSub;
 use pathfinder_color::ColorU;
 use std::collections::HashSet;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use string_offset::CharOffset;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
@@ -33,7 +33,7 @@ use crate::code::local_code_editor::{
     COMPLETION_MAX_VISIBLE_ITEMS, COMPLETION_POPUP_MAX_HEIGHT, COMPLETION_POPUP_MAX_WIDTH,
     COMPLETION_ROW_HEIGHT, HOVER_TOOLTIP_MAX_HEIGHT, HOVER_TOOLTIP_MAX_WIDTH,
 };
-use crate::code::symbol_picker::SymbolScope;
+use crate::code::symbol_picker::{PickerItem, SymbolScope};
 use crate::editor::InteractionState;
 use crate::menu::MenuItemFields;
 use vec1::Vec1;
@@ -1896,7 +1896,13 @@ $0",
         };
         ctx.spawn(request, |me, result, ctx| {
             me.symbol_picker.update(ctx, |picker, ctx| match result {
-                Ok(entries) => picker.set_entries(entries, ctx),
+                Ok(entries) => picker.set_entries(
+                    entries
+                        .into_iter()
+                        .map(|entry| PickerItem::from_symbol(entry, false))
+                        .collect(),
+                    ctx,
+                ),
                 Err(e) => picker.set_status(format!("Couldn't list symbols: {e}"), ctx),
             });
         });
@@ -1941,7 +1947,13 @@ $0",
                 return;
             }
             me.symbol_picker.update(ctx, |picker, ctx| match result {
-                Ok(entries) => picker.set_entries(entries, ctx),
+                Ok(entries) => picker.set_entries(
+                    entries
+                        .into_iter()
+                        .map(|entry| PickerItem::from_symbol(entry, true))
+                        .collect(),
+                    ctx,
+                ),
                 Err(e) => picker.set_status(format!("Couldn't search symbols: {e}"), ctx),
             });
         });
@@ -1955,12 +1967,100 @@ $0",
         ctx.notify();
     }
 
+    /// Ctrl+Shift+M: every problem the language servers know about, errors
+    /// first, for the whole project.
+    pub(super) fn open_problems(&mut self, ctx: &mut ViewContext<Self>) {
+        self.dismiss_lsp_overlays(ctx);
+        let items = Self::collect_problems(ctx);
+        self.symbol_picker.update(ctx, |picker, ctx| {
+            picker.open(SymbolScope::Problems, ctx);
+            picker.set_entries(items, ctx);
+        });
+        ctx.focus(&self.symbol_picker);
+        ctx.notify();
+    }
+
+    /// Every diagnostic from every running server, as picker rows.
+    ///
+    /// Sorted errors first, then by file and line, so the list reads in the
+    /// order a person would fix things in. A diagnostic two servers both report
+    /// appears once.
+    fn collect_problems(ctx: &ViewContext<Self>) -> Vec<PickerItem> {
+        let manager = lsp::LspManagerModel::as_ref(ctx);
+        let mut seen = std::collections::HashSet::new();
+        let mut problems: Vec<(u8, PathBuf, lsp_types::Diagnostic)> = Vec::new();
+
+        for root in manager.workspace_roots() {
+            for server in manager.servers_for_workspace(root).into_iter().flatten() {
+                for (path, diagnostic) in server.as_ref(ctx).all_diagnostics() {
+                    let key = (
+                        path.clone(),
+                        diagnostic.range.start.line,
+                        diagnostic.range.start.character,
+                        diagnostic.message.clone(),
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let rank = match diagnostic.severity {
+                        Some(lsp_types::DiagnosticSeverity::ERROR) => 0,
+                        Some(lsp_types::DiagnosticSeverity::WARNING) => 1,
+                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => 2,
+                        _ => 3,
+                    };
+                    problems.push((rank, path.clone(), diagnostic.clone()));
+                }
+            }
+        }
+
+        problems.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.range.start.line.cmp(&b.2.range.start.line))
+        });
+
+        let theme = Appearance::as_ref(ctx).theme();
+        let error: ColorU = theme.ui_error_color();
+        let warning: ColorU = theme.ui_warning_color();
+        problems
+            .into_iter()
+            .map(|(rank, path, diagnostic)| {
+                let (tag, tag_color) = match rank {
+                    0 => ("error", Some(error)),
+                    1 => ("warning", Some(warning)),
+                    2 => ("info", None),
+                    _ => ("hint", None),
+                };
+                let file = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // The first line only: multi-line messages (type mismatches
+                // especially) would push every other row out of view.
+                let message = diagnostic
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                PickerItem {
+                    label: message,
+                    secondary: None,
+                    tag,
+                    tag_color,
+                    trailing: Some(format!("{file}:{}", diagnostic.range.start.line + 1)),
+                    location: lsp::types::Location {
+                        line: diagnostic.range.start.line as usize,
+                        column: diagnostic.range.start.character as usize,
+                    },
+                    path,
+                }
+            })
+            .collect()
+    }
+
     /// Move the caret to the chosen symbol, opening its file if it is elsewhere.
-    pub(super) fn jump_to_symbol(
-        &mut self,
-        entry: lsp::types::SymbolEntry,
-        ctx: &mut ViewContext<Self>,
-    ) {
+    pub(super) fn jump_to_symbol(&mut self, entry: PickerItem, ctx: &mut ViewContext<Self>) {
         self.close_symbol_picker(ctx);
         let Some(source_server_id) = self
             .lsp_server

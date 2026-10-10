@@ -7,8 +7,6 @@
 //! too large to fetch whole, so every query goes back to the server and the
 //! answer replaces the list.
 
-use std::path::Path;
-
 use lsp::types::SymbolEntry;
 use warp_editor::editor::NavigationKey;
 use warpui::elements::{
@@ -39,16 +37,60 @@ const MAX_ROWS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolScope {
-    /// The file in the editor (Ctrl+Shift+O).
+    /// The symbols in the file in the editor.
     File,
-    /// Every file the server knows about (Ctrl+T).
+    /// Every symbol the server knows about, asked for per query.
     Project,
+    /// Every diagnostic the language servers have published, project-wide.
+    Problems,
+}
+
+/// One row of the picker: something with a place in the project to go to.
+///
+/// Symbols and diagnostics both reduce to this. Keeping the row generic is
+/// what lets one picker -- one set of keys, one look -- serve every "type to
+/// find it, Enter to go there" list in the editor.
+#[derive(Debug, Clone)]
+pub struct PickerItem {
+    /// The text the query is matched against, drawn prominently.
+    pub label: String,
+    /// Dimmed context after the label: a symbol's container, a problem's file.
+    pub secondary: Option<String>,
+    /// A short tag in the leading column: the symbol kind, or the severity.
+    pub tag: &'static str,
+    /// Colour for the tag. `None` uses the muted text colour.
+    pub tag_color: Option<pathfinder_color::ColorU>,
+    /// Shown at the far right, e.g. the file name in project scope.
+    pub trailing: Option<String>,
+    pub path: std::path::PathBuf,
+    pub location: lsp::types::Location,
+}
+
+impl PickerItem {
+    pub fn from_symbol(entry: SymbolEntry, show_file: bool) -> Self {
+        let trailing = show_file.then(|| {
+            entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        Self {
+            label: entry.name,
+            secondary: entry.container.filter(|container| !container.is_empty()),
+            tag: kind_tag(entry.kind),
+            tag_color: None,
+            trailing,
+            path: entry.path,
+            location: entry.location,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum Event {
     Close,
-    Confirm(SymbolEntry),
+    Confirm(PickerItem),
     /// The query changed. For project scope the host re-asks the server.
     QueryChanged(String),
 }
@@ -63,7 +105,7 @@ pub struct SymbolPickerView {
     query_editor: ViewHandle<EditorView>,
     scope: SymbolScope,
     is_open: bool,
-    entries: Vec<SymbolEntry>,
+    entries: Vec<PickerItem>,
     /// Indices into `entries` that match the query, with the matched char
     /// positions in each name for highlighting.
     filtered: Vec<(usize, Vec<usize>)>,
@@ -127,6 +169,7 @@ impl SymbolPickerView {
                 match scope {
                     SymbolScope::File => "Go to symbol in file",
                     SymbolScope::Project => "Go to symbol in project",
+                    SymbolScope::Problems => "Filter problems",
                 },
                 ctx,
             );
@@ -146,7 +189,7 @@ impl SymbolPickerView {
 
     /// Replace the candidates. For file scope this happens once; for project
     /// scope, once per query.
-    pub fn set_entries(&mut self, entries: Vec<SymbolEntry>, ctx: &mut ViewContext<Self>) {
+    pub fn set_entries(&mut self, entries: Vec<PickerItem>, ctx: &mut ViewContext<Self>) {
         self.entries = entries;
         self.status = None;
         self.refilter(ctx);
@@ -172,7 +215,7 @@ impl SymbolPickerView {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    fuzzy_match::match_indices_case_insensitive(&entry.name, &query)
+                    fuzzy_match::match_indices_case_insensitive(&entry.label, &query)
                         .map(|result| (index, result.matched_indices, result.score))
                 })
                 .collect();
@@ -188,11 +231,13 @@ impl SymbolPickerView {
         self.selected = 0;
         self.scroll_state.scroll_to(Pixels::zero());
         if self.filtered.is_empty() && self.status.is_none() {
-            self.status = Some(if self.entries.is_empty() && query.is_empty() {
-                "No symbols".to_string()
-            } else {
-                format!("No symbol matches \u{201c}{query}\u{201d}")
-            });
+            self.status = Some(
+                match (self.scope, self.entries.is_empty() && query.is_empty()) {
+                    (SymbolScope::Problems, true) => "No problems".to_string(),
+                    (_, true) => "No symbols".to_string(),
+                    (_, false) => format!("Nothing matches \u{201c}{query}\u{201d}"),
+                },
+            );
         } else if !self.filtered.is_empty() {
             self.status = None;
         }
@@ -230,7 +275,7 @@ impl SymbolPickerView {
     fn handle_editor_event(&mut self, event: &EditorEvent, ctx: &mut ViewContext<Self>) {
         match event {
             EditorEvent::Edited(_) => match self.scope {
-                SymbolScope::File => {
+                SymbolScope::File | SymbolScope::Problems => {
                     self.status = None;
                     self.refilter(ctx);
                 }
@@ -346,38 +391,38 @@ impl View for SymbolPickerView {
                 line.add_child(
                     ConstrainedBox::new(
                         Text::new_inline(
-                            kind_tag(entry.kind),
+                            entry.tag,
                             appearance.monospace_font_family(),
                             font_size - 2.,
                         )
-                        .with_color(muted)
+                        .with_color(entry.tag_color.unwrap_or(muted))
                         .finish(),
                     )
-                    .with_width(appearance.scale(46.))
+                    .with_width(appearance.scale(52.))
                     .finish(),
                 );
 
-                let mut name = Text::new_inline(
-                    entry.name.clone(),
+                let mut label = Text::new_inline(
+                    entry.label.clone(),
                     appearance.monospace_font_family(),
                     font_size,
                 )
                 .with_color(name_color)
                 .with_clip(ClipConfig::ellipsis());
                 if !matched.is_empty() {
-                    name = name.with_single_highlight(
+                    label = label.with_single_highlight(
                         Highlight::new()
                             .with_properties(Properties::default().weight(Weight::Bold))
                             .with_foreground_color(accent),
                         matched.clone(),
                     );
                 }
-                line.add_child(name.finish());
+                line.add_child(Shrinkable::new(1., label.finish()).finish());
 
-                if let Some(container) = entry.container.as_deref().filter(|c| !c.is_empty()) {
+                if let Some(secondary) = &entry.secondary {
                     line.add_child(
                         Text::new_inline(
-                            container.to_string(),
+                            secondary.clone(),
                             appearance.ui_font_family(),
                             font_size - 1.,
                         )
@@ -386,23 +431,15 @@ impl View for SymbolPickerView {
                         .finish(),
                     );
                 }
-
-                // For the project, which file it is in -- otherwise every
-                // `new` looks like the same `new`.
-                if self.scope == SymbolScope::Project {
-                    let file = entry
-                        .path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                if let Some(trailing) = &entry.trailing {
                     line.add_child(
-                        Shrinkable::new(
-                            1.,
-                            Text::new_inline(file, appearance.ui_font_family(), font_size - 1.)
-                                .with_color(muted)
-                                .with_clip(ClipConfig::ellipsis())
-                                .finish(),
+                        Text::new_inline(
+                            trailing.clone(),
+                            appearance.ui_font_family(),
+                            font_size - 1.,
                         )
+                        .with_color(muted)
+                        .with_clip(ClipConfig::ellipsis())
                         .finish(),
                     );
                 }
@@ -467,10 +504,4 @@ impl View for SymbolPickerView {
         .with_drop_shadow(DropShadow::default())
         .finish()
     }
-}
-
-/// Whether `path` is the file an entry points into -- used to decide between
-/// moving the caret and opening another file.
-pub fn is_same_file(entry: &SymbolEntry, path: Option<&Path>) -> bool {
-    path.is_some_and(|path| path == entry.path)
 }

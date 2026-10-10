@@ -168,6 +168,12 @@ pub fn init(app: &mut AppContext) {
             LocalCodeEditorAction::RenameSymbol,
             id!("LocalCodeEditorView") & !id!("IMEOpen"),
         ),
+        // Ctrl+Shift+M, the Problems key in VS Code.
+        FixedBinding::new(
+            "cmdorctrl-shift-m",
+            LocalCodeEditorAction::ShowProblems,
+            id!("LocalCodeEditorView") & !id!("IMEOpen"),
+        ),
         FixedBinding::new(
             file_symbols_key,
             LocalCodeEditorAction::GoToSymbolInFile,
@@ -290,6 +296,8 @@ pub enum LocalCodeEditorAction {
     GoToSymbolInProject,
     /// Close the symbol picker (a click outside it).
     CloseSymbolPicker,
+    /// List every problem the language servers have reported.
+    ShowProblems,
     /// Apply the code action at this index of the list last shown.
     ApplyCodeAction(usize),
     /// The pointer moved onto a completion row: highlight it, the way hovering
@@ -2982,6 +2990,9 @@ impl LocalCodeEditorView {
             MenuItemFields::new("Go to symbol in project…")
                 .with_on_select_action(LocalCodeEditorAction::GoToSymbolInProject)
                 .into_item(),
+            MenuItemFields::new("Problems…")
+                .with_on_select_action(LocalCodeEditorAction::ShowProblems)
+                .into_item(),
         ]
     }
 
@@ -3480,6 +3491,7 @@ impl TypedActionView for LocalCodeEditorView {
             LocalCodeEditorAction::GoToSymbolInFile => self.open_file_symbols(ctx),
             LocalCodeEditorAction::GoToSymbolInProject => self.open_project_symbols(ctx),
             LocalCodeEditorAction::CloseSymbolPicker => self.close_symbol_picker(ctx),
+            LocalCodeEditorAction::ShowProblems => self.open_problems(ctx),
             LocalCodeEditorAction::ApplyCodeAction(index) => self.apply_code_action(*index, ctx),
             LocalCodeEditorAction::HighlightCompletionRow(row) => {
                 self.select_completion_row(*row, ctx);

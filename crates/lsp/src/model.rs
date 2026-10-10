@@ -715,6 +715,15 @@ impl LspServerModel {
         })
     }
 
+    /// Every diagnostic this server has published, for every file. Servers like
+    /// rust-analyzer and tsserver report on the whole workspace, not just the
+    /// files that are open, which is what makes a project-wide list possible.
+    pub fn all_diagnostics(&self) -> impl Iterator<Item = (&PathBuf, &lsp_types::Diagnostic)> {
+        self.diagnostics_by_path
+            .iter()
+            .flat_map(|(path, document)| document.diagnostics.iter().map(move |d| (path, d)))
+    }
+
     pub fn diagnostics_for_path(&self, path: &Path) -> Result<Option<&DocumentDiagnostics>> {
         Ok(self.diagnostics_by_path.get(path))
     }
