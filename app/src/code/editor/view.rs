@@ -1544,6 +1544,16 @@ impl CodeEditorView {
         self.model.as_ref(ctx).content_string(ctx)
     }
 
+    /// The buffer's text with LF line endings, which is what the diff compares.
+    pub fn lf_text(&self, ctx: &AppContext) -> String {
+        self.model.as_ref(ctx).lf_text(ctx)
+    }
+
+    /// The text the inline diff compares against, if there is one.
+    pub fn diff_base_text(&self, ctx: &AppContext) -> Option<String> {
+        self.model.as_ref(ctx).diff_base_text(ctx)
+    }
+
     pub fn word_range_at_offset(
         &self,
         offset: CharOffset,

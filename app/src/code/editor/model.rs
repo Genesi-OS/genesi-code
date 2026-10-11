@@ -467,6 +467,19 @@ impl CodeEditorModel {
 
     /// We need to set the diff model base to the normalized version of the text. This is because the internal text
     /// representation of the content used for syntax tree highlighting and text rendering uses standard LF.
+    /// The text the inline diff compares against, if there is one.
+    pub fn diff_base_text(&self, ctx: &AppContext) -> Option<String> {
+        self.diff
+            .as_ref(ctx)
+            .base()
+            .map(|base| base.as_str().to_string())
+    }
+
+    /// The buffer's text with LF line endings, which is what the diff compares.
+    pub fn lf_text(&self, ctx: &AppContext) -> String {
+        self.content().as_ref(ctx).text().as_str().to_string()
+    }
+
     pub fn set_base(&self, base: &str, recompute_diff: bool, ctx: &mut ModelContext<Self>) {
         let normalized_text = MultilineString::<LF>::apply(base);
         self.diff

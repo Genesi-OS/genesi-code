@@ -8,6 +8,8 @@ use warpui::elements::DropTargetData;
 use warpui::AppContext;
 
 #[cfg(not(target_family = "wasm"))]
+pub mod agent_diff;
+#[cfg(not(target_family = "wasm"))]
 pub mod find_references_view;
 #[cfg(not(target_family = "wasm"))]
 pub mod language_server_extension;

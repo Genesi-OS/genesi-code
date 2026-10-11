@@ -2408,6 +2408,42 @@ impl LocalAiChatView {
         }
     }
 
+    /// What undoing the agent's edit to `path` should write back.
+    ///
+    /// The captured original, unless the file is open and the user has typed
+    /// into it since: the editor carries those edits into the diff base, so
+    /// undoing removes the agent's changes and keeps the user's.
+    fn undo_target(path: &std::path::Path, original: String, ctx: &AppContext) -> String {
+        let Some(window_id) = ctx.windows().active_window() else {
+            return original;
+        };
+        let Some(editors) = ctx.views_of_type::<LocalCodeEditorView>(window_id) else {
+            return original;
+        };
+        let carried = editors.into_iter().find_map(|editor| {
+            let editor = editor.as_ref(ctx);
+            let open = editor.file_path().is_some_and(|open| {
+                open == path
+                    || open
+                        .canonicalize()
+                        .ok()
+                        .zip(path.canonicalize().ok())
+                        .is_some_and(|(open, path)| open == path)
+            });
+            if open {
+                editor.agent_diff_base(ctx)
+            } else {
+                None
+            }
+        });
+        match carried {
+            // The editor works in LF; give the file back its own line endings.
+            Some(base) if original.contains("\r\n") => base.replace('\n', "\r\n"),
+            Some(base) => base,
+            None => original,
+        }
+    }
+
     /// Tell the file tree to rescan after the agent touched the project.
     ///
     /// The tree only catches up on outside changes when it becomes active, so a
@@ -6334,6 +6370,7 @@ impl LocalAiChatView {
                 };
                 match edit.original {
                     Some(content) => {
+                        let content = Self::undo_target(&path, content, ctx);
                         let _ = std::fs::write(&path, content);
                     }
                     None => {
@@ -9097,6 +9134,7 @@ impl TypedActionView for LocalAiChatView {
                         };
                         match edit.original {
                             Some(content) => {
+                                let content = Self::undo_target(&path, content, ctx);
                                 let _ = std::fs::write(&path, content);
                             }
                             None => {

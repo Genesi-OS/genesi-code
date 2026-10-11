@@ -487,6 +487,12 @@ pub struct LocalCodeEditorView {
     base_content_version: Option<ContentVersion>,
     /// Whether the visible inline diff belongs to the latest agent edit.
     pending_agent_diff: bool,
+    /// The pre-edit content the agent's diff was opened with, to recognise the
+    /// same review when the agent edits the file again.
+    agent_diff_original: Option<String>,
+    /// The buffer as of the last change, so the next user edit can be worked
+    /// out and carried into the diff base. See [`super::agent_diff`].
+    agent_diff_snapshot: Option<String>,
     /// Set to `true` when a `RemoteBufferConflict` event fires for this
     /// editor's buffer. Cleared when the user discards or overwrites.
     has_remote_conflict: bool,
@@ -600,8 +606,8 @@ impl LocalCodeEditorView {
                 ctx.emit(LocalCodeEditorEvent::DiffAccepted);
             }
             CodeEditorEvent::ContentChanged { origin, .. } => {
-                if origin.from_user() && me.pending_agent_diff {
-                    me.keep_pending_agent_diff(ctx);
+                if me.pending_agent_diff {
+                    me.track_edit_under_agent_diff(origin.from_user(), ctx);
                 }
                 me.update_diff_hunk_gutter_buttons(ctx);
 
@@ -662,6 +668,12 @@ impl LocalCodeEditorView {
                 }
             }
             CodeEditorEvent::DiffUpdated => {
+                // Content can also be replaced wholesale (a reload from disk)
+                // without a change event; the diff is recomputed after it, so
+                // this is where the snapshot catches up.
+                if me.pending_agent_diff {
+                    me.agent_diff_snapshot = Some(me.editor.as_ref(ctx).lf_text(ctx));
+                }
                 ctx.emit(LocalCodeEditorEvent::DiffStatusUpdated);
             }
             CodeEditorEvent::SelectionEnd => {
@@ -841,6 +853,8 @@ impl LocalCodeEditorView {
             was_edited: false,
             base_content_version: None,
             pending_agent_diff: false,
+            agent_diff_original: None,
+            agent_diff_snapshot: None,
             has_remote_conflict: false,
             conflict_banner_mouse_states: Default::default(),
             default_directory: None,
@@ -2742,17 +2756,60 @@ impl LocalCodeEditorView {
 
     /// Show an agent edit inline against the captured pre-edit content.
     pub fn show_pending_agent_diff(&mut self, original: &str, ctx: &mut ViewContext<Self>) {
+        // Still the same review (the agent edited the file again, or the diff
+        // is being restored): keep the base the user's own edits were carried
+        // into, or those edits would turn green again.
+        let same_review =
+            self.pending_agent_diff && self.agent_diff_original.as_deref() == Some(original);
+        let carried_base = if same_review {
+            self.editor.as_ref(ctx).diff_base_text(ctx)
+        } else {
+            None
+        };
         self.pending_agent_diff = true;
+        self.agent_diff_original = Some(original.to_string());
+        self.agent_diff_snapshot = Some(self.editor.as_ref(ctx).lf_text(ctx));
         self.editor.update(ctx, |editor, ctx| {
-            editor.set_base(original, true, ctx);
+            editor.set_base(carried_base.as_deref().unwrap_or(original), true, ctx);
             editor.set_pending_diff_hunk_buttons(true, ctx);
             editor.expand_diffs(ctx);
         });
     }
 
+    /// The base the agent's diff is shown against, with the user's own edits
+    /// carried in: what undoing the agent's change should leave behind.
+    pub fn agent_diff_base(&self, ctx: &AppContext) -> Option<String> {
+        if !self.pending_agent_diff {
+            return None;
+        }
+        self.editor.as_ref(ctx).diff_base_text(ctx)
+    }
+
+    /// Keep the agent's diff on screen while the buffer changes. A change the
+    /// user made is carried into the base, so only the agent's changes stay
+    /// marked; anything else just moves the snapshot along.
+    fn track_edit_under_agent_diff(&mut self, from_user: bool, ctx: &mut ViewContext<Self>) {
+        let after = self.editor.as_ref(ctx).lf_text(ctx);
+        let before = self.agent_diff_snapshot.replace(after.clone());
+        if !from_user {
+            return;
+        }
+        let (Some(before), Some(base)) = (before, self.editor.as_ref(ctx).diff_base_text(ctx))
+        else {
+            return;
+        };
+        let carried = super::agent_diff::carry_user_edit(&base, &before, &after);
+        if carried != base {
+            self.editor
+                .update(ctx, |editor, ctx| editor.set_base(&carried, true, ctx));
+        }
+    }
+
     /// Dismiss all pending agent diff decorations while retaining file content.
     pub fn keep_pending_agent_diff(&mut self, ctx: &mut ViewContext<Self>) {
         self.pending_agent_diff = false;
+        self.agent_diff_original = None;
+        self.agent_diff_snapshot = None;
         let current = self.editor.as_ref(ctx).text(ctx).into_string();
         self.editor.update(ctx, |editor, ctx| {
             editor.set_base(&current, true, ctx);
